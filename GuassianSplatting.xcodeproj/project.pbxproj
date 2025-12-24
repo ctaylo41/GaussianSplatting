@@ -6,6 +6,13 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		494CA5372EFC96B600FF3003 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 494CA5362EFC96B600FF3003 /* Foundation.framework */; };
+		494CA5392EFC96BB00FF3003 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 494CA5382EFC96BB00FF3003 /* Metal.framework */; };
+		494CA53B2EFC96C500FF3003 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 494CA53A2EFC96C500FF3003 /* QuartzCore.framework */; };
+		494CA53F2EFC97C300FF3003 /* libglfw.3.4.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 494CA53E2EFC97C300FF3003 /* libglfw.3.4.dylib */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXCopyFilesBuildPhase section */
 		494CA3D22EFC940900FF3003 /* CopyFiles */ = {
 			isa = PBXCopyFilesBuildPhase;
@@ -20,12 +27,21 @@
 
 /* Begin PBXFileReference section */
 		494CA3D42EFC940900FF3003 /* GuassianSplatting */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = GuassianSplatting; sourceTree = BUILT_PRODUCTS_DIR; };
+		494CA5362EFC96B600FF3003 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		494CA5382EFC96BB00FF3003 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		494CA53A2EFC96C500FF3003 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		494CA53E2EFC97C300FF3003 /* libglfw.3.4.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = libglfw.3.4.dylib; path = ../../../../opt/homebrew/Cellar/glfw/3.4/lib/libglfw.3.4.dylib; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		494CA3D62EFC940900FF3003 /* GuassianSplatting */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = GuassianSplatting;
+			sourceTree = "<group>";
+		};
+		494CA5342EFC960D00FF3003 /* metal-cpp */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "metal-cpp";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -35,6 +51,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				494CA53F2EFC97C300FF3003 /* libglfw.3.4.dylib in Frameworks */,
+				494CA53B2EFC96C500FF3003 /* QuartzCore.framework in Frameworks */,
+				494CA5392EFC96BB00FF3003 /* Metal.framework in Frameworks */,
+				494CA5372EFC96B600FF3003 /* Foundation.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -44,7 +64,9 @@
 		494CA3CB2EFC940900FF3003 = {
 			isa = PBXGroup;
 			children = (
+				494CA5342EFC960D00FF3003 /* metal-cpp */,
 				494CA3D62EFC940900FF3003 /* GuassianSplatting */,
+				494CA5352EFC96B600FF3003 /* Frameworks */,
 				494CA3D52EFC940900FF3003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -55,6 +77,17 @@
 				494CA3D42EFC940900FF3003 /* GuassianSplatting */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		494CA5352EFC96B600FF3003 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				494CA53E2EFC97C300FF3003 /* libglfw.3.4.dylib */,
+				494CA53A2EFC96C500FF3003 /* QuartzCore.framework */,
+				494CA5382EFC96BB00FF3003 /* Metal.framework */,
+				494CA5362EFC96B600FF3003 /* Foundation.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -74,6 +107,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				494CA3D62EFC940900FF3003 /* GuassianSplatting */,
+				494CA5342EFC960D00FF3003 /* metal-cpp */,
 			);
 			name = GuassianSplatting;
 			packageProductDependencies = (
@@ -245,6 +279,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/metal-cpp",
+					/opt/homebrew/Cellar/glfw/3.4/include/,
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					/opt/homebrew/Cellar/glfw/3.4/lib,
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Debug;
@@ -253,6 +295,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/metal-cpp",
+					/opt/homebrew/Cellar/glfw/3.4/include/,
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					/opt/homebrew/Cellar/glfw/3.4/lib,
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Release;
