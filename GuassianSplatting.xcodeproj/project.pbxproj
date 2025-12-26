@@ -282,6 +282,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(PROJECT_DIR)/metal-cpp",
 					/opt/homebrew/Cellar/glfw/3.4/include/,
+					"$(PROJECT_DIR)/GuassianSplatting/tinyply.h",
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
@@ -298,6 +299,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(PROJECT_DIR)/metal-cpp",
 					/opt/homebrew/Cellar/glfw/3.4/include/,
+					"$(PROJECT_DIR)/GuassianSplatting/tinyply.h",
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
