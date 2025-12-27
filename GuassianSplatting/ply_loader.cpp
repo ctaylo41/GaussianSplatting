@@ -90,6 +90,13 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
         gaussians.reserve(vertex_count);
         
         for(size_t i=0;i<vertex_count;i++) {
+            if (i == 0 && sh_rest_data) {
+                printf("Raw f_rest[0..8]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                       sh_rest_data[0], sh_rest_data[1], sh_rest_data[2],
+                       sh_rest_data[3], sh_rest_data[4], sh_rest_data[5],
+                       sh_rest_data[6], sh_rest_data[7], sh_rest_data[8]);
+            }
+            
             Gaussian g;
             
             g.position = simd_make_float3(pos_data[i*3 + 0],

@@ -6,6 +6,7 @@
 #include "mtl_engine.hpp"
 #include "gpu_sort.hpp"
 #include <iostream>
+#include "image_loader.hpp"
 
 void MTLEngine::init() {
     initDevice();
@@ -15,12 +16,16 @@ void MTLEngine::init() {
     createDepthTexture();
     loadShaders();
     createPipeline();
+    createLossPipeline();
+    createBackwardPipeline();
     uniformBuffer = metalDevice->newBuffer(sizeof(Uniforms), MTL::ResourceStorageModeShared);
 }
 
 void MTLEngine::run(Camera& camera) {
     activeCamera = &camera;
     while (!glfwWindowShouldClose(glfwWindow)) {
+        float loss = trainStep(0);
+        std::cout << "Loss: " << loss << std::endl;
         glfwPollEvents();
         render(camera);
     }
@@ -58,7 +63,7 @@ void MTLEngine::initWindow() {
     metalWindow = glfwGetCocoaWindow(glfwWindow);
     metalLayer = [CAMetalLayer layer];
     metalLayer.device = (__bridge id<MTLDevice>)metalDevice;
-    metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metalLayer.pixelFormat = MTLPixelFormatRGBA8Unorm;
     metalWindow.contentView.layer = metalLayer;
     metalWindow.contentView.wantsLayer = YES;
     metalLayer.frame = metalWindow.contentView.bounds;
@@ -71,6 +76,7 @@ void MTLEngine::setupCallbacks() {
     glfwSetMouseButtonCallback(glfwWindow, mouseButtonCallback);
     glfwSetCursorPosCallback(glfwWindow, cursorPosCallback);
     glfwSetScrollCallback(glfwWindow, scrollCallback);
+    glfwSetKeyCallback(glfwWindow, keyCallback);
 }
 
 void MTLEngine::mouseButtonCallback(GLFWwindow *window, int button, int action, int mods) {
@@ -134,6 +140,12 @@ void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians) {
         positions[i] = gaussians[i].position;
     }
     
+    std::vector<uint32_t> sequentialIndices(gaussianCount);
+    for (uint32_t i = 0; i < gaussianCount; i++) {
+        sequentialIndices[i] = i;
+    }
+    sequentialIndexBuffer = metalDevice->newBuffer(sequentialIndices.data(),gaussianCount * sizeof(uint32_t),MTL::ResourceStorageModeShared);
+    
     positionBuffer = metalDevice->newBuffer(positions.data(), gaussianCount * sizeof(simd_float3), MTL::ResourceStorageModeShared);
     
     gpuSort = new GPURadixSort(metalDevice, gaussianCount);
@@ -154,7 +166,7 @@ void MTLEngine::createPipeline() {
     renderPipelineDescriptor->setFragmentFunction(fragmentShader);
 
     auto colorAttachment = renderPipelineDescriptor->colorAttachments()->object(0);
-    colorAttachment->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    colorAttachment->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
     colorAttachment->setBlendingEnabled(true);
     colorAttachment->setSourceRGBBlendFactor(MTL::BlendFactorOne);
     colorAttachment->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
@@ -198,18 +210,36 @@ void MTLEngine::createDepthTexture() {
 
 void MTLEngine::render(Camera &camera) {
     MTL::Buffer* sortedIndices = gpuSort->sort(commandQueue, positionBuffer, camera.get_position(), gaussianCount);
-    
-    float fovY = 45.0f * M_PI / 180.0f;
-    float fy = windowHeight/ (2.0f * tan(fovY/2.0f));
-    float fx = fy;
-    
     Uniforms uniforms;
-    uniforms.viewMatrix = camera.get_view_matrix();
-    uniforms.projectionMatrix = camera.get_projection_matrix();
-    uniforms.viewProjectionMatrix = matrix_multiply(camera.get_projection_matrix(), camera.get_view_matrix());
-    uniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
-    uniforms.focalLength = simd_make_float2(fx, fy);
-    uniforms.cameraPos = camera.get_position();
+    
+    if (useTrainingView && !trainingImages.empty()) {
+        const TrainingImage& img = trainingImages[currentTrainingIndex];
+        const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
+        
+        uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
+        uniforms.projectionMatrix = projectionFromColmap(cam, 0.1f, 1000.0f);
+        uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
+        uniforms.screenSize = simd_make_float2((float)cam.width, (float)cam.height);
+        uniforms.focalLength = simd_make_float2(cam.fx, cam.fy);
+        
+        simd_float3x3 R;
+        R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
+        R.columns[1] = uniforms.viewMatrix.columns[1].xyz;
+        R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
+        uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
+    } else {
+        
+        float fovY = 45.0f * M_PI / 180.0f;
+        float fy = windowHeight/ (2.0f * tan(fovY/2.0f));
+        float fx = fy;
+        
+        uniforms.viewMatrix = camera.get_view_matrix();
+        uniforms.projectionMatrix = camera.get_projection_matrix();
+        uniforms.viewProjectionMatrix = matrix_multiply(camera.get_projection_matrix(), camera.get_view_matrix());
+        uniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
+        uniforms.focalLength = simd_make_float2(fx, fy);
+        uniforms.cameraPos = camera.get_position();
+    }
     memcpy(uniformBuffer->contents(), &uniforms, sizeof(Uniforms));
     
     CA::MetalDrawable* drawable = (__bridge CA::MetalDrawable*)[metalLayer nextDrawable];
@@ -250,4 +280,247 @@ void MTLEngine::framebufferSizeCallback(GLFWwindow *window, int width, int heigh
     if (engine->activeCamera) {
         engine->activeCamera->setAspectRatio((float)width / (float)height);
     }
+}
+
+void MTLEngine::loadTrainingData(const ColmapData& colmap, const std::string& imagePath) {
+    colmapData = colmap;
+    trainingImages = loadTrainingImages(metalDevice, colmap, imagePath);
+    std::cout << "Loaded " << trainingImages.size() << " training images" << std::endl;
+}
+
+simd_float4x4 MTLEngine::viewMatrixFromColmap(simd_float4 quat, simd_float3 translation) {
+    float w = quat.x, x = quat.y, y = quat.z, z = quat.w;
+    
+    matrix_float3x3 R;
+    R.columns[0] = simd_make_float3(1 - 2*(y*y + z*z), 2*(x*y + w*z), 2*(x*z - w*y));
+    R.columns[1] = simd_make_float3(2*(x*y - w*z), 1 - 2*(x*x + z*z), 2*(y*z + w*x));
+    R.columns[2] = simd_make_float3(2*(x*z + w*y), 2*(y*z - w*x), 1 - 2*(x*x + y*y));
+    
+    simd_float4x4 view;
+    view.columns[0] = simd_make_float4(R.columns[0], 0);
+    view.columns[1] = simd_make_float4(R.columns[1], 0);
+    view.columns[2] = simd_make_float4(R.columns[2], 0);
+    view.columns[3] = simd_make_float4(translation, 1);
+    
+    return view;
+}
+
+simd_float4x4 MTLEngine::projectionFromColmap(const ColmapCamera& cam, float nearZ, float farZ) {
+    float fx = cam.fx;
+    float fy = cam.fy;
+    float cx = cam.cx;
+    float cy = cam.cy;
+    float w = (float)cam.width;
+    float h = (float)cam.height;
+    
+    simd_float4x4 proj = {0};
+    proj.columns[0][0] = 2.0f * fx / w;
+    proj.columns[1][1] = 2.0f * fy / h;
+    proj.columns[2][0] = (w - 2.0f * cx) / w;
+    proj.columns[2][1] = (2.0f * cy - h) / h;
+    proj.columns[2][2] = farZ / (farZ - nearZ);
+    proj.columns[2][3] = 1.0f;
+    proj.columns[3][2] = -(farZ * nearZ) / (farZ - nearZ);
+    
+    return proj;
+}
+
+void MTLEngine::keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    MTLEngine* engine = static_cast<MTLEngine*>(glfwGetWindowUserPointer(window));
+    
+    if(action == GLFW_PRESS) {
+        if(key == GLFW_KEY_T) {
+            engine->useTrainingView = !engine->useTrainingView;
+            std::cout << "Training view: " << (engine->useTrainingView ? "ON" : "OFF") << std::endl;
+        }
+        
+        if (key == GLFW_KEY_LEFT && engine->useTrainingView) {
+            if (engine->currentTrainingIndex > 0) engine->currentTrainingIndex--;
+            std::cout << "Training image: " << engine->currentTrainingIndex << std::endl;
+        }
+        
+        if (key== GLFW_KEY_RIGHT && engine->useTrainingView) {
+            if (engine->currentTrainingIndex < engine->trainingImages.size() - 1) engine->currentTrainingIndex++;
+            std::cout << "Training image: " << engine->currentTrainingIndex << std::endl;
+        }
+    }
+}
+
+void MTLEngine::createRenderTarget(uint32_t width, uint32_t height) {
+    if (renderTarget) renderTarget->release();
+    
+    MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
+    desc->setWidth(width);
+    desc->setHeight(height);
+    desc->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+    desc->setStorageMode(MTL::StorageModeShared);
+    desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+    renderTarget = metalDevice->newTexture(desc);
+    desc->release();
+}
+
+void MTLEngine::createLossPipeline() {
+    NS::Error* error = nullptr;
+    
+    MTL::Function* lossFunc = shaderLibrary->newFunction(NS::String::string("computeL1Loss", NS::ASCIIStringEncoding));
+    lossComputePSO = metalDevice->newComputePipelineState(lossFunc, &error);
+    if(!lossComputePSO) {
+        std::cerr << "Failed to create loss pipeline: " << error->localizedDescription()->utf8String() << std::endl;
+    }
+    lossFunc->release();
+    
+    MTL::Function* reduceFunc = shaderLibrary->newFunction(NS::String::string("reduceLoss", NS::ASCIIStringEncoding));
+    reductionPSO = metalDevice->newComputePipelineState(reduceFunc, &error);
+    
+    if(!reductionPSO) {
+        std::cerr << "Failed to create loss pipeline: " << error->localizedDescription()->utf8String() << std::endl;
+    }
+    reduceFunc->release();
+}
+
+void MTLEngine::renderToTexture(const TrainingImage& img) {
+    const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
+    
+    if (!renderTarget || renderTarget->width() != cam.width || renderTarget->height() != cam.height) {
+        createRenderTarget(cam.width, cam.height);
+    }
+    
+    Uniforms uniforms;
+    uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
+    uniforms.projectionMatrix = projectionFromColmap(cam, 0.1f, 1000.0f);
+    uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
+    uniforms.screenSize = simd_make_float2((float)cam.width, (float)cam.height);
+    uniforms.focalLength = simd_make_float2(cam.fx, cam.fy);
+    
+    simd_float3x3 R;
+    R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
+    R.columns[1] = uniforms.viewMatrix.columns[1].xyz;
+    R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
+    uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
+    
+    memcpy(uniformBuffer->contents(), &uniforms, sizeof(Uniforms));
+    
+    MTL::Buffer* sortedIndices = gpuSort->sort(commandQueue, positionBuffer, uniforms.cameraPos,gaussianCount);
+    
+    MTL::RenderPassDescriptor* renderPassDesc = MTL::RenderPassDescriptor::alloc()->init();
+    renderPassDesc->colorAttachments()->object(0)->setTexture(renderTarget);
+    renderPassDesc->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
+    renderPassDesc->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+    renderPassDesc->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0.0,0.0,0.0,1.0));
+    
+    MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
+    MTL::RenderCommandEncoder* encoder = commandBuffer->renderCommandEncoder(renderPassDesc);
+    
+    encoder->setRenderPipelineState(metalRenderPSO);
+    encoder->setVertexBuffer(gaussianBuffer, 0,0);
+    encoder->setVertexBuffer(uniformBuffer, 0, 1);
+    encoder->setVertexBuffer(sortedIndices, 0, 2);
+    encoder->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4), gaussianCount);
+    
+    encoder->endEncoding();
+    commandBuffer->commit();
+    commandBuffer->waitUntilCompleted();
+    
+    renderPassDesc->release();
+}
+
+float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) {
+    uint32_t width = rendered->width();
+    uint32_t height = rendered->height();
+    uint32_t pixelCount = width*height;
+    
+    if(!lossBuffer || lossBuffer->length() < pixelCount * sizeof(float)) {
+        if(lossBuffer) lossBuffer->release();
+        lossBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+    
+    if (!totalLossBuffer) {
+        totalLossBuffer = metalDevice->newBuffer(sizeof(float), MTLResourceStorageModeShared);
+    }
+    
+    float zero = 0.0f;
+    memcpy(totalLossBuffer->contents(), &zero, sizeof(float));
+    
+    MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
+    
+    encoder->setComputePipelineState(lossComputePSO);
+    encoder->setTexture(rendered, 0);
+    encoder->setTexture(groundTruth, 1);
+    encoder->setBuffer(lossBuffer, 0, 0);
+    
+    MTL::Size gridSize = MTL::Size(width, height, 1);
+    MTL::Size threadGroupSize = MTL::Size(16, 16, 1);
+    encoder->dispatchThreads(gridSize, threadGroupSize);
+    
+    encoder->setComputePipelineState(reductionPSO);
+    encoder->setBuffer(lossBuffer, 0, 0);
+    encoder->setBuffer(totalLossBuffer, 0, 1);
+    encoder->setBytes(&pixelCount, sizeof(uint32_t), 2);
+    
+    uint32_t reductionThreads = 1024;
+    encoder->dispatchThreads(MTL::Size(reductionThreads, 1, 1), MTL::Size(64, 1, 1));
+    
+    encoder->endEncoding();
+    commandBuffer->commit();
+    commandBuffer->waitUntilCompleted();
+    
+    float totalLoss = *(float*)totalLossBuffer->contents();
+    return totalLoss / pixelCount;
+}
+
+float MTLEngine::trainStep(size_t imageIndex) {
+    if (imageIndex >= trainingImages.size()) return 0.0f;
+    
+    const TrainingImage& img = trainingImages[imageIndex];
+    
+    renderToTexture(img);
+    
+    float loss = computeLoss(renderTarget, img.texture);
+    
+    Uniforms* u = (Uniforms*)uniformBuffer->contents();
+    MTL::Buffer* sortedIndices = gpuSort->sort(commandQueue, positionBuffer,u->cameraPos, gaussianCount);
+    
+    backward(img,sortedIndices);
+    
+    return loss;
+}
+
+void MTLEngine::createBackwardPipeline() {
+    NS::Error* error = nullptr;
+    MTL::Function* func = shaderLibrary->newFunction(NS::String::string("backwardPass", NS::ASCIIStringEncoding));
+    backwardPSO = metalDevice->newComputePipelineState(func, &error);
+    if(!backwardPSO) {
+        std::cerr << "Failed to create backward pipeline: " << error->localizedDescription()->utf8String() << std::endl;
+    }
+    func->release();
+    
+    gaussianGradients = metalDevice->newBuffer(gaussianCount * sizeof(gaussianGradients), MTL::ResourceStorageModeShared);
+}
+
+void MTLEngine::backward(const TrainingImage& img, MTL::Buffer* sortedIndices) {
+    memset(gaussianGradients->contents(), 0, gaussianGradients->length());
+    
+    MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
+    
+    encoder->setComputePipelineState(backwardPSO);
+    encoder->setBuffer(gaussianBuffer,0,0);
+    encoder->setBuffer(gaussianGradients, 0, 1);
+    encoder->setBuffer(sortedIndices, 0, 2);
+    encoder->setBuffer(uniformBuffer, 0, 3);
+    
+    uint32_t count = (uint32_t)gaussianCount;
+    encoder->setBytes(&count, sizeof(uint32_t), 4);
+    
+    encoder->setTexture(renderTarget, 0);
+    encoder->setTexture(img.texture, 1);
+    
+    MTL::Size gridSize = MTL::Size(gaussianCount, 1, 1);
+    MTL::Size threadGroupSize = MTL::Size(64, 1, 1);
+    encoder->dispatchThreads(gridSize, threadGroupSize);
+    
+    encoder->endEncoding();
+    commandBuffer->commit();
+    commandBuffer->waitUntilCompleted();
 }

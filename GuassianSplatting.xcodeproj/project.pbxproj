@@ -283,6 +283,7 @@
 					"$(PROJECT_DIR)/metal-cpp",
 					/opt/homebrew/Cellar/glfw/3.4/include/,
 					"$(PROJECT_DIR)/GuassianSplatting/tinyply.h",
+					"$(PROJECT_DIR)/GuassianSplatting/stbi_image.h",
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
@@ -300,6 +301,7 @@
 					"$(PROJECT_DIR)/metal-cpp",
 					/opt/homebrew/Cellar/glfw/3.4/include/,
 					"$(PROJECT_DIR)/GuassianSplatting/tinyply.h",
+					"$(PROJECT_DIR)/GuassianSplatting/stbi_image.h",
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
