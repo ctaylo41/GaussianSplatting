@@ -16,7 +16,14 @@ public:
     const simd_float4x4 get_projection_matrix() {return projection_matrix; };
     const simd_float3 get_position() { return position; };
     
+    void orbit(float deltaAzimuth, float deltaElevation);
+    void zoom(float deltaDistance);
+    void pan(float deltaX, float deltaY);
+    void setAspectRatio(float aspect);
+    
 private:
+    void updateMatrices();
+    
     simd_float3 position;
     simd_float3 target;
     simd_float3 up;

@@ -15,18 +15,6 @@
 int main() {
     auto gaussians = load_ply("/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/father-day.ply");
     
-    if(!gaussians.empty()) {
-        printf("First gaussian position: (%.3f, %.3f, %.3f)\n",
-               gaussians[0].position.x,
-               gaussians[0].position.y,
-               gaussians[0].position.z);
-        
-        printf("First gaussian color: (%.3f, %.3f, %.3f)\n",
-               gaussians[0].sh_dc.x,
-               gaussians[0].sh_dc.y,
-               gaussians[0].sh_dc.z);
-    }
-    
     float min_x = FLT_MAX, min_y = FLT_MAX, min_z = FLT_MAX;
     float max_x = -FLT_MAX, max_y = -FLT_MAX, max_z = -FLT_MAX;
 

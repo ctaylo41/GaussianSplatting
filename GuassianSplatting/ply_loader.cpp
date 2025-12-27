@@ -61,6 +61,20 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             return gaussians;
         }
         
+        std::shared_ptr<tinyply::PlyData> sh_rest;
+        
+        try{
+            sh_rest = ply_file.request_properties_from_element("vertex", {
+                "f_rest_0", "f_rest_1", "f_rest_2",
+                "f_rest_3", "f_rest_4", "f_rest_5",
+                "f_rest_6", "f_rest_7", "f_rest_8"
+            });
+        } catch(...) {
+            std::cout << "No SH rest coefficients, using DC only" << std::endl;
+            sh_rest = nullptr;
+        }
+        
+        
         ply_file.read(file);
         
         size_t vertex_count = positions->count;
@@ -71,7 +85,8 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
         const float* rot_data = reinterpret_cast<const float*>(rotations->buffer.get());
         const float* opacity_data = reinterpret_cast<const float*>(opacities->buffer.get());
         const float* sh_dc_data = reinterpret_cast<const float*>(sh_dcs->buffer.get());
-        
+        const float* sh_rest_data = sh_rest ? reinterpret_cast<const float*>(sh_rest->buffer.get()) : nullptr;
+
         gaussians.reserve(vertex_count);
         
         for(size_t i=0;i<vertex_count;i++) {
@@ -103,9 +118,29 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             g.opacity = 1.0f / (1.0f + std::exp(-raw_opacity));
             
             const float SH_CO = 0.2820948f;
-            g.sh_dc = simd_make_float3(sh_dc_data[i*3 + 0] * SH_CO + 0.5f,
-                                       sh_dc_data[i*3 + 1] * SH_CO + 0.5f,
-                                       sh_dc_data[i*3 + 2] * SH_CO + 0.5f);
+            g.sh[0] = sh_dc_data[i * 3 + 0];
+            g.sh[4] = sh_dc_data[i * 3 + 1];
+            g.sh[8] = sh_dc_data[i * 3 + 2];
+
+            if (sh_rest_data) {
+                g.sh[1] = sh_rest_data[i * 9 + 0];
+                g.sh[2] = sh_rest_data[i * 9 + 1];
+                g.sh[3] = sh_rest_data[i * 9 + 2];
+                g.sh[5] = sh_rest_data[i * 9 + 3];
+                g.sh[6] = sh_rest_data[i * 9 + 4];
+                g.sh[7] = sh_rest_data[i * 9 + 5];
+                g.sh[9] = sh_rest_data[i * 9 + 6];
+                g.sh[10] = sh_rest_data[i * 9 + 7];
+                g.sh[11] = sh_rest_data[i * 9 + 8];
+            } else {
+                for (int j = 1; j < 4; j++) {
+                    g.sh[j] = 0;
+                    g.sh[j+4] = 0;
+                    g.sh[j+8] = 0;
+                }
+            }
+
+            
             
             gaussians.push_back(g);
             

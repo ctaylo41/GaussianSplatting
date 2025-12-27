@@ -12,9 +12,16 @@
 #include <QuartzCore/QuartzCore.hpp>
 #include "ply_loader.hpp"
 #include "camera.hpp"
+#include "gpu_sort.hpp"
 
 struct Uniforms {
-    simd_float4x4 viewProjection;
+    simd_float4x4 viewMatrix;
+    simd_float4x4 projectionMatrix;
+    simd_float4x4 viewProjectionMatrix;
+    simd_float2 screenSize;
+    simd_float2 focalLength;
+    simd_float3 cameraPos;
+    float _pad;
 };
 
 class MTLEngine {
@@ -28,12 +35,17 @@ public:
 private:
     void initDevice();
     void initWindow();
+    void setupCallbacks();
     
     void initCommandQueue();
     void createPipeline();
     void render(Camera& camera);
     void loadShaders();
     void createDepthTexture();
+    
+    static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
+    static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos);
+    static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset);
     
     MTL::Device* metalDevice;
     GLFWwindow* glfwWindow;
@@ -50,5 +62,18 @@ private:
     MTL::RenderPipelineState* metalRenderPSO;
     MTL::DepthStencilState* depthStencilState;
     MTL::Texture* depthTexture;
-
+    
+    bool isDragging = false;
+    bool isPanning = false;
+    double lastMouseX = 0;
+    double lastMouseY = 0;
+    Camera* activeCamera = nullptr;
+    
+    MTL::Buffer* positionBuffer = nullptr;
+    GPURadixSort* gpuSort = nullptr;
+    
+    int windowWidth = 800;
+    int windowHeight = 600;
+    
+    static void framebufferSizeCallback(GLFWwindow* window, int width, int height);
 };

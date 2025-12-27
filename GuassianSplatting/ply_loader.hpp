@@ -14,7 +14,7 @@ struct Gaussian {
     simd_float3 scale;
     simd_float4 rotation;
     float opacity;
-    simd_float3 sh_dc;
+    float sh[12];
 };
 
 std::vector<Gaussian> load_ply(const std::string& file_path);
