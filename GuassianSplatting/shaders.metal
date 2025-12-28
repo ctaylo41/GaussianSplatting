@@ -475,5 +475,102 @@ kernel void backwardPass(device const Gaussian* gaussians [[buffer(0)]],
     
     gradients[gaussiansIdx] = grad;
 
+}
 
+kernel void adamStep(device Gaussian* gaussians [[buffer(0)]],
+                     device const GaussianGradients* gradients [[buffer(1)]],
+                     device float3* m_position [[buffer(2)]],
+                     device float3* m_scale [[buffer(3)]],
+                     device float4* m_rotation [[buffer(4)]],
+                     device float* m_opacity [[buffer(5)]],
+                     device float* m_sh [[buffer(6)]],
+                     device float3* v_position [[buffer(7)]],
+                     device float3* v_scale [[buffer(8)]],
+                     device float4* v_rotation [[buffer(9)]],
+                     device float* v_opacity [[buffer(10)]],
+                     device float* v_sh [[buffer(11)]],
+                     constant float* lrs [[buffer(12)]],       // [pos, scale, rot, opacity, sh]
+                     constant float& beta1 [[buffer(13)]],
+                     constant float& beta2 [[buffer(14)]],
+                     constant float& epsilon [[buffer(15)]],
+                     constant uint2& params [[buffer(16)]],    // [timestep, numGaussians]
+                     uint tid [[thread_position_in_grid]]) {
+    uint t = params.x;
+    uint numGaussians = params.y;
+        
+    if (tid >= numGaussians) return;
+        
+    GaussianGradients g = gradients[tid];
+        
+    // Bias correction factors
+    float bc1 = 1.0 - pow(beta1, float(t));
+    float bc2 = 1.0 - pow(beta2, float(t));
+        
+    // Position
+    {
+        float3 grad = g.position;
+        float3 m = beta1 * m_position[tid] + (1.0 - beta1) * grad;
+        float3 v = beta2 * v_position[tid] + (1.0 - beta2) * grad * grad;
+        m_position[tid] = m;
+        v_position[tid] = v;
+        
+        float3 m_hat = m / bc1;
+        float3 v_hat = v / bc2;
+        gaussians[tid].position -= lrs[0] * m_hat / (sqrt(v_hat) + epsilon);
+    }
+        
+    // Scale
+    {
+        float3 grad = g.scale;
+        float3 m = beta1 * m_scale[tid] + (1.0 - beta1) * grad;
+        float3 v = beta2 * v_scale[tid] + (1.0 - beta2) * grad * grad;
+        m_scale[tid] = m;
+        v_scale[tid] = v;
+        
+        float3 m_hat = m / bc1;
+        float3 v_hat = v / bc2;
+        gaussians[tid].scale -= lrs[1] * m_hat / (sqrt(v_hat) + epsilon);
+    }
+        
+    // Rotation
+    {
+        float4 grad = g.rotation;
+        float4 m = beta1 * m_rotation[tid] + (1.0 - beta1) * grad;
+        float4 v = beta2 * v_rotation[tid] + (1.0 - beta2) * grad * grad;
+        m_rotation[tid] = m;
+        v_rotation[tid] = v;
+        
+        float4 m_hat = m / bc1;
+        float4 v_hat = v / bc2;
+        float4 newRot = gaussians[tid].rotation - lrs[2] * m_hat / (sqrt(v_hat) + epsilon);
+        gaussians[tid].rotation = normalize(newRot);  // Keep unit quaternion
+    }
+    
+    // Opacity
+    {
+        float grad = g.opacity;
+        float m = beta1 * m_opacity[tid] + (1.0 - beta1) * grad;
+        float v = beta2 * v_opacity[tid] + (1.0 - beta2) * grad * grad;
+        m_opacity[tid] = m;
+        v_opacity[tid] = v;
+        
+        float m_hat = m / bc1;
+        float v_hat = v / bc2;
+        gaussians[tid].opacity -= lrs[3] * m_hat / (sqrt(v_hat) + epsilon);
+    }
+        
+    // SH coefficients
+    for (int i = 0; i < 12; i++) {
+        float grad = g.sh[i];
+        uint idx = tid * 12 + i;
+        
+        float m = beta1 * m_sh[idx] + (1.0 - beta1) * grad;
+        float v = beta2 * v_sh[idx] + (1.0 - beta2) * grad * grad;
+        m_sh[idx] = m;
+        v_sh[idx] = v;
+        
+        float m_hat = m / bc1;
+        float v_hat = v / bc2;
+        gaussians[tid].sh[i] -= lrs[4] * m_hat / (sqrt(v_hat) + epsilon);
+    }
 }

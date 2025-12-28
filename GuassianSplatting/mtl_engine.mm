@@ -23,11 +23,51 @@ void MTLEngine::init() {
 
 void MTLEngine::run(Camera& camera) {
     activeCamera = &camera;
+    size_t totalIterations = 0;
+    
     while (!glfwWindowShouldClose(glfwWindow)) {
-        float loss = trainStep(0);
-        std::cout << "Loss: " << loss << std::endl;
         glfwPollEvents();
-        render(camera);
+        
+        if(isTraining && !trainingImages.empty()) {
+            float loss = trainStep(currentImageIdx);
+            epochLoss += loss;
+            epochIterations++;
+            totalIterations++;
+            
+            if(epochIterations % 10 == 0) {
+                std::cout << "Epoch " << currentEpoch
+                          << " | Image " << currentImageIdx << "/" << trainingImages.size()
+                          << " | Loss: " << (epochLoss / epochIterations) << std::endl;
+            }
+            
+            if (totalIterations % densityControlInterval == 0 && totalIterations > 500) {
+                densityController->apply(commandQueue,
+                                         gaussianBuffer,
+                                         positionBuffer,
+                                         nullptr,
+                                         gaussianCount,
+                                         totalIterations);
+                            
+                if (gaussianGradients->length() < gaussianCount * sizeof(gaussianGradients)) {
+                    gaussianGradients->release();
+                    gaussianGradients = metalDevice->newBuffer(gaussianCount * sizeof(gaussianGradients), MTL::ResourceStorageModeShared);
+                }
+            }
+                        
+            
+            currentImageIdx++;
+            if(currentImageIdx >= trainingImages.size()) {
+                std::cout << "=== Epoch " << currentEpoch << " complete | Avg Loss: "
+                          << (epochLoss / epochIterations) << " ===" << std::endl;
+                currentImageIdx = 0;
+                currentEpoch++;
+                epochLoss = 0.0f;
+                epochIterations = 0;
+                
+                updatePositionBuffer();
+            }
+            render(camera);
+        }
     }
     activeCamera=nullptr;
 }
@@ -44,6 +84,14 @@ void MTLEngine::cleanup() {
     
     if(gpuSort) {
         delete gpuSort;
+    }
+    
+    if(optimizer) {
+        delete optimizer;
+    }
+    
+    if(densityController) {
+        delete densityController;
     }
 }
 
@@ -133,22 +181,19 @@ void MTLEngine::scrollCallback(GLFWwindow *window, double xoffset, double yoffse
 
 void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians) {
     gaussianCount = gaussians.size();
-    gaussianBuffer = metalDevice->newBuffer(gaussians.data(), gaussianCount*sizeof(gaussians[0]),MTL::ResourceStorageModeShared);
-    
+    gaussianBuffer = metalDevice->newBuffer(gaussians.data(), gaussianCount * sizeof(Gaussian), MTL::ResourceStorageModeShared);
+        
     std::vector<simd_float3> positions(gaussianCount);
-    for (size_t i=0;i<gaussianCount;i++) {
+    for (size_t i = 0; i < gaussianCount; i++) {
         positions[i] = gaussians[i].position;
     }
-    
-    std::vector<uint32_t> sequentialIndices(gaussianCount);
-    for (uint32_t i = 0; i < gaussianCount; i++) {
-        sequentialIndices[i] = i;
-    }
-    sequentialIndexBuffer = metalDevice->newBuffer(sequentialIndices.data(),gaussianCount * sizeof(uint32_t),MTL::ResourceStorageModeShared);
-    
+        
     positionBuffer = metalDevice->newBuffer(positions.data(), gaussianCount * sizeof(simd_float3), MTL::ResourceStorageModeShared);
     
-    gpuSort = new GPURadixSort(metalDevice, gaussianCount);
+    gpuSort = new GPURadixSort(metalDevice, 2000000);
+    optimizer = new AdamOptimizer(metalDevice, shaderLibrary, 2000000);
+    densityController = new DensityController(metalDevice, shaderLibrary);
+    densityController->resetAccumulator(gaussianCount);
 }
 
 void MTLEngine::initCommandQueue() {
@@ -334,6 +379,11 @@ void MTLEngine::keyCallback(GLFWwindow* window, int key, int scancode, int actio
             std::cout << "Training view: " << (engine->useTrainingView ? "ON" : "OFF") << std::endl;
         }
         
+        if (key==GLFW_KEY_SPACE) {
+            engine->isTraining = !engine->isTraining;
+            std::cout << "Training: " << (engine->isTraining ? "STARTED" : "PAUSED") << std::endl;
+        }
+        
         if (key == GLFW_KEY_LEFT && engine->useTrainingView) {
             if (engine->currentTrainingIndex > 0) engine->currentTrainingIndex--;
             std::cout << "Training image: " << engine->currentTrainingIndex << std::endl;
@@ -480,8 +530,11 @@ float MTLEngine::trainStep(size_t imageIndex) {
     
     Uniforms* u = (Uniforms*)uniformBuffer->contents();
     MTL::Buffer* sortedIndices = gpuSort->sort(commandQueue, positionBuffer,u->cameraPos, gaussianCount);
-    
     backward(img,sortedIndices);
+    
+    densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
+    
+    optimizer->step(commandQueue, gaussianBuffer, gaussianGradients);
     
     return loss;
 }
@@ -523,4 +576,13 @@ void MTLEngine::backward(const TrainingImage& img, MTL::Buffer* sortedIndices) {
     encoder->endEncoding();
     commandBuffer->commit();
     commandBuffer->waitUntilCompleted();
+}
+
+void MTLEngine::updatePositionBuffer() {
+    Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
+    simd_float3* positions = (simd_float3*)positionBuffer->contents();
+    
+    for(size_t i=0;i<gaussianCount;i++) {
+        positions[i] = gaussians[i].position;
+    }
 }

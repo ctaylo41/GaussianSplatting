@@ -15,6 +15,8 @@
 #include "gpu_sort.hpp"
 #include "image_loader.hpp"
 #include "colmap_loader.hpp"
+#include "optimizer.hpp"
+#include "density_control.hpp"
 
 struct Uniforms {
     simd_float4x4 viewMatrix;
@@ -113,4 +115,16 @@ private:
     
     void createBackwardPipeline();
     void backward(const TrainingImage& img, MTL::Buffer* sortedIndices);
+    
+    AdamOptimizer* optimizer = nullptr;
+    
+    bool isTraining = false;
+    size_t currentEpoch = 0;
+    size_t currentImageIdx = 0;
+    float epochLoss = 0.0f;
+    size_t epochIterations = 0;
+    void updatePositionBuffer();
+    
+    DensityController* densityController = nullptr;
+    size_t densityControlInterval = 100;
 };
