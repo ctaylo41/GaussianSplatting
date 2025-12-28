@@ -56,9 +56,9 @@ float3x3 quaternionToMatrix(float4 q) {
                     2.0*(x*z - w*y), 2.0*(y*z + w*x), 1.0 - 2.0*(x*x + y*y));
 }
 
-float3x3 computeCovariance3D(float3 scale, float4 rotation) {
+float3x3 computeCovariance3D(float3 logScale, float4 rotation) {
     float3x3 R = quaternionToMatrix(rotation);
-    
+    float3 scale = exp(logScale);
     // S is a diagonal scale matrix we compute R *S * S^T * R^T = R * S^2 * R^T
     float3x3 S = float3x3(scale.x * scale.x,0,0,
                           0, scale.y * scale.y, 0,
@@ -184,7 +184,8 @@ vertex VertexOut vertexShader(
     
     out.color = evalSH(g.sh, viewDir);
     out.opacity = g.opacity;
-    out.centerScreenPos = (centerNDC * 0.5 + 0.5) * uniforms.screenSize;
+    out.centerScreenPos = float2((centerNDC.x * 0.5 + 0.5) * uniforms.screenSize.x,
+                                 (1.0 - (centerNDC.y * 0.5 + 0.5)) * uniforms.screenSize.y);
     out.conic = conic;
     out.quadOffset = offsetPixels;
     
@@ -254,9 +255,13 @@ kernel void computePixelGradient(texture2d<float, access::read> rendered [[textu
 }
 
 struct GaussianGradients {
-    float3 position;
+    float position_x;
+    float position_y;
+    float position_z;
     float opacity;
-    float3 scale;
+    float scale_x;
+    float scale_y;
+    float scale_z;
     float _pad1;
     float4 rotation;
     float sh[12];
@@ -397,8 +402,8 @@ kernel void backwardPass(device const Gaussian* gaussians [[buffer(0)]],
     float SH_C0 = 0.28209479177387814;
     float3 color = clamp(float3(
         SH_C0 * g.sh[0] + 0.5,
-        SH_C0 * g.sh[1] + 0.5,
-        SH_C0 * g.sh[2] + 0.5
+        SH_C0 * g.sh[4] + 0.5,
+        SH_C0 * g.sh[8] + 0.5
     ), 0.0, 1.0);
     
     float2 dL_dScreenPos = float2(0);
@@ -458,8 +463,8 @@ kernel void backwardPass(device const Gaussian* gaussians [[buffer(0)]],
                         - dL_dCovInv11 * a * a * inv_det2;
             
             grad.sh[0] += dL_dC.r * weight * SH_C0;
-            grad.sh[1] += dL_dC.g * weight * SH_C0;
-            grad.sh[2] += dL_dC.b * weight * SH_C0;
+            grad.sh[4] += dL_dC.g * weight * SH_C0;
+            grad.sh[8] += dL_dC.b * weight * SH_C0;
             
             float sigmoid_deriv = opacity * (1.0 - opacity);
             grad.opacity += dL_dAlpha * G * sigmoid_deriv;
@@ -483,7 +488,10 @@ kernel void backwardPass(device const Gaussian* gaussians [[buffer(0)]],
     dL_dClip.z = 0;
     dL_dClip.w = -(dL_dNDC.x * ndc.x + dL_dNDC.y * ndc.y) / w;
     
-    grad.position = (transpose(uniforms.viewProjectionMatrix) * dL_dClip).xyz;
+    float3 gradPos = (transpose(uniforms.viewProjectionMatrix) * dL_dClip).xyz;
+    grad.position_x = gradPos.x;
+    grad.position_y = gradPos.y;
+    grad.position_z = gradPos.z;
     
     // Backprop scale and rotation
     float3x3 dL_dSigmaView = float3x3(0);
@@ -499,7 +507,10 @@ kernel void backwardPass(device const Gaussian* gaussians [[buffer(0)]],
     float3x3 dL_dM = 2.0 * dL_dSigma3D * M;
     float3x3 dL_dS = transpose(R) * dL_dM;
     
-    grad.scale = float3(dL_dS[0][0], dL_dS[1][1], dL_dS[2][2]) * scale;
+    float3 gradScale = float3(dL_dS[0][0], dL_dS[1][1], dL_dS[2][2]) * scale;
+    grad.scale_x = gradScale.x;
+    grad.scale_y = gradScale.y;
+    grad.scale_z = gradScale.z;
     
     float3x3 dL_dR = dL_dM * transpose(S);
     
@@ -511,8 +522,8 @@ kernel void backwardPass(device const Gaussian* gaussians [[buffer(0)]],
     grad.rotation = float4(dL_dr, dL_dx, dL_dy, dL_dz);
     
     // Final NaN check - zero out if any NaN
-    if (isnan(grad.position.x) || isnan(grad.position.y) || isnan(grad.position.z) ||
-        isnan(grad.scale.x) || isnan(grad.scale.y) || isnan(grad.scale.z) ||
+    if (isnan(grad.position_x) || isnan(grad.position_y) || isnan(grad.position_z) ||
+        isnan(grad.scale_x) || isnan(grad.scale_y) || isnan(grad.scale_z) ||
         isnan(grad.opacity) || isnan(grad.rotation.x)) {
         grad = GaussianGradients{};
     }
@@ -551,7 +562,7 @@ kernel void adamStep(device Gaussian* gaussians [[buffer(0)]],
         
     // Position
     {
-        float3 grad = g.position;
+        float3 grad = float3(g.position_x, g.position_y, g.position_z);
         float3 m = beta1 * m_position[tid] + (1.0 - beta1) * grad;
         float3 v = beta2 * v_position[tid] + (1.0 - beta2) * grad * grad;
         m_position[tid] = m;
@@ -564,7 +575,7 @@ kernel void adamStep(device Gaussian* gaussians [[buffer(0)]],
         
     // Scale
     {
-        float3 grad = g.scale;
+        float3 grad = float3(g.scale_x, g.scale_y, g.scale_z);
         float3 m = beta1 * m_scale[tid] + (1.0 - beta1) * grad;
         float3 v = beta2 * v_scale[tid] + (1.0 - beta2) * grad * grad;
         m_scale[tid] = m;

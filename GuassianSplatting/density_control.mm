@@ -35,7 +35,9 @@ void DensityController::accumulateGradients(MTL::CommandQueue *queue, MTL::Buffe
     uint32_t* count = (uint32_t*)gradientCount->contents();
     
     for(size_t i=0;i<gaussianCount;i++) {
-        float gradMag = simd_length(grads[i].position);
+        float gradMag = sqrtf(grads[i].position_x * grads[i].position_x +
+                              grads[i].position_y * grads[i].position_y +
+                              grads[i].position_z * grads[i].position_z);
         accum[i] += gradMag;
         count[i]++;
     }
@@ -67,7 +69,8 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             markers[i] = 1;
             stats.numPruned++;
         } else if(avgGrad > gradThreshold) {
-            if(maxScaleVal > 0.01f) {
+            // Split large Gaussians (scale > 0.1), clone small ones
+            if(maxScaleVal > 0.1f) {
                 markers[i] = 3;
                 stats.numSplit++;
             } else {

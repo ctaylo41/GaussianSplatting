@@ -26,11 +26,11 @@ public:
     void step(MTL::CommandQueue* queue,
               MTL::Buffer* gausians,
               MTL::Buffer* gradients,
-              float lr_position = 0.001,
-              float lr_scale = 0.01f,
-              float lr_rotation = 0.005f,
-              float lr_opacity = 0.1f,
-              float lr_sh = 0.01f);
+              float lr_position = 0.00001f,
+              float lr_scale = 0.001f,
+              float lr_rotation = 0.0005f,
+              float lr_opacity = 0.01f,
+              float lr_sh = 0.001f);
     
     void reset();
 

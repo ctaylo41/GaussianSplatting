@@ -26,9 +26,9 @@ public:
                        MTL::Buffer* gradientAccum,
                        size_t& gaussianCount,
                        size_t iteration,
-                       float gradThreshold = 0.0002f,
+                       float gradThreshold = 0.002f,
                        float minOpacity = 0.005f,
-                       float maxScale = 0.1f);
+                       float maxScale = 0.5f);
     
     void accumulateGradients(MTL::CommandQueue* queue,
                              MTL::Buffer* gradients,

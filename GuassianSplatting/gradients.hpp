@@ -8,9 +8,13 @@
 #include <simd/simd.h>
 
 struct GaussianGradients {
-    simd_float3 position;
+    float position_x;
+    float position_y;
+    float position_z;
     float opacity;
-    simd_float3 scale;
+    float scale_x;
+    float scale_y;
+    float scale_z;
     float _pad1;
     simd_float4 rotation;
     float sh[12];

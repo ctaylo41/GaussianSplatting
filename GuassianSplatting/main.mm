@@ -21,9 +21,10 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
     for (const auto& pt : colmap.points) {
         Gaussian g;
         g.position = pt.position;
-        g.scale = simd_make_float3(-5.0f, -5.0f, -5.01f);  // Small initial scale
+        // Initial scale: exp(-3) ≈ 0.05, gives reasonable starting size
+        g.scale = simd_make_float3(-3.0f, -3.0f, -3.0f);
         g.rotation = simd_make_float4(1, 0, 0, 0);         // Identity quaternion (w,x,y,z)
-        g.opacity = 0.0f;
+        g.opacity = -1.0f;  // sigmoid(-1) ≈ 0.27, moderately visible
         
         // Initialize SH from point color (DC term only)
         float SH_C0 = 0.28209479177387814f;

@@ -17,6 +17,7 @@
 #include "colmap_loader.hpp"
 #include "optimizer.hpp"
 #include "density_control.hpp"
+#include "tiled_rasterizer.hpp"
 
 struct Uniforms {
     simd_float4x4 viewMatrix;
@@ -96,39 +97,35 @@ private:
     simd_float4x4 projectionFromColmap(const ColmapCamera& cam, float nearZ, float farZ);
     simd_float4x4 viewMatrixFromColmap(simd_float4 quat, simd_float3 translation);
     
-    
+    // Render target for training
     MTL::Texture* renderTarget = nullptr;
+    void createRenderTarget(uint32_t width, uint32_t height);
+    
+    // Loss computation
     MTL::ComputePipelineState* lossComputePSO = nullptr;
     MTL::ComputePipelineState* reductionPSO = nullptr;
     MTL::Buffer* lossBuffer = nullptr;
     MTL::Buffer* totalLossBuffer = nullptr;
-    
-    void createRenderTarget(uint32_t width, uint32_t height);
     void createLossPipeline();
     float computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth);
-    void renderToTexture(const TrainingImage& img);
-    float trainStep(size_t imageIndex);
     
-    MTL::Texture* gradientTexture = nullptr;
+    // Tiled rasterizer for training
+    TiledRasterizer* tiledRasterizer = nullptr;
     MTL::Buffer* gaussianGradients = nullptr;
-    MTL::ComputePipelineState* pixelGradientPSO = nullptr;
-    MTL::ComputePipelineState* backwardPSO = nullptr;
     
-    void createBackwardPipeline();
-    void backward(const TrainingImage& img, MTL::Buffer* sortedIndices);
+    // Training step
+    float trainStep(size_t imageIndex);
+    void updatePositionBuffer();
     
+    // Optimizer and density control
     AdamOptimizer* optimizer = nullptr;
+    DensityController* densityController = nullptr;
+    size_t densityControlInterval = 100;
     
+    // Training state
     bool isTraining = false;
     size_t currentEpoch = 0;
     size_t currentImageIdx = 0;
     float epochLoss = 0.0f;
     size_t epochIterations = 0;
-    void updatePositionBuffer();
-    
-    DensityController* densityController = nullptr;
-    size_t densityControlInterval = 100;
-    
-    
-
 };
