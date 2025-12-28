@@ -35,7 +35,8 @@ public:
     void cleanup();
     void loadGaussians(const std::vector<Gaussian>& gaussians);
     void loadTrainingData(const ColmapData& colmap, const std::string& imagePath);
-
+    void train(size_t numEpochs);
+    void initHeadless();
 
 private:
     void initDevice();
@@ -127,4 +128,7 @@ private:
     
     DensityController* densityController = nullptr;
     size_t densityControlInterval = 100;
+    
+    
+
 };

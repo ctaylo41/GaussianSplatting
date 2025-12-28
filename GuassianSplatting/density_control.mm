@@ -12,18 +12,9 @@
 DensityController::DensityController(MTL::Device* device, MTL::Library* library):device(device),maxGaussians(2000000) {
     NS::Error* error = nullptr;
     
-    MTL::Function* markFunc = library->newFunction(NS::String::string("markGaussians", NS::ASCIIStringEncoding));
-    markPSO = device->newComputePipelineState(markFunc, &error);
-    markFunc->release();
-    
-    MTL::Function* splitCloneFunc = library->newFunction(NS::String::string("splitCloneGaussians", NS::ASCIIStringEncoding));
-    splitClonePSO = device->newComputePipelineState(splitCloneFunc, &error);
-    splitCloneFunc->release();
-    
     gradientAccum = device->newBuffer(maxGaussians * sizeof(float), MTL::ResourceStorageModeShared);
     gradientCount = device->newBuffer(maxGaussians * sizeof(uint32_t), MTL::ResourceStorageModeShared);
     markerBuffer = device->newBuffer(maxGaussians * sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    prefixSumBuffer = device->newBuffer(maxGaussians * sizeof(uint32_t), MTL::ResourceStorageModeShared);
     
 }
 
@@ -31,9 +22,6 @@ DensityController::~DensityController() {
     gradientAccum->release();
     gradientCount->release();
     markerBuffer->release();
-    prefixSumBuffer->release();
-    markPSO->release();
-    splitClonePSO->release();
 }
 
 void DensityController::resetAccumulator(size_t gaussianCount) {
@@ -91,7 +79,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
         }
     }
     
-    size_t newCount = gaussianCount - stats.numPruned + stats.numSplit + stats.numSplit;
+    size_t newCount = gaussianCount - stats.numPruned + stats.numCloned + stats.numSplit;
     
     if(newCount > maxGaussians) {
         std::cout << "Warning would exceed max gaussians skipping density control" << std::endl;

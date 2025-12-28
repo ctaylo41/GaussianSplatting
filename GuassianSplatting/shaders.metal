@@ -272,135 +272,171 @@ kernel void backwardPass(device const Gaussian* gaussians [[buffer(0)]],
                          uint tid [[thread_position_in_grid]]) {
     if (tid >= numGaussians) return;
     
-    uint gaussiansIdx = sortedIndices[tid];
-    Gaussian g = gaussians[gaussiansIdx];
+    uint gaussianIdx = sortedIndices[tid];
+    Gaussian g = gaussians[gaussianIdx];
     
-    // project gaussian to screen for forward pass
+    // Initialize gradients to zero
+    GaussianGradients grad = {};
+    
+    // Check for NaN in input
+    if (isnan(g.position.x) || isnan(g.position.y) || isnan(g.position.z)) {
+        gradients[gaussianIdx] = grad;
+        return;
+    }
+    
     float4 worldPos = float4(g.position, 1.0);
     float4 viewPos = uniforms.viewMatrix * worldPos;
     float4 clipPos = uniforms.viewProjectionMatrix * worldPos;
     
-    if(clipPos.w <= 0.0) {
-        //behind camera zero gradients
-        gradients[gaussiansIdx] = GaussianGradients{};
+    // Behind camera or invalid
+    if (clipPos.w <= 0.01) {
+        gradients[gaussianIdx] = grad;
         return;
     }
     
     float z_cam = viewPos.z;
+    if (abs(z_cam) < 0.01) {
+        gradients[gaussianIdx] = grad;
+        return;
+    }
+    
     float3 ndc = clipPos.xyz / clipPos.w;
-    float2 screenPos = float2((ndc.x*0.5 + 0.5) * uniforms.screenSize.x,
-                              (1.0 - (ndc.y * 0.5 +0.5)) * uniforms.screenSize.y);
     
-    float3 scale = exp(g.scale);
-    float4 q = normalize(g.rotation);
-    float r  = q.x, x = q.y, y = q.z, z = q.w;
+    // Check NDC bounds
+    if (abs(ndc.x) > 1.5 || abs(ndc.y) > 1.5) {
+        gradients[gaussianIdx] = grad;
+        return;
+    }
     
-    float3x3 R = float3x3(1.0 - 2.0*(y*y + z*z), 2.0*(x*y - r*z), 2.0*(x*z + r*y),
-                          2.0 * (x*y + r*z), 1.0 - 2.0*(x*x + z*z), 2.0*(y*z - r*x),
-                          2.0 * (x*z - r*y), 2.0 * (y*z + r*x), 1.0 - 2.0 * (x*x + y*y));
+    float2 screenPos = float2(
+        (ndc.x * 0.5 + 0.5) * uniforms.screenSize.x,
+        (1.0 - (ndc.y * 0.5 + 0.5)) * uniforms.screenSize.y
+    );
     
-    float3x3 S = float3x3(scale.x, 0, 0,
-                          0, scale.y, 0,
-                          0, 0, scale.z);
+    // Clamp scale to reasonable range to prevent explosion
+    float3 rawScale = clamp(g.scale, -10.0f, 10.0f);
+    float3 scale = exp(rawScale);
     
+    float4 q = g.rotation;
+    float qLen = length(q);
+    if (qLen < 0.001) {
+        q = float4(1, 0, 0, 0);
+    } else {
+        q = q / qLen;
+    }
+    
+    float r = q.x, x = q.y, y = q.z, z = q.w;
+    
+    float3x3 R = float3x3(
+        1.0 - 2.0*(y*y + z*z), 2.0*(x*y - r*z), 2.0*(x*z + r*y),
+        2.0*(x*y + r*z), 1.0 - 2.0*(x*x + z*z), 2.0*(y*z - r*x),
+        2.0*(x*z - r*y), 2.0*(y*z + r*x), 1.0 - 2.0*(x*x + y*y)
+    );
+    
+    float3x3 S = float3x3(scale.x, 0, 0, 0, scale.y, 0, 0, 0, scale.z);
     float3x3 M = R * S;
     float3x3 Sigma3D = M * transpose(M);
     
-    float3x3 viewRot = float3x3(uniforms.viewMatrix.columns[0].xyz,
-                                uniforms.viewMatrix.columns[1].xyz,
-                                uniforms.viewMatrix.columns[2].xyz);
-    
+    float3x3 viewRot = float3x3(
+        uniforms.viewMatrix.columns[0].xyz,
+        uniforms.viewMatrix.columns[1].xyz,
+        uniforms.viewMatrix.columns[2].xyz
+    );
     
     float fx = uniforms.focalLength.x;
     float fy = uniforms.focalLength.y;
     float z2 = z_cam * z_cam;
     
-    float2x3 J = float2x3(fx / z_cam, 0, -fx * viewPos.x / z2,
-                           0, fy / z_cam, -fy * viewPos.y / z2);
+    // Clamp Jacobian values
+    float j00 = clamp(fx / z_cam, -10000.0f, 10000.0f);
+    float j02 = clamp(-fx * viewPos.x / z2, -10000.0f, 10000.0f);
+    float j11 = clamp(fy / z_cam, -10000.0f, 10000.0f);
+    float j12 = clamp(-fy * viewPos.y / z2, -10000.0f, 10000.0f);
     
+    float2x3 J = float2x3(j00, 0, j02, 0, j11, j12);
     
-    float3x3 Sigma_view  = viewRot * Sigma3D * transpose(viewRot);
-    
+    float3x3 Sigma_view = viewRot * Sigma3D * transpose(viewRot);
     
     float a = 0, b = 0, c = 0;
-    for(int i=0;i<3;i++) {
-        for(int j=0;j<3;j++) {
-            a+=J[0][i] * Sigma_view[i][j] * J[0][j];
-            b+=J[0][i] * Sigma_view[i][j] * J[1][j];
-            c+=J[1][i] * Sigma_view[i][j] * J[1][j];
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            a += J[0][i] * Sigma_view[i][j] * J[0][j];
+            b += J[0][i] * Sigma_view[i][j] * J[1][j];
+            c += J[1][i] * Sigma_view[i][j] * J[1][j];
         }
     }
     
-    a+=0.3;
-    c+=0.3;
+    a += 0.3;
+    c += 0.3;
     
-    float det = a * c - b*b;
-    if (det <= 0.0) {
-        gradients[gaussiansIdx] = GaussianGradients{};
+    float det = a * c - b * b;
+    if (det < 0.0001) {
+        gradients[gaussianIdx] = grad;
         return;
     }
     
-    float inv_det = 1.0/det;
+    float inv_det = 1.0 / det;
     float cov_inv_00 = c * inv_det;
     float cov_inv_01 = -b * inv_det;
     float cov_inv_11 = a * inv_det;
     
-    float radius = 3.0 * sqrt(max(a,c));
+    float radius = min(3.0 * sqrt(max(a, c)), 64.0f);
     
     int2 minBound = int2(max(0, int(screenPos.x - radius)), max(0, int(screenPos.y - radius)));
     int2 maxBound = int2(min(int(uniforms.screenSize.x) - 1, int(screenPos.x + radius)),
                          min(int(uniforms.screenSize.y) - 1, int(screenPos.y + radius)));
-
     
-    float opacity = 1.0 / (1.0 + exp(-g.opacity));
+    int numPixels = (maxBound.x - minBound.x + 1) * (maxBound.y - minBound.y + 1);
+    if (numPixels <= 0 || numPixels > 16384) {
+        gradients[gaussianIdx] = grad;
+        return;
+    }
+    
+    float opacity = 1.0 / (1.0 + exp(-clamp(g.opacity, -10.0f, 10.0f)));
     
     float SH_C0 = 0.28209479177387814;
     float3 color = clamp(float3(
         SH_C0 * g.sh[0] + 0.5,
         SH_C0 * g.sh[1] + 0.5,
         SH_C0 * g.sh[2] + 0.5
-    ),0.0, 1.0);
-    
-
-    GaussianGradients grad = {};
+    ), 0.0, 1.0);
     
     float2 dL_dScreenPos = float2(0);
     float dL_dCov00 = 0, dL_dCov01 = 0, dL_dCov11 = 0;
-    for (int py = minBound.y; py<= maxBound.y;py++) {
-        for(int px=minBound.x;px<=maxBound.x;px++) {
-            float2 d = float2(px,py) - screenPos;
+    
+    for (int py = minBound.y; py <= maxBound.y; py++) {
+        for (int px = minBound.x; px <= maxBound.x; px++) {
+            float2 d = float2(px, py) - screenPos;
             
             float power = -0.5 * (cov_inv_00 * d.x * d.x + 2.0 * cov_inv_01 * d.x * d.y + cov_inv_11 * d.y * d.y);
-            if (power > 0.0) continue;
+            if (power > 0.0 || power < -4.5) continue;
             
             float G = exp(power);
             float alpha = opacity * G;
+            if (alpha < 1.0/255.0) continue;
             
-            if(alpha<1.0/255.0) continue;
-            
-            float4 r = rendered.read(uint2(px, py));
-            float4 gt = groundTruth.read(uint2(px, py));
+            float4 r_pix = rendered.read(uint2(px, py));
+            float4 gt_pix = groundTruth.read(uint2(px, py));
             
             float3 dL_dC = float3(
-                (r.r > gt.r) ? 1.0 : -1.0,
-                (r.g > gt.g) ? 1.0 : -1.0,
-                (r.b > gt.b) ? 1.0 : -1.0
+                (r_pix.r > gt_pix.r) ? 1.0 : -1.0,
+                (r_pix.g > gt_pix.g) ? 1.0 : -1.0,
+                (r_pix.b > gt_pix.b) ? 1.0 : -1.0
             );
-            
-            float T = max(1.0 - r.a, 0.01);
-            
+            //full tiled backward pass
+            //float T = max(1.0 - r_pix.a, 0.01);
+            float T = 1.0f;
             float weight = alpha * T;
             float dL_dAlpha = dot(dL_dC, color) * T;
-            
             float dL_dG = dL_dAlpha * opacity;
             
-            float2 cov_inv_d = float2(cov_inv_00 * d.x + cov_inv_01 * d.y,
-                                      cov_inv_01 * d.x + cov_inv_11 * d.y);
-            
+            float2 cov_inv_d = float2(
+                cov_inv_00 * d.x + cov_inv_01 * d.y,
+                cov_inv_01 * d.x + cov_inv_11 * d.y
+            );
             dL_dScreenPos += dL_dG * G * cov_inv_d;
             
             float dL_dPower = dL_dG * G;
-            
             float d_power_d_cov_inv_00 = -0.5 * d.x * d.x;
             float d_power_d_cov_inv_01 = -d.x * d.y;
             float d_power_d_cov_inv_11 = -0.5 * d.y * d.y;
@@ -412,60 +448,61 @@ kernel void backwardPass(device const Gaussian* gaussians [[buffer(0)]],
             float dL_dCovInv11 = dL_dPower * d_power_d_cov_inv_11;
             
             dL_dCov00 += -dL_dCovInv00 * c * c * inv_det2
-                         + dL_dCovInv01 * b * c * inv_det2
-                         + dL_dCovInv11 * (inv_det - a * c * inv_det2);
+                        + dL_dCovInv01 * b * c * inv_det2
+                        + dL_dCovInv11 * (inv_det - a * c * inv_det2);
             dL_dCov01 += dL_dCovInv00 * 2 * b * c * inv_det2
-                         + dL_dCovInv01 * (-inv_det - 2 * b * b * inv_det2)
-                         + dL_dCovInv11 * 2 * a * b * inv_det2;
+                        + dL_dCovInv01 * (-inv_det - 2 * b * b * inv_det2)
+                        + dL_dCovInv11 * 2 * a * b * inv_det2;
             dL_dCov11 += dL_dCovInv00 * (inv_det - a * c * inv_det2)
-                         + dL_dCovInv01 * a * b * inv_det2
-                         - dL_dCovInv11 * a * a * inv_det2;
+                        + dL_dCovInv01 * a * b * inv_det2
+                        - dL_dCovInv11 * a * a * inv_det2;
             
             grad.sh[0] += dL_dC.r * weight * SH_C0;
             grad.sh[1] += dL_dC.g * weight * SH_C0;
             grad.sh[2] += dL_dC.b * weight * SH_C0;
             
-            float sigmoid_deriv = opacity * (1.0 - opacity);  // sigmoid derivative
+            float sigmoid_deriv = opacity * (1.0 - opacity);
             grad.opacity += dL_dAlpha * G * sigmoid_deriv;
         }
     }
     
-    //backprop from screen space to 3d
+    // Backprop position
+    float3x3 VP3 = float3x3(
+        uniforms.viewProjectionMatrix.columns[0].xyz,
+        uniforms.viewProjectionMatrix.columns[1].xyz,
+        uniforms.viewProjectionMatrix.columns[2].xyz
+    );
     
-    float3x3 VP3 = float3x3(uniforms.viewProjectionMatrix.columns[0].xyz,
-                            uniforms.viewProjectionMatrix.columns[1].xyz,
-                            uniforms.viewProjectionMatrix.columns[2].xyz);
+    float2 dL_dNDC = float2(dL_dScreenPos.x * uniforms.screenSize.x *0.5,
+                            dL_dScreenPos.y * -uniforms.screenSize.y * 0.5);
     
     float w = clipPos.w;
-    float2 d_screen_d_ndcX = float2(uniforms.screenSize.x * 0.5, 0);
-    float2 d_screen_d_ndcY = float2(0, -uniforms.screenSize.y * 0.5);
-    
-    float3 dL_dClip;
-    dL_dClip.x = (dL_dScreenPos.x * d_screen_d_ndcX.x) / w;
-    dL_dClip.y = (dL_dScreenPos.y * d_screen_d_ndcY.y) / w;
+    float4 dL_dClip;
+    dL_dClip.x = dL_dNDC.x / w;
+    dL_dClip.y = dL_dNDC.y / w;
     dL_dClip.z = 0;
+    dL_dClip.w = -(dL_dNDC.x * ndc.x + dL_dNDC.y * ndc.y) / w;
     
-    grad.position = transpose(VP3) * dL_dClip;
+    grad.position = (transpose(uniforms.viewProjectionMatrix) * dL_dClip).xyz;
     
+    // Backprop scale and rotation
     float3x3 dL_dSigmaView = float3x3(0);
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
             dL_dSigmaView[i][j] = J[0][i] * J[0][j] * dL_dCov00
-                                 + (J[0][i] * J[1][j] + J[1][i] * J[0][j]) * dL_dCov01
-                                 + J[1][i] * J[1][j] * dL_dCov11;
+                                + (J[0][i] * J[1][j] + J[1][i] * J[0][j]) * dL_dCov01
+                                + J[1][i] * J[1][j] * dL_dCov11;
         }
     }
     
     float3x3 dL_dSigma3D = transpose(viewRot) * dL_dSigmaView * viewRot;
-
     float3x3 dL_dM = 2.0 * dL_dSigma3D * M;
-
     float3x3 dL_dS = transpose(R) * dL_dM;
-
+    
     grad.scale = float3(dL_dS[0][0], dL_dS[1][1], dL_dS[2][2]) * scale;
-
+    
     float3x3 dL_dR = dL_dM * transpose(S);
-
+    
     float dL_dr = 2.0 * (-z * (dL_dR[0][1] - dL_dR[1][0]) + y * (dL_dR[0][2] - dL_dR[2][0]) - x * (dL_dR[1][2] - dL_dR[2][1]));
     float dL_dx = 2.0 * (y * (dL_dR[0][1] + dL_dR[1][0]) + z * (dL_dR[0][2] + dL_dR[2][0]) - 2*x * (dL_dR[1][1] + dL_dR[2][2]));
     float dL_dy = 2.0 * (x * (dL_dR[0][1] + dL_dR[1][0]) - 2*y * (dL_dR[0][0] + dL_dR[2][2]) + z * (dL_dR[1][2] + dL_dR[2][1]));
@@ -473,8 +510,14 @@ kernel void backwardPass(device const Gaussian* gaussians [[buffer(0)]],
     
     grad.rotation = float4(dL_dr, dL_dx, dL_dy, dL_dz);
     
-    gradients[gaussiansIdx] = grad;
-
+    // Final NaN check - zero out if any NaN
+    if (isnan(grad.position.x) || isnan(grad.position.y) || isnan(grad.position.z) ||
+        isnan(grad.scale.x) || isnan(grad.scale.y) || isnan(grad.scale.z) ||
+        isnan(grad.opacity) || isnan(grad.rotation.x)) {
+        grad = GaussianGradients{};
+    }
+    
+    gradients[gaussianIdx] = grad;
 }
 
 kernel void adamStep(device Gaussian* gaussians [[buffer(0)]],

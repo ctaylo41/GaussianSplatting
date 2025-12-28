@@ -38,13 +38,10 @@ public:
 
 private:
     MTL::Device* device;
-    MTL::ComputePipelineState* markPSO;
-    MTL::ComputePipelineState* splitClonePSO;
     
     MTL::Buffer* gradientAccum;
     MTL::Buffer* gradientCount;
     MTL::Buffer* markerBuffer;
-    MTL::Buffer* prefixSumBuffer;
     
     size_t maxGaussians;
 };

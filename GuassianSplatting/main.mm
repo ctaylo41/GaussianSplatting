@@ -21,9 +21,9 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
     for (const auto& pt : colmap.points) {
         Gaussian g;
         g.position = pt.position;
-        g.scale = simd_make_float3(0.01f, 0.01f, 0.01f);  // Small initial scale
+        g.scale = simd_make_float3(-5.0f, -5.0f, -5.01f);  // Small initial scale
         g.rotation = simd_make_float4(1, 0, 0, 0);         // Identity quaternion (w,x,y,z)
-        g.opacity = 0.5f;
+        g.opacity = 0.0f;
         
         // Initialize SH from point color (DC term only)
         float SH_C0 = 0.28209479177387814f;
@@ -86,10 +86,10 @@ int main() {
 
     
     MTLEngine engine;
-    engine.init();
+    engine.initHeadless();
     engine.loadTrainingData(colmap, "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images");
     engine.loadGaussians(gaussians);
-    engine.run(camera);
+    engine.train(10);
     engine.cleanup();
     return 0;
 }

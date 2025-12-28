@@ -4,7 +4,7 @@
 //
 //  Created by Colin Taylor Taylor on 2025-12-27.
 //
-
+#pragma once
 #include <simd/simd.h>
 
 struct GaussianGradients {
