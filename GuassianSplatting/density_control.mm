@@ -27,6 +27,15 @@ DensityController::DensityController(MTL::Device* device, MTL::Library* library)
     
 }
 
+DensityController::~DensityController() {
+    gradientAccum->release();
+    gradientCount->release();
+    markerBuffer->release();
+    prefixSumBuffer->release();
+    markPSO->release();
+    splitClonePSO->release();
+}
+
 void DensityController::resetAccumulator(size_t gaussianCount) {
     memset(gradientAccum->contents(), 0, gaussianCount * sizeof(float));
     memset(gradientCount->contents(), 0, gaussianCount * sizeof(uint32_t));
