@@ -13,6 +13,7 @@
 #include <cstddef>
 #include "colmap_loader.hpp"
 #include "image_loader.hpp"
+#include "ply_exporter.hpp"
 
 std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
     std::vector<Gaussian> gaussians;
@@ -26,24 +27,15 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
         g.position = pt.position;
         
         // Initial scale: exp(-4) ≈ 0.018, gives small starting size
-        // Paper suggests initializing based on mean distance to nearest points
         g.scale = simd_make_float3(-4.0f, -4.0f, -4.0f);
         
         // Identity quaternion in (w, x, y, z) format stored as (x=w, y=x, z=y, w=z)
-        // Based on your quaternionToMatrix: float w = q.x, x = q.y, y = q.z, z = q.w;
-        g.rotation = simd_make_float4(1.0f, 0.0f, 0.0f, 0.0f);  // (w=1, x=0, y=0, z=0)
+        g.rotation = simd_make_float4(1.0f, 0.0f, 0.0f, 0.0f);
         
-        // Initial opacity: sigmoid(-2) ≈ 0.12, gives moderately transparent starting point
+        // Initial opacity: sigmoid(-2) ≈ 0.12
         g.opacity = -2.0f;
         
         // Initialize SH coefficients
-        // SH layout: sh[0-3] = R coefficients (DC, then first order)
-        //            sh[4-7] = G coefficients
-        //            sh[8-11] = B coefficients
-        // DC term: color = SH_C0 * sh_dc + 0.5
-        // So: sh_dc = (color - 0.5) / SH_C0
-        
-        // Initialize all to zero first
         for (int i = 0; i < 12; i++) {
             g.sh[i] = 0.0f;
         }
@@ -62,9 +54,45 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
 }
 
 
-int main() {
-    printf("sizeof(ProjectedGaussian): %zu\n", sizeof(ProjectedGaussian));
-    ColmapData colmap = loadColmap("/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/");
+int main(int argc, char* argv[]) {
+    
+    // Default paths - can be overridden with command line args
+    std::string colmapPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/";
+    std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images";
+    std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
+    size_t numEpochs = 10;  // Default to 30 epochs for decent quality
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--colmap" && i + 1 < argc) {
+            colmapPath = argv[++i];
+        } else if (arg == "--images" && i + 1 < argc) {
+            imagePath = argv[++i];
+        } else if (arg == "--output" && i + 1 < argc) {
+            outputPath = argv[++i];
+        } else if (arg == "--epochs" && i + 1 < argc) {
+            numEpochs = std::stoi(argv[++i]);
+        } else if (arg == "--help") {
+            std::cout << "Usage: " << argv[0] << " [options]\n"
+                      << "Options:\n"
+                      << "  --colmap PATH   Path to COLMAP sparse reconstruction\n"
+                      << "  --images PATH   Path to training images\n"
+                      << "  --output PATH   Output PLY file path\n"
+                      << "  --epochs N      Number of training epochs (default: 30)\n"
+                      << "  --help          Show this help message\n";
+            return 0;
+        }
+    }
+    
+    std::cout << "=== Gaussian Splatting Training ===" << std::endl;
+    std::cout << "COLMAP path: " << colmapPath << std::endl;
+    std::cout << "Images path: " << imagePath << std::endl;
+    std::cout << "Output PLY: " << outputPath << std::endl;
+    std::cout << "Epochs: " << numEpochs << std::endl;
+    std::cout << std::endl;
+    
+    ColmapData colmap = loadColmap(colmapPath);
     
     auto gaussians = gaussiansFromColmap(colmap);
     
@@ -134,12 +162,75 @@ int main() {
 
     MTLEngine engine;
     engine.initHeadless();
-    engine.loadTrainingData(colmap, "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images");
+    engine.loadTrainingData(colmap, imagePath);
     engine.loadGaussians(gaussians);
     
     printf("\n=== Starting Training ===\n");
-    engine.train(10);
+    engine.train(numEpochs);
     
+    // Export trained Gaussians to PLY
+    printf("\n=== Exporting PLY ===\n");
+    const Gaussian* trainedGaussians = engine.getGaussians();
+    size_t gaussianCount = engine.getGaussianCount();
+    
+    if (trainedGaussians && gaussianCount > 0) {
+        PLYExporter::exportPLY(outputPath, trainedGaussians, gaussianCount);
+    } else {
+        std::cerr << "Error: No Gaussians to export!" << std::endl;
+    }
+    
+    // Now switch to viewer mode
+    printf("\n=== Starting Viewer ===\n");
+    printf("Controls:\n");
+    printf("  Left mouse drag: Orbit camera\n");
+    printf("  Right mouse drag: Pan camera\n");
+    printf("  Scroll: Zoom in/out\n");
+    printf("  T: Toggle training view\n");
+    printf("  Space: Toggle training (if in interactive mode)\n");
+    printf("  Arrow keys: Switch training images\n");
+    printf("  ESC: Exit\n\n");
+    
+    // Reinitialize with window for viewing
     engine.cleanup();
+    
+    MTLEngine viewerEngine;
+    viewerEngine.init();  // Full init with window
+    
+    // Reload the trained Gaussians from the exported PLY
+    auto loadedGaussians = load_ply(outputPath);
+    if (loadedGaussians.empty()) {
+        std::cerr << "Error: Failed to load exported PLY!" << std::endl;
+        return 1;
+    }
+    
+    viewerEngine.loadGaussians(loadedGaussians);
+    
+    // Recompute camera for the potentially changed scene
+    min_x = FLT_MAX; min_y = FLT_MAX; min_z = FLT_MAX;
+    max_x = -FLT_MAX; max_y = -FLT_MAX; max_z = -FLT_MAX;
+    
+    for (const Gaussian& g : loadedGaussians) {
+        min_x = fmin(min_x, g.position.x);
+        max_x = fmax(max_x, g.position.x);
+        min_y = fmin(min_y, g.position.y);
+        max_y = fmax(max_y, g.position.y);
+        min_z = fmin(min_z, g.position.z);
+        max_z = fmax(max_z, g.position.z);
+    }
+    
+    center = simd_make_float3(
+        (min_x + max_x) / 2.0f,
+        (min_y + max_y) / 2.0f,
+        (min_z + max_z) / 2.0f
+    );
+    diagonal = simd_length(simd_make_float3(max_x - min_x, max_y - min_y, max_z - min_z));
+    
+    Camera viewerCamera = Camera(center, 0, 0.3f, 1.5f * diagonal,
+                                  45.0f * M_PI / 180.0f, 800.0f / 600.0f,
+                                  0.1f, 10.0f * diagonal);
+    
+    viewerEngine.run(viewerCamera);
+    viewerEngine.cleanup();
+    
     return 0;
 }

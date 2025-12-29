@@ -38,6 +38,13 @@ public:
     void loadTrainingData(const ColmapData& colmap, const std::string& imagePath);
     void train(size_t numEpochs);
     void initHeadless();
+    const Gaussian* getGaussians() const {
+            return gaussianBuffer ? (const Gaussian*)gaussianBuffer->contents() : nullptr;
+    };
+    size_t getGaussianCount() const {
+        return gaussianCount;
+    };
+
 
 private:
     void initDevice();
