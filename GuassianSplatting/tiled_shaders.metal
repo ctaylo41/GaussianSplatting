@@ -277,7 +277,7 @@ kernel void tiledForward(
 }
 
 // ============================================================================
-// Tiled backward pass
+// Tiled backward pass - OPTIMIZED with threadgroup reduction
 // ============================================================================
 
 kernel void tiledBackward(
@@ -291,131 +291,148 @@ kernel void tiledBackward(
     device const uint* lastIdx [[buffer(7)]],
     texture2d<float, access::read> rendered [[texture(0)]],
     texture2d<float, access::read> groundTruth [[texture(1)]],
-    uint2 gid [[thread_position_in_grid]])
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]])
 {
-    if (gid.x >= uint(uniforms.screenSize.x) || gid.y >= uint(uniforms.screenSize.y)) return;
+    // Shared memory for gradient accumulation within tile
+    threadgroup float tg_sh_grads[TILE_SIZE * TILE_SIZE][3];      // SH gradients per thread
+    threadgroup float tg_opacity_grads[TILE_SIZE * TILE_SIZE];
+    threadgroup float tg_pos_grads[TILE_SIZE * TILE_SIZE][2];
+    threadgroup float tg_scale_grads[TILE_SIZE * TILE_SIZE];
+    threadgroup uint tg_gaussian_idx[TILE_SIZE * TILE_SIZE];
     
-    uint tileIdx = (gid.y / TILE_SIZE) * uniforms.numTilesX + (gid.x / TILE_SIZE);
-    uint pixelIdx = gid.y * uint(uniforms.screenSize.x) + gid.x;
+    uint localIdx = tid.y * TILE_SIZE + tid.x;
+    uint tileIdx = tgid.y * uniforms.numTilesX + tgid.x;
     TileRange range = tileRanges[tileIdx];
+    
+    bool validPixel = (gid.x < uint(uniforms.screenSize.x) && gid.y < uint(uniforms.screenSize.y));
+    uint pixelIdx = gid.y * uint(uniforms.screenSize.x) + gid.x;
+    
+    float2 pixelPos = float2(gid) + 0.5;
+    float3 dL_dPix = float3(0);
+    uint endIdx = 0;
+    
+    if (validPixel) {
+        float4 r_pix = rendered.read(gid);
+        float4 gt_pix = groundTruth.read(gid);
+        
+        // L1 loss gradient
+        dL_dPix = float3(
+            (r_pix.r > gt_pix.r) ? 1.0 : -1.0,
+            (r_pix.g > gt_pix.g) ? 1.0 : -1.0,
+            (r_pix.b > gt_pix.b) ? 1.0 : -1.0
+        );
+        
+        endIdx = lastIdx[pixelIdx];
+    }
     
     if (range.count == 0) return;
     
-    uint endIdx = lastIdx[pixelIdx];
-    if (endIdx == UINT_MAX) return;  // No contributing Gaussians
-    
-    float2 pixelPos = float2(gid) + 0.5;
-    
-    float4 r_pix = rendered.read(gid);
-    float4 gt_pix = groundTruth.read(gid);
-    
-    // L1 loss gradient: sign(rendered - ground_truth)
-    float3 dL_dPix = float3(
-        (r_pix.r > gt_pix.r) ? 1.0 : -1.0,
-        (r_pix.g > gt_pix.g) ? 1.0 : -1.0,
-        (r_pix.b > gt_pix.b) ? 1.0 : -1.0
-    );
-    
-    // First pass forward to collect alphas and colors for backward
-    // We need to store these for proper gradient computation
-    float T_final = transmittance[pixelIdx];
-    
-    // For the backward pass, we need to track accumulated color after each gaussian
-    // C = sum_i (c_i * alpha_i * T_i) where T_i = prod_{j<i}(1 - alpha_j)
-    // dL/d(c_i) = dL/dC * alpha_i * T_i
-    // dL/d(alpha_i) = dL/dC * (c_i * T_i - C_after_i / (1-alpha_i)) -- this is complex
-    
-    // Simpler approach: forward pass to reconstruct state, then compute gradients
+    // Process gaussians in batches to reduce atomic contention
     float T = 1.0;
-    float3 accum_color = float3(0);
     
-    // Forward pass to compute gradients directly
-    for (uint i = range.start; i <= endIdx; i++) {
-        if (T <= 0.001) break;
+    for (uint i = range.start; i < range.start + range.count; i++) {
+        // Initialize thread-local gradients
+        tg_sh_grads[localIdx][0] = 0;
+        tg_sh_grads[localIdx][1] = 0;
+        tg_sh_grads[localIdx][2] = 0;
+        tg_opacity_grads[localIdx] = 0;
+        tg_pos_grads[localIdx][0] = 0;
+        tg_pos_grads[localIdx][1] = 0;
+        tg_scale_grads[localIdx] = 0;
         
         uint gIdx = sortedIndices[i];
-        ProjectedGaussian p = projected[gIdx];
-        Gaussian g = gaussians[gIdx];
+        tg_gaussian_idx[localIdx] = gIdx;
         
-        if (p.radius <= 0) continue;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         
-        float2 d = pixelPos - p.screenPos;
-        float power = -0.5 * (p.conic.x * d.x * d.x + 2.0 * p.conic.y * d.x * d.y + p.conic.z * d.y * d.y);
+        if (validPixel && endIdx != UINT_MAX && i <= endIdx && T > 0.001) {
+            ProjectedGaussian p = projected[gIdx];
+            
+            if (p.radius > 0) {
+                float2 d = pixelPos - p.screenPos;
+                float power = -0.5 * (p.conic.x * d.x * d.x + 2.0 * p.conic.y * d.x * d.y + p.conic.z * d.y * d.y);
+                
+                if (power <= 0.0 && power >= -4.5) {
+                    float G = exp(power);
+                    float alpha = min(p.opacity * G, 0.99f);
+                    
+                    if (alpha >= 1.0/255.0) {
+                        float weight = alpha * T;
+                        float3 dL_dC = dL_dPix * weight;
+                        
+                        // Store gradients in threadgroup memory
+                        tg_sh_grads[localIdx][0] = dL_dC.r * SH_C0;
+                        tg_sh_grads[localIdx][1] = dL_dC.g * SH_C0;
+                        tg_sh_grads[localIdx][2] = dL_dC.b * SH_C0;
+                        
+                        float dL_dAlpha = dot(dL_dPix, p.color * T);
+                        float sigmoid_val = p.opacity;
+                        float sig_deriv = sigmoid_val * (1.0 - sigmoid_val);
+                        tg_opacity_grads[localIdx] = dL_dAlpha * G * sig_deriv;
+                        
+                        float dP_ddx = -(p.conic.x * d.x + p.conic.y * d.y);
+                        float dP_ddy = -(p.conic.y * d.x + p.conic.z * d.y);
+                        float dL_dG = dL_dAlpha * sigmoid_val;
+                        float dG_dP = G;
+                        
+                        float inv_z = 1.0 / max(abs(p.depth), 0.1f);
+                        float fx = uniforms.focalLength.x;
+                        float fy = uniforms.focalLength.y;
+                        
+                        tg_pos_grads[localIdx][0] = -dL_dG * dG_dP * dP_ddx * inv_z * fx * 0.5;
+                        tg_pos_grads[localIdx][1] = -dL_dG * dG_dP * dP_ddy * inv_z * fy * 0.5;
+                        
+                        float dL_dPower = dL_dG * G;
+                        float distSq = d.x * d.x + d.y * d.y;
+                        tg_scale_grads[localIdx] = dL_dPower * distSq * 0.001f;
+                        
+                        T *= (1.0 - alpha);
+                    }
+                }
+            }
+        }
         
-        if (power > 0.0 || power < -4.5) continue;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         
-        float G = exp(power);
-        float alpha = min(p.opacity * G, 0.99f);
-        if (alpha < 1.0/255.0) continue;
+        // Parallel reduction within threadgroup (only first thread writes)
+        if (localIdx == 0) {
+            float sum_sh0 = 0, sum_sh1 = 0, sum_sh2 = 0;
+            float sum_opacity = 0;
+            float sum_pos_x = 0, sum_pos_y = 0;
+            float sum_scale = 0;
+            
+            for (uint j = 0; j < TILE_SIZE * TILE_SIZE; j++) {
+                sum_sh0 += tg_sh_grads[j][0];
+                sum_sh1 += tg_sh_grads[j][1];
+                sum_sh2 += tg_sh_grads[j][2];
+                sum_opacity += tg_opacity_grads[j];
+                sum_pos_x += tg_pos_grads[j][0];
+                sum_pos_y += tg_pos_grads[j][1];
+                sum_scale += tg_scale_grads[j];
+            }
+            
+            // Single atomic write per gaussian per tile (instead of per pixel!)
+            if (sum_sh0 != 0 || sum_sh1 != 0 || sum_sh2 != 0) {
+                atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0], sum_sh0, memory_order_relaxed);
+                atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[1], sum_sh1, memory_order_relaxed);
+                atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[2], sum_sh2, memory_order_relaxed);
+            }
+            if (sum_opacity != 0) {
+                atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].opacity, sum_opacity, memory_order_relaxed);
+            }
+            if (sum_pos_x != 0 || sum_pos_y != 0) {
+                atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_x, sum_pos_x, memory_order_relaxed);
+                atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_y, sum_pos_y, memory_order_relaxed);
+            }
+            if (sum_scale != 0) {
+                atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_x, sum_scale, memory_order_relaxed);
+                atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_y, sum_scale, memory_order_relaxed);
+                atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_z, sum_scale, memory_order_relaxed);
+            }
+        }
         
-        float weight = alpha * T;
-        
-        // SH gradients: dL/d(sh) = dL/dC * dC/d(color) * d(color)/d(sh)
-        // color = sh * SH_C0 + 0.5, so d(color)/d(sh) = SH_C0
-        float3 dL_dC = dL_dPix * weight;
-        
-        // Use atomic operations to accumulate gradients from all pixels
-        // SH DC coefficients are at indices 0,1,2 for R,G,B
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0], dL_dC.r * SH_C0, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[1], dL_dC.g * SH_C0, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[2], dL_dC.b * SH_C0, memory_order_relaxed);
-        
-        // Opacity gradient: dL/d(opacity_raw) = dL/d(alpha) * d(alpha)/d(opacity_raw)
-        // alpha = sigmoid(opacity_raw) * G
-        // d(alpha)/d(opacity_raw) = sigmoid'(opacity_raw) * G = sigmoid * (1-sigmoid) * G = (alpha/G) * (1 - alpha/G) * G
-        float dL_dAlpha = dot(dL_dPix, p.color * T);
-        float sigmoid_val = p.opacity;  // p.opacity is already sigmoid(g.opacity)
-        float sig_deriv = sigmoid_val * (1.0 - sigmoid_val);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].opacity, dL_dAlpha * G * sig_deriv, memory_order_relaxed);
-        
-        // Position gradient through screen position
-        // d(power)/d(d) where d = pixelPos - screenPos
-        // d(power)/d(screenPos) = -d(power)/d(d)
-        // power = -0.5 * (a*dx^2 + 2*b*dx*dy + c*dy^2)
-        // d(power)/d(dx) = -(a*dx + b*dy)
-        // d(power)/d(dy) = -(b*dx + c*dy)
-        float dP_ddx = -(p.conic.x * d.x + p.conic.y * d.y);
-        float dP_ddy = -(p.conic.y * d.x + p.conic.z * d.y);
-        
-        // dL/d(d) = dL/d(alpha) * d(alpha)/d(G) * d(G)/d(power) * d(power)/d(d)
-        float dL_dG = dL_dAlpha * sigmoid_val;
-        float dG_dP = G;
-        
-        // d(screenPos) = -d(d), so we flip sign
-        float2 dL_dScreen = -float2(dL_dG * dG_dP * dP_ddx, dL_dG * dG_dP * dP_ddy);
-        
-        // Transform from screen to view space
-        // screen.x = (clip.x/w * 0.5 + 0.5) * width
-        // d(screen.x)/d(view.x) = fx / z * width * 0.5
-        // d(screen.x)/d(view.z) = -fx * view.x / z^2 * width * 0.5
-        float inv_z = 1.0 / max(abs(p.depth), 0.1f);
-        float fx = uniforms.focalLength.x;
-        float fy = uniforms.focalLength.y;
-        
-        float dL_dViewX = dL_dScreen.x * inv_z * fx * 0.5;
-        float dL_dViewY = dL_dScreen.y * inv_z * fy * 0.5;
-        
-        // Accumulate position gradients (in view space - will be transformed by optimizer if needed)
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_x, dL_dViewX, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_y, dL_dViewY, memory_order_relaxed);
-
-        // Scale gradient (simplified)
-        // The covariance affects the conic which affects power
-        // A larger scale means larger covariance, which spreads the gaussian more
-        float dL_dPower = dL_dG * G;
-        // Approximate: d(power)/d(scale) ∝ -(d·d) / scale
-        // The gradient should push scale larger when gaussian needs to spread more
-        float distSq = d.x * d.x + d.y * d.y;
-        float3 scale = exp(clamp(g.scale, -10.0f, 10.0f));
-        
-        // Scale gradient: larger distSq and negative dL_dPower means we want to grow
-        float dL_dScale = dL_dPower * distSq * 0.001f;
-        
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_x, dL_dScale, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_y, dL_dScale, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_z, dL_dScale, memory_order_relaxed);
-        
-        // Update T for next iteration
-        T *= (1.0 - alpha);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
