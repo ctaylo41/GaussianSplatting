@@ -11,13 +11,13 @@
 #include "ply_loader.hpp"
 #include "gradients.hpp"
 
-// Must match shader definition
+// Must match shader definition EXACTLY
 struct TileRange {
     uint32_t start;
     uint32_t count;
 };
 
-// Projected Gaussian data cached for backward pass
+// Projected Gaussian data - must match shader struct
 struct ProjectedGaussian {
     simd_float2 screenPos;
     simd_float3 conic;       // Inverse 2D covariance (a, b, c)
@@ -29,6 +29,7 @@ struct ProjectedGaussian {
     uint32_t tileMinY;
     uint32_t tileMaxX;
     uint32_t tileMaxY;
+    simd_float3 cov2D;       // Store 2D covariance for backward pass
 };
 
 struct TiledUniforms {

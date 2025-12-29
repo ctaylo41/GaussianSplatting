@@ -1,5 +1,5 @@
 //
-//  sort.metal
+//  tiled_rasterizer.mm
 //  GuassianSplatting
 //
 //  Created by Colin Taylor Taylor on 2025-12-28.
@@ -8,6 +8,7 @@
 #include "tiled_rasterizer.hpp"
 #include <iostream>
 #include <algorithm>
+#include <cstring>
 
 TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uint32_t maxGaussians)
     : device(device)
@@ -159,6 +160,15 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     memset(tileCounts->contents(), 0, maxTiles * sizeof(uint32_t));
     *(uint32_t*)totalPairsBuffer->contents() = 0;
     
+    // Initialize per-pixel data
+    uint32_t numPixels = width * height;
+    float* transmittancePtr = (float*)perPixelTransmittance->contents();
+    uint32_t* lastIdxPtr = (uint32_t*)perPixelLastIdx->contents();
+    for (uint32_t i = 0; i < numPixels; i++) {
+        transmittancePtr[i] = 1.0f;
+        lastIdxPtr[i] = UINT32_MAX;
+    }
+    
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
     
     // Step 1: Project all Gaussians to screen space
@@ -195,8 +205,16 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     
     // Get total pairs
     uint32_t totalPairs = *(uint32_t*)totalPairsBuffer->contents();
+    
+    // Debug: check projection results
+    ProjectedGaussian* projPtr = (ProjectedGaussian*)projectedGaussians->contents();
+    int validCount = 0;
+    for (size_t i = 0; i < std::min(gaussianCount, (size_t)100); i++) {
+        if (projPtr[i].radius > 0) validCount++;
+    }
+    
     if (totalPairs == 0) {
-        std::cout << "Warning: No Gaussian-tile pairs generated" << std::endl;
+        std::cout << "Warning: No Gaussian-tile pairs generated. Valid projections: " << validCount << "/100" << std::endl;
         return;
     }
     
@@ -233,7 +251,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
     
-    // Step 4: Sort (CPU for simplicity - can be GPU later)
+    // Step 4: Sort by key (CPU for now)
     {
         struct SortPair {
             uint64_t key;
@@ -352,4 +370,19 @@ void TiledRasterizer::backward(MTL::CommandQueue* queue,
     
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
+    
+    // Debug: check gradient statistics
+    GaussianGradients* grads = (GaussianGradients*)gradientBuffer->contents();
+    int nonZeroGrads = 0;
+    float maxPosGrad = 0;
+    float maxSHGrad = 0;
+    for (size_t i = 0; i < std::min(gaussianCount, (size_t)1000); i++) {
+        float posLen = sqrtf(grads[i].position_x * grads[i].position_x +
+                             grads[i].position_y * grads[i].position_y +
+                             grads[i].position_z * grads[i].position_z);
+        float shLen = fabs(grads[i].sh[0]) + fabs(grads[i].sh[4]) + fabs(grads[i].sh[8]);
+        if (posLen > 0.0001f || shLen > 0.0001f) nonZeroGrads++;
+        maxPosGrad = fmax(maxPosGrad, posLen);
+        maxSHGrad = fmax(maxSHGrad, shLen);
+    }
 }
