@@ -8,6 +8,7 @@
 #include <iostream>
 #include "image_loader.hpp"
 #include "gradients.hpp"
+#include <chrono>
 
 void MTLEngine::init() {
     initDevice();
@@ -44,9 +45,9 @@ void MTLEngine::run(Camera& camera) {
             totalIterations++;
             
             if (epochIterations % 10 == 0) {
-                std::cout << "Epoch " << currentEpoch
+                std::cout << "\rEpoch " << currentEpoch
                           << " | Image " << currentImageIdx << "/" << trainingImages.size()
-                          << " | Loss: " << (epochLoss / epochIterations) << std::endl;
+                          << " | Loss: " << (epochLoss / epochIterations) << std::flush;
             }
             
             if (totalIterations % densityControlInterval == 0 && totalIterations > 500) {
@@ -62,7 +63,7 @@ void MTLEngine::run(Camera& camera) {
             
             currentImageIdx++;
             if (currentImageIdx >= trainingImages.size()) {
-                std::cout << "=== Epoch " << currentEpoch << " complete | Avg Loss: "
+                std::cout << std::endl << "=== Epoch " << currentEpoch << " complete | Avg Loss: "
                           << (epochLoss / epochIterations) << " ===" << std::endl;
                 currentImageIdx = 0;
                 currentEpoch++;
@@ -90,6 +91,11 @@ void MTLEngine::cleanup() {
 
 void MTLEngine::initDevice() {
     metalDevice = MTL::CreateSystemDefaultDevice();
+    if (!metalDevice) {
+        std::cerr << "Failed to create Metal device" << std::endl;
+        std::exit(1);
+    }
+    std::cout << "Using Metal device: " << metalDevice->name()->utf8String() << std::endl;
 }
 
 void MTLEngine::initWindow() {
@@ -191,6 +197,8 @@ void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians) {
                                                MTL::ResourceStorageModeShared);
     
     tiledRasterizer = new TiledRasterizer(metalDevice, shaderLibrary, 2000000);
+    
+    std::cout << "Loaded " << gaussianCount << " Gaussians" << std::endl;
 }
 
 void MTLEngine::initCommandQueue() {
@@ -491,33 +499,26 @@ float MTLEngine::trainStep(size_t imageIndex) {
     R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
     uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
     
+    // Forward pass
     tiledRasterizer->forward(commandQueue, gaussianBuffer, gaussianCount, uniforms, renderTarget);
     
+    // Compute loss
     float loss = computeLoss(renderTarget, img.texture);
     
+    // Backward pass
     tiledRasterizer->backward(commandQueue, gaussianBuffer, gaussianGradients, gaussianCount,
                               uniforms, renderTarget, img.texture);
     
-    GaussianGradients* grads = (GaussianGradients*)gaussianGradients->contents();
-    float posGradSum = 0, shGradSum = 0;
-    int nonZero = 0;
-    for (int i = 0; i < std::min((size_t)100, gaussianCount); i++) {
-        float posLen = sqrtf(grads[i].position_x * grads[i].position_x +
-                             grads[i].position_y * grads[i].position_y +
-                             grads[i].position_z * grads[i].position_z);
-        posGradSum += posLen;
-        shGradSum += std::abs(grads[i].sh[0]) + std::abs(grads[i].sh[4]) + std::abs(grads[i].sh[8]);
-        if (posLen > 0.0001f) nonZero++;
-    }
-    if (imageIndex % 10 == 0) {
-        std::cout << "Grads: pos=" << posGradSum/100 << " sh=" << shGradSum/100
-                  << " nonzero=" << nonZero << "/100" << std::endl;
-    }
-    
+    // Accumulate for density control
     densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
     
+    // Optimizer step
     optimizer->step(commandQueue, gaussianBuffer, gaussianGradients,
-                    0.0001f, 0.005f, 0.001f, 0.05f, 0.005f);
+                    0.0008f,   // position lr
+                    0.005f,     // scale lr
+                    0.001f,     // rotation lr
+                    0.1f,      // opacity lr
+                    0.005f);   // sh lr
     
     return loss;
 }
@@ -535,16 +536,25 @@ void MTLEngine::train(size_t numEpochs) {
     std::cout << "Starting training for " << numEpochs << " epochs..." << std::endl;
     std::cout << "Gaussians: " << gaussianCount << " | Images: " << trainingImages.size() << std::endl;
     
+    auto startTime = std::chrono::high_resolution_clock::now();
     size_t totalIterations = 0;
     
     for (size_t epoch = 0; epoch < numEpochs; epoch++) {
         float epochLoss = 0.0f;
+        auto epochStart = std::chrono::high_resolution_clock::now();
         
         for (size_t imgIdx = 0; imgIdx < trainingImages.size(); imgIdx++) {
             float loss = trainStep(imgIdx);
             epochLoss += loss;
             totalIterations++;
             
+            // Progress update every 20 images
+            if (imgIdx % 20 == 0) {
+                std::cout << "\rEpoch " << epoch << " [" << imgIdx << "/" << trainingImages.size()
+                          << "] Loss: " << (epochLoss / (imgIdx + 1)) << std::flush;
+            }
+            
+            // Density control
             if (totalIterations % densityControlInterval == 0 && totalIterations > 500) {
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
                                          nullptr, gaussianCount, totalIterations);
@@ -558,9 +568,18 @@ void MTLEngine::train(size_t numEpochs) {
         }
         
         updatePositionBuffer();
-        std::cout << "=== Epoch " << epoch << " complete | Avg Loss: "
-                  << (epochLoss / trainingImages.size()) << " | Gaussians: " << gaussianCount << " ===" << std::endl;
+        
+        auto epochEnd = std::chrono::high_resolution_clock::now();
+        auto epochDuration = std::chrono::duration_cast<std::chrono::seconds>(epochEnd - epochStart).count();
+        
+        std::cout << std::endl << "=== Epoch " << epoch << " | Loss: "
+                  << (epochLoss / trainingImages.size())
+                  << " | Gaussians: " << gaussianCount
+                  << " | Time: " << epochDuration << "s ===" << std::endl;
     }
     
-    std::cout << "Training complete!" << std::endl;
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto totalDuration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
+    
+    std::cout << "Training complete! Total time: " << totalDuration << "s" << std::endl;
 }

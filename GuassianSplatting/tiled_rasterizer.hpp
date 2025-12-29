@@ -17,19 +17,19 @@ struct TileRange {
     uint32_t count;
 };
 
-// Projected Gaussian data - must match shader struct
+// Projected Gaussian data
 struct ProjectedGaussian {
     simd_float2 screenPos;
-    simd_float3 conic;       // Inverse 2D covariance (a, b, c)
+    simd_float3 conic;       // Inverse 2D covariance
     float depth;
-    float opacity;
+    float opacity;           // After sigmoid
     simd_float3 color;
     float radius;
     uint32_t tileMinX;
     uint32_t tileMinY;
     uint32_t tileMaxX;
     uint32_t tileMaxY;
-    simd_float3 cov2D;       // Store 2D covariance for backward pass
+    simd_float2 viewPos_xy;  // For gradient computation
 };
 
 struct TiledUniforms {
@@ -51,14 +51,12 @@ public:
     TiledRasterizer(MTL::Device* device, MTL::Library* library, uint32_t maxGaussians);
     ~TiledRasterizer();
     
-    // Render Gaussians to texture, storing intermediate state for backward pass
     void forward(MTL::CommandQueue* queue,
                  MTL::Buffer* gaussianBuffer,
                  size_t gaussianCount,
                  const TiledUniforms& uniforms,
                  MTL::Texture* outputTexture);
     
-    // Compute gradients using stored intermediate state
     void backward(MTL::CommandQueue* queue,
                   MTL::Buffer* gaussianBuffer,
                   MTL::Buffer* gradientBuffer,
@@ -67,42 +65,25 @@ public:
                   MTL::Texture* renderedTexture,
                   MTL::Texture* groundTruthTexture);
     
-    // Get buffers for debugging
-    MTL::Buffer* getSortedIndices() { return sortedGaussianIndices; }
-    MTL::Buffer* getTileRanges() { return tileRanges; }
-    MTL::Buffer* getProjectedGaussians() { return projectedGaussians; }
-    
 private:
     static constexpr uint32_t TILE_SIZE = 16;
-    static constexpr uint32_t MAX_PAIRS_PER_GAUSSIAN = 64;
+    // Average Gaussians touch ~4-8 tiles, set reasonable max
+    static constexpr uint32_t AVG_TILES_PER_GAUSSIAN = 8;
     
     MTL::Device* device;
     
     // Compute pipelines
     MTL::ComputePipelineState* projectGaussiansPSO;
-    MTL::ComputePipelineState* countTilesPSO;
-    MTL::ComputePipelineState* writeGaussianKeysPSO;
     MTL::ComputePipelineState* tiledForwardPSO;
     MTL::ComputePipelineState* tiledBackwardPSO;
     
-    // Buffers for projection
+    // Buffers
     MTL::Buffer* projectedGaussians;
-    
-    // Buffers for tiling
-    MTL::Buffer* tileCounts;
-    MTL::Buffer* tileOffsets;
-    MTL::Buffer* tileWriteOffsets;
     MTL::Buffer* gaussianKeys;
     MTL::Buffer* gaussianValues;
     MTL::Buffer* tileRanges;
-    MTL::Buffer* sortedGaussianIndices;
     MTL::Buffer* totalPairsBuffer;
-    
-    // Buffers for backward pass
-    MTL::Buffer* perPixelTransmittance;
     MTL::Buffer* perPixelLastIdx;
-    
-    // Uniform buffer
     MTL::Buffer* uniformBuffer;
     
     uint32_t maxGaussians;
@@ -114,5 +95,6 @@ private:
     uint32_t numTilesY;
     
     void createPipelines(MTL::Library* library);
-    void ensureBufferCapacity(uint32_t width, uint32_t height);
+    void ensureBufferCapacity(uint32_t width, uint32_t height, size_t gaussianCount);
+    void ensurePairsCapacity(uint32_t requiredPairs);
 };
