@@ -45,7 +45,7 @@ struct VertexOut {
 
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
-constant float MAX_SCALE = 3.0f;
+constant float MAX_SCALE = 10.0f;  // Allow smaller scales (log range -10 to 10)
 
 float3 evalSH(float sh[12], float3 dir) {
     // DC term + degree 1 terms
@@ -59,10 +59,11 @@ float3 evalSH(float sh[12], float3 dir) {
 float3x3 quaternionToMatrix(float4 q) {
     // q.x=w, q.y=x, q.z=y, q.w=z
     float w = q.x, x = q.y, y = q.z, z = q.w;
+    // Metal float3x3 constructor takes COLUMNS
     return float3x3(
-        1.0 - 2.0*(y*y + z*z), 2.0*(x*y - w*z), 2.0*(x*z + w*y),
-        2.0*(x*y + w*z), 1.0 - 2.0*(x*x + z*z), 2.0*(y*z - w*x),
-        2.0*(x*z - w*y), 2.0*(y*z + w*x), 1.0 - 2.0*(x*x + y*y)
+        float3(1.0 - 2.0*(y*y + z*z), 2.0*(x*y + w*z), 2.0*(x*z - w*y)), // Column 0
+        float3(2.0*(x*y - w*z), 1.0 - 2.0*(x*x + z*z), 2.0*(y*z + w*x)), // Column 1
+        float3(2.0*(x*z + w*y), 2.0*(y*z - w*x), 1.0 - 2.0*(x*x + y*y))  // Column 2
     );
 }
 
@@ -70,9 +71,12 @@ float3x3 computeCovariance3D(float3 logScale, float4 rotation) {
     float3x3 R = quaternionToMatrix(rotation);
     // Apply exp() to log scale - this is the ONLY place exp() is applied
     float3 scale = exp(clamp(logScale, -MAX_SCALE, MAX_SCALE));
-    float3x3 S = float3x3(scale.x, 0, 0,
-                          0, scale.y, 0,
-                          0, 0, scale.z);
+    // Diagonal scale matrix - Metal column constructor
+    float3x3 S = float3x3(
+        float3(scale.x, 0, 0),  // Column 0
+        float3(0, scale.y, 0),  // Column 1
+        float3(0, 0, scale.z)   // Column 2
+    );
     float3x3 M = R * S;
     return M * transpose(M);
 }
@@ -92,9 +96,15 @@ float3 computeCovariance2D(float3 mean, float3x3 covariance3D, float4x4 viewMatr
     float J11 = focalLength.y / t.z;
     float J12 = -focalLength.y * tytz / t.z;
     
-    float3x3 J = float3x3(J00, 0, J02,
-                          0, J11, J12,
-                          0, 0, 0);
+    // Metal float3x3 takes columns: col0, col1, col2
+    // J = | J00  0    J02 |
+    //     | 0    J11  J12 |
+    //     | 0    0    0   |
+    float3x3 J = float3x3(
+        float3(J00, 0, 0),    // Column 0
+        float3(0, J11, 0),    // Column 1
+        float3(J02, J12, 0)   // Column 2
+    );
     
     // View rotation (upper-left 3x3)
     float3x3 W = float3x3(viewMatrix[0].xyz, viewMatrix[1].xyz, viewMatrix[2].xyz);

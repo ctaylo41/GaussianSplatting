@@ -340,16 +340,22 @@ void MTLEngine::loadTrainingData(const ColmapData& colmap, const std::string& im
 simd_float4x4 MTLEngine::viewMatrixFromColmap(simd_float4 quat, simd_float3 translation) {
     float w = quat.x, x = quat.y, y = quat.z, z = quat.w;
     
+    // Camera-to-world rotation from quaternion
     matrix_float3x3 R;
     R.columns[0] = simd_make_float3(1 - 2*(y*y + z*z), 2*(x*y + w*z), 2*(x*z - w*y));
     R.columns[1] = simd_make_float3(2*(x*y - w*z), 1 - 2*(x*x + z*z), 2*(y*z + w*x));
     R.columns[2] = simd_make_float3(2*(x*z + w*y), 2*(y*z - w*x), 1 - 2*(x*x + y*y));
     
+    // For world-to-view: invert the camera-to-world transform
+    // View matrix = [R^T | -R^T * t] where R is cam-to-world rotation, t is cam position
+    matrix_float3x3 Rt = simd_transpose(R);
+    simd_float3 viewTranslation = -simd_mul(Rt, translation);
+    
     simd_float4x4 view;
-    view.columns[0] = simd_make_float4(R.columns[0], 0);
-    view.columns[1] = simd_make_float4(R.columns[1], 0);
-    view.columns[2] = simd_make_float4(R.columns[2], 0);
-    view.columns[3] = simd_make_float4(translation, 1);
+    view.columns[0] = simd_make_float4(Rt.columns[0], 0);
+    view.columns[1] = simd_make_float4(Rt.columns[1], 0);
+    view.columns[2] = simd_make_float4(Rt.columns[2], 0);
+    view.columns[3] = simd_make_float4(viewTranslation, 1);
     
     return view;
 }

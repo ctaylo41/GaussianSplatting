@@ -63,7 +63,7 @@ int main(int argc, char* argv[]) {
     std::string colmapPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/";
     std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4";
     std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
-    size_t numEpochs = 10;
+    size_t numEpochs = 3;
     bool viewOnly = false;
     std::string viewPlyPath = "";
     

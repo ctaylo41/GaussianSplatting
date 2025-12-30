@@ -76,16 +76,17 @@ struct GaussianGradients {
 constant float SH_C0 = 0.28209479177387814f;
 constant uint TILE_SIZE = 16;
 constant float MAX_RADIUS = 64.0f;
-constant float MAX_SCALE = 3.0f;
+constant float MAX_SCALE = 10.0f;  // Allow smaller scales (log range -10 to 10)
 
 // Quaternion to rotation matrix
 // q.x=w, q.y=x, q.z=y, q.w=z
 float3x3 quatToMat(float4 q) {
     float w = q.x, x = q.y, y = q.z, z = q.w;
+    // Metal float3x3 constructor takes COLUMNS
     return float3x3(
-        1.0 - 2.0*(y*y + z*z), 2.0*(x*y - w*z), 2.0*(x*z + w*y),
-        2.0*(x*y + w*z), 1.0 - 2.0*(x*x + z*z), 2.0*(y*z - w*x),
-        2.0*(x*z - w*y), 2.0*(y*z + w*x), 1.0 - 2.0*(x*x + y*y)
+        float3(1.0 - 2.0*(y*y + z*z), 2.0*(x*y + w*z), 2.0*(x*z - w*y)), // Column 0
+        float3(2.0*(x*y - w*z), 1.0 - 2.0*(x*x + z*z), 2.0*(y*z + w*x)), // Column 1
+        float3(2.0*(x*z + w*y), 2.0*(y*z - w*x), 1.0 - 2.0*(x*x + y*y))  // Column 2
     );
 }
 
@@ -150,7 +151,12 @@ kernel void projectGaussians(
     
     // Build 3D covariance: Sigma = R * S * S^T * R^T = M * M^T where M = R * S
     float3x3 R = quatToMat(q);
-    float3x3 S = float3x3(scale.x, 0, 0, 0, scale.y, 0, 0, 0, scale.z);
+    // Diagonal scale matrix - Metal column constructor
+    float3x3 S = float3x3(
+        float3(scale.x, 0, 0),  // Column 0
+        float3(0, scale.y, 0),  // Column 1
+        float3(0, 0, scale.z)   // Column 2
+    );
     float3x3 M = R * S;
     float3x3 Sigma3D = M * transpose(M);
     
@@ -165,23 +171,30 @@ kernel void projectGaussians(
     float txtz = clamp(viewPos.x / z_cam, -limx, limx);
     float tytz = clamp(viewPos.y / z_cam, -limy, limy);
     
-    // Jacobian of projection (3x3 with zero last row for proper matrix multiply)
+    // Jacobian of projection (perspective projection derivative)
+    // Maps 3D view space -> 2D screen space
     float J00 = fx / z_cam;
     float J02 = -fx * txtz / z_cam;
     float J11 = fy / z_cam;
     float J12 = -fy * tytz / z_cam;
     
-    float3x3 J = float3x3(J00, 0, J02,
-                          0, J11, J12,
-                          0, 0, 0);
+    // Metal float3x3 constructor takes COLUMNS
+    // J = | J00  0    J02 |
+    //     | 0    J11  J12 |
+    //     | 0    0    0   |
+    float3x3 J = float3x3(
+        float3(J00, 0, 0),    // Column 0
+        float3(0, J11, 0),    // Column 1
+        float3(J02, J12, 0)   // Column 2
+    );
     
-    // View rotation (upper-left 3x3) - use row access like shaders.metal
-    // In Metal, matrix[i] gives row i
+    // View matrix rotation (world-to-view)
+    // matrix[i] in Metal gives COLUMN i
     float3x3 W = float3x3(uniforms.viewMatrix[0].xyz, 
                           uniforms.viewMatrix[1].xyz, 
                           uniforms.viewMatrix[2].xyz);
     
-    // Combined transform: T = J * W
+    // Combined transform: T = J * W projects world covariance to screen
     float3x3 T = J * W;
     
     // Project 3D covariance to 2D: cov2D = T * Sigma3D * T^T
@@ -414,16 +427,88 @@ kernel void tiledBackward(
         dL_dViewPos.z = -dL_dScreenPos.x * fx * p.viewPos_xy.x / (z * z)
                         + dL_dScreenPos.y * fy * p.viewPos_xy.y / (z * z);
         
-        // Use row access like forward pass (matrix[i] gives row i in Metal)
+        // Extract view rotation (columns = rotation matrix)
+        // viewMatrix is world-to-view, so transpose gives view-to-world
         float3x3 viewRot = float3x3(
             uniforms.viewMatrix[0].xyz,
             uniforms.viewMatrix[1].xyz,
             uniforms.viewMatrix[2].xyz
         );
+        // viewRot already contains columns of rotation, transpose gives view-to-world
         float3 dL_dWorldPos = transpose(viewRot) * dL_dViewPos;
         
-        // Scale gradient (simplified heuristic)
-        float scale_grad_magnitude = dL_dG * G * 0.01;
+        // ===== Proper Scale and Rotation Gradients =====
+        // 1. Conic gradient
+        float3 dL_dConic;
+        dL_dConic.x = dL_dG * G * (-0.5 * d.x * d.x);
+        dL_dConic.y = dL_dG * G * (-1.0 * d.x * d.y);
+        dL_dConic.z = dL_dG * G * (-0.5 * d.y * d.y);
+        
+        // 2. Cov2D gradient: dL_dCov2D = -Conic * dL_dConic * Conic
+        float3 c = p.conic;
+        float t00 = dL_dConic.x * c.x + dL_dConic.y * c.y;
+        float t01 = dL_dConic.x * c.y + dL_dConic.y * c.z;
+        float t10 = dL_dConic.y * c.x + dL_dConic.z * c.y;
+        float t11 = dL_dConic.y * c.y + dL_dConic.z * c.z;
+        
+        float3 dL_dCov2D;
+        dL_dCov2D.x = -(c.x * t00 + c.y * t10);
+        dL_dCov2D.y = -(c.x * t01 + c.y * t11);
+        dL_dCov2D.z = -(c.y * t01 + c.z * t11);
+        
+        // 3. Cov3D gradient
+        float3 t_cam = float3(p.viewPos_xy, p.depth);
+        float txtz = t_cam.x / t_cam.z;
+        float tytz = t_cam.y / t_cam.z;
+        
+        float J00 = fx / t_cam.z;
+        float J02 = -fx * txtz / t_cam.z;
+        float J11 = fy / t_cam.z;
+        float J12 = -fy * tytz / t_cam.z;
+        
+        float3 T0 = float3(J00, 0, J02) * viewRot;
+        float3 T1 = float3(0, J11, J12) * viewRot;
+        
+        float3 A = dL_dCov2D.x * T0 + dL_dCov2D.y * T1;
+        float3 B = dL_dCov2D.y * T0 + dL_dCov2D.z * T1;
+        
+        float3x3 dL_dCov3D;
+        dL_dCov3D[0] = A * T0.x + B * T1.x;
+        dL_dCov3D[1] = A * T0.y + B * T1.y;
+        dL_dCov3D[2] = A * T0.z + B * T1.z;
+        
+        // 4. Scale and Rotation gradients
+        Gaussian g_orig = gaussians[gIdx];
+        float3 scale = exp(clamp(g_orig.scale, -MAX_SCALE, MAX_SCALE));
+        float3x3 R = quatToMat(g_orig.rotation);
+        // Diagonal scale matrix - Metal column constructor
+        float3x3 S = float3x3(
+            float3(scale.x, 0, 0),  // Column 0
+            float3(0, scale.y, 0),  // Column 1
+            float3(0, 0, scale.z)   // Column 2
+        );
+        float3x3 M = R * S;
+        
+        float3x3 dL_dM = 2.0 * dL_dCov3D * M;
+        float3x3 Rt = transpose(R);
+        float3 dL_dScale_val;
+        dL_dScale_val.x = dot(Rt[0], dL_dM[0]);
+        dL_dScale_val.y = dot(Rt[1], dL_dM[1]);
+        dL_dScale_val.z = dot(Rt[2], dL_dM[2]);
+        
+        float3 dL_dLogScale = dL_dScale_val * scale;
+        float3x3 dL_dR = dL_dM * S;
+        
+        float4 dL_dq = float4(0);
+        float w = g_orig.rotation.x;
+        float x = g_orig.rotation.y;
+        float y = g_orig.rotation.z;
+        float z_rot = g_orig.rotation.w; // Rename to avoid conflict with z coordinate
+        
+        dL_dq.x = dot(dL_dR[0], float3(0, 2*z_rot, -2*y)) + dot(dL_dR[1], float3(-2*z_rot, 0, 2*x)) + dot(dL_dR[2], float3(2*y, -2*x, 0));
+        dL_dq.y = dot(dL_dR[0], float3(0, 2*y, 2*z_rot)) + dot(dL_dR[1], float3(2*y, -4*x, -2*w)) + dot(dL_dR[2], float3(2*z_rot, 2*w, -4*x));
+        dL_dq.z = dot(dL_dR[0], float3(-4*y, 2*x, -2*w)) + dot(dL_dR[1], float3(2*x, 0, 2*z_rot)) + dot(dL_dR[2], float3(2*w, 2*z_rot, -4*y));
+        dL_dq.w = dot(dL_dR[0], float3(-4*z_rot, 2*w, 2*x)) + dot(dL_dR[1], float3(-2*w, -4*z_rot, 2*y)) + dot(dL_dR[2], float3(2*x, 2*y, 0));
         
         float clampVal = 1.0;
         
@@ -446,11 +531,19 @@ kernel void tiledBackward(
             clamp(dL_dWorldPos.z, -clampVal, clampVal), memory_order_relaxed);
         
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_x,
-            clamp(scale_grad_magnitude, -clampVal, clampVal), memory_order_relaxed);
+            clamp(dL_dLogScale.x, -clampVal, clampVal), memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_y,
-            clamp(scale_grad_magnitude, -clampVal, clampVal), memory_order_relaxed);
+            clamp(dL_dLogScale.y, -clampVal, clampVal), memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_z,
-            clamp(scale_grad_magnitude, -clampVal, clampVal), memory_order_relaxed);
+            clamp(dL_dLogScale.z, -clampVal, clampVal), memory_order_relaxed);
+        atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 0,
+            clamp(dL_dq.x, -clampVal, clampVal), memory_order_relaxed);
+        atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 1,
+            clamp(dL_dq.y, -clampVal, clampVal), memory_order_relaxed);
+        atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 2,
+            clamp(dL_dq.z, -clampVal, clampVal), memory_order_relaxed);
+        atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 3,
+            clamp(dL_dq.w, -clampVal, clampVal), memory_order_relaxed);
         
         T *= (1.0 - alpha);
     }

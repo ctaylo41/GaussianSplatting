@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <cmath>
+#include <float.h>
 
 std::vector<Gaussian> load_ply(const std::string& file_path) {
     std::vector<Gaussian> gaussians;
@@ -163,14 +164,38 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             std::cout << "Skipped " << numSkipped << " invalid gaussians" << std::endl;
         }
         
-        // Debug first Gaussian
+        // Debug first Gaussian with more detail
         if (!gaussians.empty()) {
             const Gaussian& g = gaussians[0];
             std::cout << "First Gaussian:" << std::endl;
             std::cout << "  Position: (" << g.position.x << ", " << g.position.y << ", " << g.position.z << ")" << std::endl;
             std::cout << "  Scale (log): (" << g.scale.x << ", " << g.scale.y << ", " << g.scale.z << ")" << std::endl;
+            std::cout << "  Scale (exp): (" << std::exp(g.scale.x) << ", " << std::exp(g.scale.y) << ", " << std::exp(g.scale.z) << ")" << std::endl;
             std::cout << "  Rotation (wxyz): (" << g.rotation.x << ", " << g.rotation.y << ", " << g.rotation.z << ", " << g.rotation.w << ")" << std::endl;
             std::cout << "  Opacity (raw): " << g.opacity << std::endl;
+            std::cout << "  Opacity (sigmoid): " << (1.0f / (1.0f + std::exp(-g.opacity))) << std::endl;
+            
+            // Show SH DC coefficients and expected color
+            const float SH_C0 = 0.28209479177387814f;
+            std::cout << "  SH DC (indices 0,4,8): (" << g.sh[0] << ", " << g.sh[4] << ", " << g.sh[8] << ")" << std::endl;
+            float r = SH_C0 * g.sh[0] + 0.5f;
+            float gr = SH_C0 * g.sh[4] + 0.5f;
+            float b = SH_C0 * g.sh[8] + 0.5f;
+            std::cout << "  Expected color: (" << r << ", " << gr << ", " << b << ")" << std::endl;
+        }
+        
+        // Also show stats across all Gaussians
+        if (gaussians.size() > 1) {
+            float minScale = FLT_MAX, maxScale = -FLT_MAX;
+            float minOpacity = FLT_MAX, maxOpacity = -FLT_MAX;
+            for (const auto& g : gaussians) {
+                minScale = std::min(minScale, std::min({g.scale.x, g.scale.y, g.scale.z}));
+                maxScale = std::max(maxScale, std::max({g.scale.x, g.scale.y, g.scale.z}));
+                minOpacity = std::min(minOpacity, g.opacity);
+                maxOpacity = std::max(maxOpacity, g.opacity);
+            }
+            std::cout << "Scale (log) range: [" << minScale << ", " << maxScale << "]" << std::endl;
+            std::cout << "Opacity (raw) range: [" << minOpacity << ", " << maxOpacity << "]" << std::endl;
         }
         
     } catch (const std::exception& e) {
