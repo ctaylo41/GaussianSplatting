@@ -2,14 +2,17 @@
 //  ply_loader.cpp
 //  GuassianSplatting
 //
-//  Created by Colin Taylor Taylor on 2025-12-26.
+//  CRITICAL: This loader must match the internal representation expected by shaders:
+//  - Scale: stored in LOG space (shader applies exp())
+//  - Opacity: stored as RAW pre-sigmoid value (shader applies sigmoid())
+//  - Rotation: stored as (w,x,y,z) in float4 where .x=w, .y=x, .z=y, .w=z
 //
-
 
 #include "ply_loader.hpp"
 #include "tinyply.h"
 #include <fstream>
 #include <iostream>
+#include <cmath>
 
 std::vector<Gaussian> load_ply(const std::string& file_path) {
     std::vector<Gaussian> gaussians;
@@ -63,7 +66,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
         
         std::shared_ptr<tinyply::PlyData> sh_rest;
         
-        try{
+        try {
             sh_rest = ply_file.request_properties_from_element("vertex", {
                 "f_rest_0", "f_rest_1", "f_rest_2",
                 "f_rest_3", "f_rest_4", "f_rest_5",
@@ -73,7 +76,6 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             std::cout << "No SH rest coefficients, using DC only" << std::endl;
             sh_rest = nullptr;
         }
-        
         
         ply_file.read(file);
         
@@ -89,71 +91,87 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
 
         gaussians.reserve(vertex_count);
         
-        for(size_t i=0;i<vertex_count;i++) {
-            if (i == 0 && sh_rest_data) {
-                printf("Raw f_rest[0..8]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-                       sh_rest_data[0], sh_rest_data[1], sh_rest_data[2],
-                       sh_rest_data[3], sh_rest_data[4], sh_rest_data[5],
-                       sh_rest_data[6], sh_rest_data[7], sh_rest_data[8]);
-            }
-            
+        int numSkipped = 0;
+        
+        for(size_t i = 0; i < vertex_count; i++) {
             Gaussian g;
             
+            // ===== POSITION: Direct copy =====
             g.position = simd_make_float3(pos_data[i*3 + 0],
                                           pos_data[i*3 + 1],
                                           pos_data[i*3 + 2]);
             
-            g.scale = simd_make_float3(std::exp(scale_data[i*3 + 0]),
-                                       std::exp(scale_data[i*3 + 1]),
-                                       std::exp(scale_data[i*3 + 2]));
-            
-            float qx = rot_data[i*4 + 0];
-            float qy = rot_data[i*4 + 1];
-            float qz = rot_data[i*4 + 2];
-            float qw = rot_data[i*4 + 3];
-            
-            float q_len = std::sqrt(qx*qx + qy*qy + qz*qz + qw*qw);
-            if (q_len > 0.0f) {
-                qx /= q_len;
-                qy /= q_len;
-                qz /= q_len;
-                qw /= q_len;
+            // Skip NaN/Inf positions
+            if (std::isnan(g.position.x) || std::isnan(g.position.y) || std::isnan(g.position.z) ||
+                std::isinf(g.position.x) || std::isinf(g.position.y) || std::isinf(g.position.z) ||
+                std::abs(g.position.x) > 1e6 || std::abs(g.position.y) > 1e6 || std::abs(g.position.z) > 1e6) {
+                numSkipped++;
+                continue;
             }
-            g.rotation = simd_make_float4(qx,qy,qz,qw);
             
-            float raw_opacity = opacity_data[i];
-            g.opacity = 1.0f / (1.0f + std::exp(-raw_opacity));
+            // ===== SCALE: Keep as LOG space - DO NOT apply exp()! =====
+            g.scale = simd_make_float3(scale_data[i*3 + 0],
+                                       scale_data[i*3 + 1],
+                                       scale_data[i*3 + 2]);
             
-            const float SH_CO = 0.2820948f;
-            g.sh[0] = sh_dc_data[i * 3 + 0];
-            g.sh[4] = sh_dc_data[i * 3 + 1];
-            g.sh[8] = sh_dc_data[i * 3 + 2];
-
+            // ===== ROTATION: PLY format is (rot_0=w, rot_1=x, rot_2=y, rot_3=z) =====
+            float qw = rot_data[i*4 + 0];  // rot_0 = w
+            float qx = rot_data[i*4 + 1];  // rot_1 = x
+            float qy = rot_data[i*4 + 2];  // rot_2 = y
+            float qz = rot_data[i*4 + 3];  // rot_3 = z
+            
+            // Normalize quaternion
+            float q_len = std::sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+            if (q_len > 0.0001f) {
+                qw /= q_len; qx /= q_len; qy /= q_len; qz /= q_len;
+            } else {
+                qw = 1.0f; qx = 0.0f; qy = 0.0f; qz = 0.0f;
+            }
+            
+            // Store as (w, x, y, z) - shader expects q.x=w, q.y=x, q.z=y, q.w=z
+            g.rotation = simd_make_float4(qw, qx, qy, qz);
+            
+            // ===== OPACITY: Keep as RAW - DO NOT apply sigmoid()! =====
+            g.opacity = opacity_data[i];
+            
+            // ===== SH COEFFICIENTS =====
+            g.sh[0] = sh_dc_data[i * 3 + 0];  // R DC
+            g.sh[4] = sh_dc_data[i * 3 + 1];  // G DC
+            g.sh[8] = sh_dc_data[i * 3 + 2];  // B DC
+            
             if (sh_rest_data) {
                 g.sh[1] = sh_rest_data[i * 9 + 0];
-                g.sh[2] = sh_rest_data[i * 9 + 1];
-                g.sh[3] = sh_rest_data[i * 9 + 2];
-                g.sh[5] = sh_rest_data[i * 9 + 3];
+                g.sh[5] = sh_rest_data[i * 9 + 1];
+                g.sh[9] = sh_rest_data[i * 9 + 2];
+                g.sh[2] = sh_rest_data[i * 9 + 3];
                 g.sh[6] = sh_rest_data[i * 9 + 4];
-                g.sh[7] = sh_rest_data[i * 9 + 5];
-                g.sh[9] = sh_rest_data[i * 9 + 6];
-                g.sh[10] = sh_rest_data[i * 9 + 7];
+                g.sh[10] = sh_rest_data[i * 9 + 5];
+                g.sh[3] = sh_rest_data[i * 9 + 6];
+                g.sh[7] = sh_rest_data[i * 9 + 7];
                 g.sh[11] = sh_rest_data[i * 9 + 8];
             } else {
                 for (int j = 1; j < 4; j++) {
-                    g.sh[j] = 0;
-                    g.sh[j+4] = 0;
-                    g.sh[j+8] = 0;
+                    g.sh[j] = 0; g.sh[j+4] = 0; g.sh[j+8] = 0;
                 }
             }
-
-            
             
             gaussians.push_back(g);
-            
         }
         
         std::cout << "Loaded " << gaussians.size() << " gaussians successfully" << std::endl;
+        if (numSkipped > 0) {
+            std::cout << "Skipped " << numSkipped << " invalid gaussians" << std::endl;
+        }
+        
+        // Debug first Gaussian
+        if (!gaussians.empty()) {
+            const Gaussian& g = gaussians[0];
+            std::cout << "First Gaussian:" << std::endl;
+            std::cout << "  Position: (" << g.position.x << ", " << g.position.y << ", " << g.position.z << ")" << std::endl;
+            std::cout << "  Scale (log): (" << g.scale.x << ", " << g.scale.y << ", " << g.scale.z << ")" << std::endl;
+            std::cout << "  Rotation (wxyz): (" << g.rotation.x << ", " << g.rotation.y << ", " << g.rotation.z << ", " << g.rotation.w << ")" << std::endl;
+            std::cout << "  Opacity (raw): " << g.opacity << std::endl;
+        }
         
     } catch (const std::exception& e) {
         std::cerr << "Error loading ply: " << e.what() << std::endl;

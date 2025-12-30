@@ -17,7 +17,7 @@ struct TileRange {
     uint32_t count;
 };
 
-// Projected Gaussian data
+// Projected Gaussian data for tiled rendering
 struct ProjectedGaussian {
     simd_float2 screenPos;
     simd_float3 conic;       // Inverse 2D covariance

@@ -1,27 +1,44 @@
+//
+//  tiled_shaders.metal
+//  GuassianSplatting
+//
+//  Tiled rasterizer for training with proper gradient computation
+//
+//  IMPORTANT: Data format expectations:
+//  - Scale: LOG space (we apply exp() here)
+//  - Opacity: RAW pre-sigmoid (we apply sigmoid() here)
+//  - Rotation: quaternion (w,x,y,z) stored as float4(.x=w, .y=x, .z=y, .w=z)
+//
 #include <metal_stdlib>
 using namespace metal;
 
+// CRITICAL: Must match C++ simd struct layout EXACTLY
+// C++ simd_float3 is 12 bytes with 16-byte alignment
+// Use packed_float3 in Metal which is exactly 12 bytes
+// Layout: position(0-12), scale(16-28), rotation(32-48), opacity(48-52), sh(52-100), total 112
 struct Gaussian {
-    float3 position;
-    float3 scale;
-    float4 rotation;
-    float opacity;
-    float sh[12];
-};
+    packed_float3 position; // offset 0, 12 bytes
+    float _pad0;            // offset 12, 4 bytes padding (to align scale to 16)
+    packed_float3 scale;    // offset 16, LOG scale, 12 bytes
+    float _pad1;            // offset 28, 4 bytes padding (to align rotation to 32)
+    float4 rotation;        // offset 32, (w,x,y,z) as (.x=w, .y=x, .z=y, .w=z)
+    float opacity;          // offset 48, RAW pre-sigmoid
+    float sh[12];           // offset 52, 48 bytes
+};  // Total: 100 bytes, padded to 112 for struct alignment
 
+// Projected Gaussian data for tiled rendering
 struct ProjectedGaussian {
     float2 screenPos;
-    float3 conic;
+    float3 conic;       // Inverse 2D covariance
     float depth;
-    float opacity;
+    float opacity;      // AFTER sigmoid (for rendering efficiency)
     float3 color;
     float radius;
     uint tileMinX;
     uint tileMinY;
     uint tileMaxX;
     uint tileMaxY;
-    // Store additional info for backward pass
-    float2 viewPos_xy;  // For gradient computation
+    float2 viewPos_xy;
 };
 
 struct TileRange {
@@ -61,6 +78,8 @@ constant uint TILE_SIZE = 16;
 constant float MAX_RADIUS = 64.0f;
 constant float MAX_SCALE = 3.0f;
 
+// Quaternion to rotation matrix
+// q.x=w, q.y=x, q.z=y, q.w=z
 float3x3 quatToMat(float4 q) {
     float w = q.x, x = q.y, y = q.z, z = q.w;
     return float3x3(
@@ -86,8 +105,10 @@ kernel void projectGaussians(
     proj.tileMinY = UINT_MAX;
     proj.tileMaxY = 0;
     
+    // Skip invalid Gaussians
     if (isnan(g.position.x) || isnan(g.position.y) || isnan(g.position.z) ||
-        isnan(g.scale.x) || isnan(g.scale.y) || isnan(g.scale.z)) {
+        isnan(g.scale.x) || isnan(g.scale.y) || isnan(g.scale.z) ||
+        abs(g.position.x) > 1e6 || abs(g.position.y) > 1e6 || abs(g.position.z) > 1e6) {
         projected[tid] = proj;
         return;
     }
@@ -96,6 +117,7 @@ kernel void projectGaussians(
     float4 viewPos = uniforms.viewMatrix * worldPos;
     float4 clipPos = uniforms.viewProjectionMatrix * worldPos;
     
+    // Behind camera or too close
     if (clipPos.w <= 0.1 || viewPos.z <= 0.1) {
         projected[tid] = proj;
         return;
@@ -103,57 +125,73 @@ kernel void projectGaussians(
     
     float3 ndc = clipPos.xyz / clipPos.w;
     
+    // Outside frustum
     if (abs(ndc.x) > 1.2 || abs(ndc.y) > 1.2) {
         projected[tid] = proj;
         return;
     }
     
-    // Screen position - standard convention
+    // Screen position (Y flipped for screen coordinates)
     proj.screenPos = float2(
         (ndc.x * 0.5 + 0.5) * uniforms.screenSize.x,
         (1.0 - (ndc.y * 0.5 + 0.5)) * uniforms.screenSize.y
     );
     proj.depth = viewPos.z;
-    proj.viewPos_xy = viewPos.xy;  // Store for backward pass
+    proj.viewPos_xy = viewPos.xy;
     
+    // ===== SCALE: Apply exp() to log scale =====
     float3 logScale = clamp(g.scale, -MAX_SCALE, MAX_SCALE);
     float3 scale = exp(logScale);
     
+    // Normalize quaternion
     float4 q = g.rotation;
     float qLen = length(q);
     q = (qLen > 0.001) ? (q / qLen) : float4(1, 0, 0, 0);
     
+    // Build 3D covariance: Sigma = R * S * S^T * R^T = M * M^T where M = R * S
     float3x3 R = quatToMat(q);
     float3x3 S = float3x3(scale.x, 0, 0, 0, scale.y, 0, 0, 0, scale.z);
     float3x3 M = R * S;
     float3x3 Sigma3D = M * transpose(M);
     
-    float3x3 viewRot = float3x3(
-        uniforms.viewMatrix.columns[0].xyz,
-        uniforms.viewMatrix.columns[1].xyz,
-        uniforms.viewMatrix.columns[2].xyz
-    );
-    
+    // View space projection using same approach as shaders.metal
     float z_cam = viewPos.z;
     float fx = uniforms.focalLength.x;
     float fy = uniforms.focalLength.y;
     
-    float2x3 J = float2x3(
-        fx / z_cam, 0, -fx * viewPos.x / (z_cam * z_cam),
-        0, fy / z_cam, -fy * viewPos.y / (z_cam * z_cam)
-    );
+    // Clamp to avoid numerical issues at edges
+    float limx = 1.3 * fx / z_cam;
+    float limy = 1.3 * fy / z_cam;
+    float txtz = clamp(viewPos.x / z_cam, -limx, limx);
+    float tytz = clamp(viewPos.y / z_cam, -limy, limy);
     
-    float3x3 Sv = viewRot * Sigma3D * transpose(viewRot);
+    // Jacobian of projection (3x3 with zero last row for proper matrix multiply)
+    float J00 = fx / z_cam;
+    float J02 = -fx * txtz / z_cam;
+    float J11 = fy / z_cam;
+    float J12 = -fy * tytz / z_cam;
     
-    float a = 0, b = 0, c = 0;
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            a += J[0][i] * Sv[i][j] * J[0][j];
-            b += J[0][i] * Sv[i][j] * J[1][j];
-            c += J[1][i] * Sv[i][j] * J[1][j];
-        }
-    }
+    float3x3 J = float3x3(J00, 0, J02,
+                          0, J11, J12,
+                          0, 0, 0);
     
+    // View rotation (upper-left 3x3) - use row access like shaders.metal
+    // In Metal, matrix[i] gives row i
+    float3x3 W = float3x3(uniforms.viewMatrix[0].xyz, 
+                          uniforms.viewMatrix[1].xyz, 
+                          uniforms.viewMatrix[2].xyz);
+    
+    // Combined transform: T = J * W
+    float3x3 T = J * W;
+    
+    // Project 3D covariance to 2D: cov2D = T * Sigma3D * T^T
+    float3x3 cov2D = T * Sigma3D * transpose(T);
+    
+    float a = cov2D[0][0];
+    float b = cov2D[0][1];
+    float c = cov2D[1][1];
+    
+    // Low-pass filter
     a += 0.3;
     c += 0.3;
     
@@ -163,9 +201,11 @@ kernel void projectGaussians(
         return;
     }
     
+    // Conic (inverse covariance)
     float inv_det = 1.0 / det;
     proj.conic = float3(c * inv_det, -b * inv_det, a * inv_det);
     
+    // Compute radius from eigenvalues
     float mid = 0.5 * (a + c);
     float disc = mid * mid - det;
     float l1 = mid + sqrt(max(0.1f, disc));
@@ -177,6 +217,7 @@ kernel void projectGaussians(
         return;
     }
     
+    // Tile bounds
     float r = proj.radius;
     int minX = max(0, int(proj.screenPos.x - r));
     int minY = max(0, int(proj.screenPos.y - r));
@@ -194,6 +235,7 @@ kernel void projectGaussians(
     proj.tileMaxX = min(uint(maxX) / TILE_SIZE, uniforms.numTilesX - 1);
     proj.tileMaxY = min(uint(maxY) / TILE_SIZE, uniforms.numTilesY - 1);
     
+    // Limit tile coverage
     uint tilesX = proj.tileMaxX - proj.tileMinX + 1;
     uint tilesY = proj.tileMaxY - proj.tileMinY + 1;
     if (tilesX * tilesY > 64) {
@@ -202,9 +244,11 @@ kernel void projectGaussians(
         return;
     }
     
+    // ===== OPACITY: Apply sigmoid to raw opacity =====
     float rawOpacity = clamp(g.opacity, -8.0f, 8.0f);
     proj.opacity = 1.0 / (1.0 + exp(-rawOpacity));
     
+    // Color from SH DC terms
     proj.color = clamp(float3(
         SH_C0 * g.sh[0] + 0.5f,
         SH_C0 * g.sh[4] + 0.5f,
@@ -301,18 +345,14 @@ kernel void tiledBackward(
     
     float2 pixelPos = float2(gid) + 0.5;
     
-    // Get pixel colors
     float4 r_pix = rendered.read(gid);
     float4 gt_pix = groundTruth.read(gid);
     
-    // L1 gradient: sign of (rendered - gt)
+    // L1 gradient
     float3 diff = r_pix.rgb - gt_pix.rgb;
     float3 dL_dPixel = sign(diff) / 3.0;
     
-    // Also compute for accumulating dL/dC for the backward pass
-    // Following the paper: we need to track accumulated color for proper gradients
     float T = 1.0;
-    float3 accum_color = float3(0);
     
     uint endIdx = min(lastIdx + 1, range.start + min(range.count, 256u));
     
@@ -341,12 +381,9 @@ kernel void tiledBackward(
         float weight = alpha * T_i;
         
         // ===== Color/SH gradients =====
-        // dL/dC = dL/dPixel * weight
         float3 dL_dColor = dL_dPixel * weight;
         
         // ===== Alpha gradient =====
-        // dL/dalpha = dL/dPixel · (T_i * color - (1/(1-alpha)) * (C_final - accum_color - alpha*T_i*color))
-        // Simplified: dL/dalpha ≈ dL/dPixel · T_i * color
         float dL_dAlpha = dot(dL_dPixel, p.color * T_i);
         
         // ===== Opacity gradient =====
@@ -356,15 +393,10 @@ kernel void tiledBackward(
         float dAlpha_dRawOp = sig * (1.0 - sig) * G;
         float dL_dRawOpacity = dL_dAlpha * dAlpha_dRawOp;
         
-        // ===== Gaussian (G) gradient =====
-        // dalpha/dG = sigmoid(raw_opacity)
+        // ===== Gaussian gradient =====
         float dL_dG = dL_dAlpha * sig;
         
         // ===== Screen position gradient =====
-        // G = exp(power), power = -0.5 * (d^T * Sigma^-1 * d)
-        // dG/d_screenPos = G * (-Sigma^-1 * d) = G * -conic * d
-        // Note: d = pixel - screenPos, so d_screenPos/d_d = -1
-        // Therefore: dG/d_screenPos = G * conic * d (positive because of chain rule flip)
         float2 conic_d = float2(
             p.conic.x * d.x + p.conic.y * d.y,
             p.conic.y * d.x + p.conic.z * d.y
@@ -372,39 +404,27 @@ kernel void tiledBackward(
         float2 dL_dScreenPos = dL_dG * G * conic_d;
         
         // ===== World position gradient =====
-        // screenPos = project(worldPos)
-        // For perspective: screen_x = fx * view_x / view_z + cx
-        //                  screen_y = fy * view_y / view_z + cy (with Y flip)
-        // view = R * world + t (from view matrix)
-        
         float z = p.depth;
         float fx = uniforms.focalLength.x;
         float fy = uniforms.focalLength.y;
         
-        // d_screenPos / d_viewPos:
-        // d_sx/d_vx = fx/z, d_sx/d_vz = -fx*vx/z^2
-        // d_sy/d_vy = -fy/z (Y flip), d_sy/d_vz = fy*vy/z^2 (Y flip)
         float3 dL_dViewPos;
         dL_dViewPos.x = dL_dScreenPos.x * fx / z;
         dL_dViewPos.y = -dL_dScreenPos.y * fy / z;  // Y flip
         dL_dViewPos.z = -dL_dScreenPos.x * fx * p.viewPos_xy.x / (z * z)
                         + dL_dScreenPos.y * fy * p.viewPos_xy.y / (z * z);
         
-        // d_viewPos / d_worldPos = viewMatrix rotation part (transpose to go backward)
+        // Use row access like forward pass (matrix[i] gives row i in Metal)
         float3x3 viewRot = float3x3(
-            uniforms.viewMatrix.columns[0].xyz,
-            uniforms.viewMatrix.columns[1].xyz,
-            uniforms.viewMatrix.columns[2].xyz
+            uniforms.viewMatrix[0].xyz,
+            uniforms.viewMatrix[1].xyz,
+            uniforms.viewMatrix[2].xyz
         );
         float3 dL_dWorldPos = transpose(viewRot) * dL_dViewPos;
         
-        // ===== Scale gradient (simplified) =====
-        // Larger scale -> larger 2D covariance -> larger radius -> affects more pixels
-        // We approximate: if Gaussian should be bigger, scale gradient is positive
-        // This is a heuristic based on the alpha contribution
-        float scale_grad_magnitude = dL_dG * G * 0.01;  // Small factor
+        // Scale gradient (simplified heuristic)
+        float scale_grad_magnitude = dL_dG * G * 0.01;
         
-        // Gradient clamp
         float clampVal = 1.0;
         
         // Atomic accumulation
@@ -432,8 +452,6 @@ kernel void tiledBackward(
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_z,
             clamp(scale_grad_magnitude, -clampVal, clampVal), memory_order_relaxed);
         
-        // Update for next iteration
-        accum_color += p.color * weight;
         T *= (1.0 - alpha);
     }
 }

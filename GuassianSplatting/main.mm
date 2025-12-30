@@ -24,15 +24,17 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
     
     for (const auto& pt : colmap.points) {
         Gaussian g;
+        
         g.position = pt.position;
         
-        // Initial scale: exp(-4) ≈ 0.018, gives small starting size
+        // Initial scale in LOG space: log(0.018) ≈ -4
         g.scale = simd_make_float3(-4.0f, -4.0f, -4.0f);
         
-        // Identity quaternion in (w, x, y, z) format stored as (x=w, y=x, z=y, w=z)
+        // Identity quaternion: (w=1, x=0, y=0, z=0)
+        // Stored as float4(.x=w, .y=x, .z=y, .w=z)
         g.rotation = simd_make_float4(1.0f, 0.0f, 0.0f, 0.0f);
         
-        // Initial opacity: sigmoid(-2) ≈ 0.12
+        // Initial opacity in RAW space: sigmoid(-2) ≈ 0.12
         g.opacity = -2.0f;
         
         // Initialize SH coefficients
@@ -41,6 +43,7 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
         }
         
         // Set DC terms (indices 0, 4, 8)
+        // color = SH_C0 * sh_dc + 0.5, so sh_dc = (color - 0.5) / SH_C0
         g.sh[0] = (pt.color.x - 0.5f) / SH_C0;  // R DC
         g.sh[4] = (pt.color.y - 0.5f) / SH_C0;  // G DC
         g.sh[8] = (pt.color.z - 0.5f) / SH_C0;  // B DC
@@ -58,11 +61,12 @@ int main(int argc, char* argv[]) {
     
     // Default paths - can be overridden with command line args
     std::string colmapPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/";
-    std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images";
+    std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4";
     std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
-    size_t numEpochs = 10;  // Default to 30 epochs for decent quality
+    size_t numEpochs = 10;
+    bool viewOnly = false;
+    std::string viewPlyPath = "";
     
-    // Parse command line arguments
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--colmap" && i + 1 < argc) {
@@ -73,18 +77,76 @@ int main(int argc, char* argv[]) {
             outputPath = argv[++i];
         } else if (arg == "--epochs" && i + 1 < argc) {
             numEpochs = std::stoi(argv[++i]);
+        } else if (arg == "--view" && i + 1 < argc) {
+            viewOnly = true;
+            viewPlyPath = argv[++i];
         } else if (arg == "--help") {
             std::cout << "Usage: " << argv[0] << " [options]\n"
                       << "Options:\n"
                       << "  --colmap PATH   Path to COLMAP sparse reconstruction\n"
                       << "  --images PATH   Path to training images\n"
                       << "  --output PATH   Output PLY file path\n"
-                      << "  --epochs N      Number of training epochs (default: 30)\n"
+                      << "  --epochs N      Number of training epochs (default: 10)\n"
+                      << "  --view PATH     View-only mode: load and display PLY file\n"
                       << "  --help          Show this help message\n";
             return 0;
         }
     }
     
+    // View-only mode
+    if (viewOnly) {
+        std::cout << "=== View Mode ===" << std::endl;
+        std::cout << "Loading: " << viewPlyPath << std::endl;
+        
+        auto gaussians = load_ply(viewPlyPath);
+        if (gaussians.empty()) {
+            std::cerr << "Error: Failed to load PLY file!" << std::endl;
+            return 1;
+        }
+        
+        // Compute bounding box
+        float min_x = FLT_MAX, min_y = FLT_MAX, min_z = FLT_MAX;
+        float max_x = -FLT_MAX, max_y = -FLT_MAX, max_z = -FLT_MAX;
+        
+        for (const Gaussian& g : gaussians) {
+            min_x = fmin(min_x, g.position.x);
+            max_x = fmax(max_x, g.position.x);
+            min_y = fmin(min_y, g.position.y);
+            max_y = fmax(max_y, g.position.y);
+            min_z = fmin(min_z, g.position.z);
+            max_z = fmax(max_z, g.position.z);
+        }
+        
+        simd_float3 center = simd_make_float3(
+            (min_x + max_x) / 2.0f,
+            (min_y + max_y) / 2.0f,
+            (min_z + max_z) / 2.0f
+        );
+        float diagonal = simd_length(simd_make_float3(max_x - min_x, max_y - min_y, max_z - min_z));
+        
+        std::cout << "Scene center: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
+        std::cout << "Scene diagonal: " << diagonal << std::endl;
+        
+        Camera camera = Camera(center, 0, 0.3f, 1.5f * diagonal,
+                               45.0f * M_PI / 180.0f, 800.0f / 600.0f,
+                               0.1f, 10.0f * diagonal);
+        
+        MTLEngine engine;
+        engine.init();
+        engine.loadGaussians(gaussians);
+        
+        std::cout << "\nControls:" << std::endl;
+        std::cout << "  Left mouse drag: Orbit camera" << std::endl;
+        std::cout << "  Right mouse drag: Pan camera" << std::endl;
+        std::cout << "  Scroll: Zoom in/out" << std::endl;
+        std::cout << "  ESC: Exit" << std::endl;
+        
+        engine.run(camera);
+        engine.cleanup();
+        return 0;
+    }
+    
+    // Training mode
     std::cout << "=== Gaussian Splatting Training ===" << std::endl;
     std::cout << "COLMAP path: " << colmapPath << std::endl;
     std::cout << "Images path: " << imagePath << std::endl;
@@ -177,35 +239,30 @@ int main(int argc, char* argv[]) {
         PLYExporter::exportPLY(outputPath, trainedGaussians, gaussianCount);
     } else {
         std::cerr << "Error: No Gaussians to export!" << std::endl;
+        engine.cleanup();
+        return 1;
     }
     
-    // Now switch to viewer mode
+    engine.cleanup();
+    
+    // Now open viewer with the exported PLY
     printf("\n=== Starting Viewer ===\n");
     printf("Controls:\n");
     printf("  Left mouse drag: Orbit camera\n");
     printf("  Right mouse drag: Pan camera\n");
     printf("  Scroll: Zoom in/out\n");
-    printf("  T: Toggle training view\n");
-    printf("  Space: Toggle training (if in interactive mode)\n");
-    printf("  Arrow keys: Switch training images\n");
     printf("  ESC: Exit\n\n");
     
-    // Reinitialize with window for viewing
-    engine.cleanup();
-    
-    MTLEngine viewerEngine;
-    viewerEngine.init();  // Full init with window
-    
-    // Reload the trained Gaussians from the exported PLY
+    // Load the exported PLY
     auto loadedGaussians = load_ply(outputPath);
     if (loadedGaussians.empty()) {
         std::cerr << "Error: Failed to load exported PLY!" << std::endl;
         return 1;
     }
     
-    viewerEngine.loadGaussians(loadedGaussians);
+    std::cout << "Loaded " << loadedGaussians.size() << " Gaussians for viewing" << std::endl;
     
-    // Recompute camera for the potentially changed scene
+    // Recompute bounds for loaded Gaussians
     min_x = FLT_MAX; min_y = FLT_MAX; min_z = FLT_MAX;
     max_x = -FLT_MAX; max_y = -FLT_MAX; max_z = -FLT_MAX;
     
@@ -225,10 +282,16 @@ int main(int argc, char* argv[]) {
     );
     diagonal = simd_length(simd_make_float3(max_x - min_x, max_y - min_y, max_z - min_z));
     
+    std::cout << "Viewer scene center: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
+    std::cout << "Viewer scene diagonal: " << diagonal << std::endl;
+    
     Camera viewerCamera = Camera(center, 0, 0.3f, 1.5f * diagonal,
                                   45.0f * M_PI / 180.0f, 800.0f / 600.0f,
                                   0.1f, 10.0f * diagonal);
     
+    MTLEngine viewerEngine;
+    viewerEngine.init();
+    viewerEngine.loadGaussians(loadedGaussians);
     viewerEngine.run(viewerCamera);
     viewerEngine.cleanup();
     
