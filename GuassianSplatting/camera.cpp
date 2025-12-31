@@ -32,10 +32,12 @@ void Camera::updateMatrices() {
     
     position = simd_make_float3(target.x + x, target.y + y, target.z + z);
     
+    // Use left-hand coordinate system to match COLMAP convention
+    // In left-hand: +Z forward, so objects in front have POSITIVE z in view space
+    // This matches what the training shader expects
+    view_matrix = matrix_look_at_left_hand(position.x, position.y, position.z, target.x, target.y, target.z, up.x, up.y, up.z);
     
-    view_matrix = matrix_look_at_right_hand(position.x, position.y, position.z, target.x, target.y, target.z, up.x, up.y, up.z);
-    
-    projection_matrix = matrix_perspective_right_hand(fov, aspect_ratio, near_plane, far_plane);
+    projection_matrix = matrix_perspective_left_hand(fov, aspect_ratio, near_plane, far_plane);
 }
 
 void Camera::orbit(float deltaAzimuth, float deltaElevation) {

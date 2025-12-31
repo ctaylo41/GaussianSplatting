@@ -94,7 +94,7 @@ private:
     
     std::vector<TrainingImage> trainingImages;
     
-    bool useTrainingView = false;
+    bool useTrainingView = true;  // Default to training view for proper scale
     size_t currentTrainingIndex = 0;
     
     static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);

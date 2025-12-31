@@ -45,15 +45,14 @@ struct VertexOut {
 
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
-constant float MAX_SCALE = 10.0f;  // Allow smaller scales (log range -10 to 10)
+constant float MAX_SCALE = 3.0f;  // Log scale range -3 to 3 (exp: 0.05 to 20)
 
 float3 evalSH(float sh[12], float3 dir) {
-    // DC term + degree 1 terms
-    float3 result = float3(sh[0], sh[4], sh[8]) * SH_C0;
-    result += float3(sh[1], sh[5], sh[9]) * SH_C1 * dir.y;
-    result += float3(sh[2], sh[6], sh[10]) * SH_C1 * dir.z;
-    result += float3(sh[3], sh[7], sh[11]) * SH_C1 * dir.x;
-    return max(result + 0.5f, 0.0f);
+    // Use only DC term to match training (which only trains DC)
+    // DC coefficient: sh[0]=R, sh[4]=G, sh[8]=B
+    // Formula: color = SH_C0 * sh_dc + 0.5
+    float3 result = float3(sh[0], sh[4], sh[8]) * SH_C0 + 0.5f;
+    return clamp(result, 0.0f, 1.0f);
 }
 
 float3x3 quaternionToMatrix(float4 q) {
@@ -84,22 +83,24 @@ float3x3 computeCovariance3D(float3 logScale, float4 rotation) {
 float3 computeCovariance2D(float3 mean, float3x3 covariance3D, float4x4 viewMatrix, float2 focalLength) {
     float4 t = viewMatrix * float4(mean, 1.0);
     
-    // Clamp to avoid numerical issues at edges
-    float limx = 1.3 * focalLength.x / t.z;
-    float limy = 1.3 * focalLength.y / t.z;
-    float txtz = clamp(t.x / t.z, -limx, limx);
-    float tytz = clamp(t.y / t.z, -limy, limy);
+    // Using left-hand coordinate system: +Z forward, objects in front have POSITIVE z
+    float z = t.z;
+    if (z < 0.001) z = 0.001;  // Prevent division by zero and behind camera
     
-    // Jacobian of projection
-    float J00 = focalLength.x / t.z;
-    float J02 = -focalLength.x * txtz / t.z;
-    float J11 = focalLength.y / t.z;
-    float J12 = -focalLength.y * tytz / t.z;
+    // Clamp to avoid numerical issues at edges
+    float limx = 1.3 * focalLength.x / z;
+    float limy = 1.3 * focalLength.y / z;
+    float txtz = clamp(t.x / z, -limx, limx);
+    float tytz = clamp(t.y / z, -limy, limy);
+    
+    // Jacobian of projection (perspective projection derivative)
+    // Maps 3D view space -> 2D screen space
+    float J00 = focalLength.x / z;
+    float J02 = -focalLength.x * txtz / z;
+    float J11 = focalLength.y / z;
+    float J12 = -focalLength.y * tytz / z;
     
     // Metal float3x3 takes columns: col0, col1, col2
-    // J = | J00  0    J02 |
-    //     | 0    J11  J12 |
-    //     | 0    0    0   |
     float3x3 J = float3x3(
         float3(J00, 0, 0),    // Column 0
         float3(0, J11, 0),    // Column 1
@@ -115,7 +116,12 @@ float3 computeCovariance2D(float3 mean, float3x3 covariance3D, float4x4 viewMatr
     cov[0][0] += 0.3;
     cov[1][1] += 0.3;
     
-    return float3(cov[0][0], cov[0][1], cov[1][1]);
+    // Extract 2D covariance components
+    float a = cov[0][0];
+    float b = cov[0][1];  // Off-diagonal
+    float c = cov[1][1];
+    
+    return float3(a, b, c);
 }
 
 float3 computeConic(float3 cov2D) {
@@ -162,20 +168,54 @@ vertex VertexOut vertexShader(
         return out;
     }
     
-    // Compute 2D covariance from 3D (scale is log, will be exp'd inside)
-    float3x3 cov3d = computeCovariance3D(g.scale, g.rotation);
-    float3 cov2d = computeCovariance2D(g.position, cov3d, uniforms.viewMatrix, uniforms.focalLength);
-    float3 conic = computeConic(cov2d);
-    float radius = computeRadius(cov2d);
+    // Compute 3D covariance from scale and rotation
+    float3x3 cov3D = computeCovariance3D(g.scale, g.rotation);
     
-    // Quad corners
+    // Project to 2D screen space
+    float3 cov2D = computeCovariance2D(g.position, cov3D, uniforms.viewMatrix, uniforms.focalLength);
+    
+    // Compute radius from eigenvalues of 2D covariance
+    float det = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+    float radius;
+    
+    if (det > 0.0001 && cov2D.x > 0.0 && cov2D.z > 0.0) {
+        // Valid covariance - compute radius from eigenvalues
+        float mid = 0.5 * (cov2D.x + cov2D.z);
+        float disc = max(0.0f, mid * mid - det);
+        float lambda = mid + sqrt(disc);  // Largest eigenvalue
+        radius = ceil(3.0 * sqrt(max(lambda, 0.1f)));
+    } else {
+        // Invalid covariance - use fixed radius
+        radius = 15.0;
+    }
+    
+    // Clamp radius
+    radius = clamp(radius, 1.0f, 64.0f);
+    
+    // Compute conic (inverse of 2D covariance) - CRITICAL for proper Gaussian shape
+    float3 conic;
+    if (det > 0.0001) {
+        float invDet = 1.0 / det;
+        conic = float3(cov2D.z * invDet, -cov2D.y * invDet, cov2D.x * invDet);
+    } else {
+        // Fallback to circular if covariance is degenerate
+        conic = float3(0.02, 0.0, 0.02);
+    }
+    
+    // Quad corners in normalized [-1,1] space
+    // vertexID 0: bottom-left, 1: bottom-right, 2: top-left, 3: top-right
     float2 quadOffsets[4] = {
         float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1)
     };
     
-    float2 quadOffset = quadOffsets[vertexID];
+    float2 quadOffset = quadOffsets[vertexID];  // This is in [-1, 1] range
     float2 centerNDC = clipPos.xy / clipPos.w;
+    
+    // Offset in pixels from center
     float2 offsetPixels = quadOffset * radius;
+    
+    // Convert pixel offset to NDC offset
+    // Note: NDC y goes up, but screen y goes down - don't flip here, it's handled in fragment
     float2 offsetNDC = offsetPixels / (uniforms.screenSize * 0.5);
     
     out.position = float4((centerNDC + offsetNDC) * clipPos.w, clipPos.z, clipPos.w);
@@ -187,11 +227,14 @@ vertex VertexOut vertexShader(
     // Apply sigmoid to raw opacity - this is the ONLY place sigmoid() is applied
     out.opacity = 1.0 / (1.0 + exp(-clamp(g.opacity, -8.0f, 8.0f)));
     
+    // Center screen position (for debugging, not used in current frag shader)
     out.centerScreenPos = float2(
         (centerNDC.x * 0.5 + 0.5) * uniforms.screenSize.x,
-        (1.0 - (centerNDC.y * 0.5 + 0.5)) * uniforms.screenSize.y
+        (centerNDC.y * 0.5 + 0.5) * uniforms.screenSize.y  // Don't flip here
     );
+    
     out.conic = conic;
+    // Pass pixel offset directly - fragment shader uses this for Gaussian calculation
     out.quadOffset = offsetPixels;
     
     return out;
@@ -199,15 +242,22 @@ vertex VertexOut vertexShader(
 
 fragment float4 fragmentShader(VertexOut in [[stage_in]]) {
     float2 d = in.quadOffset;
-    float power = -0.5 * (in.conic.x * d.x * d.x +
-                          2.0 * in.conic.y * d.x * d.y +
+    
+    // Use proper conic-based Gaussian evaluation (matches training)
+    // power = -0.5 * (conic.x * d.x^2 + 2 * conic.y * d.x * d.y + conic.z * d.y^2)
+    float power = -0.5 * (in.conic.x * d.x * d.x + 
+                          2.0 * in.conic.y * d.x * d.y + 
                           in.conic.z * d.y * d.y);
     
-    if (power > 0.0) discard_fragment();
+    // Skip if power is positive (outside ellipse) or too negative
+    if (power > 0.0 || power < -4.5) discard_fragment();
     
-    float alpha = in.opacity * exp(power);
+    float G = exp(power);
+    float alpha = in.opacity * G;
+    
     if (alpha < 1.0 / 255.0) discard_fragment();
     
+    // Pre-multiplied alpha output for blending
     return float4(in.color * alpha, alpha);
 }
 
@@ -371,7 +421,7 @@ kernel void adamStep(
         gaussians[tid].opacity = clamp(gaussians[tid].opacity - lrs[3] * m_hat / (sqrt(v_hat) + epsilon), -8.0f, 8.0f);
     }
     
-    // SH update
+    // SH update - clamp to reasonable range
     for (int i = 0; i < 12; i++) {
         float grad = clamp(g.sh[i], -clip, clip);
         uint idx = tid * 12 + i;
@@ -383,6 +433,9 @@ kernel void adamStep(
         
         float m_hat = m / bc1;
         float v_hat = v / bc2;
-        gaussians[tid].sh[i] -= lrs[4] * m_hat / (sqrt(v_hat) + epsilon);
+        float newSH = gaussians[tid].sh[i] - lrs[4] * m_hat / (sqrt(v_hat) + epsilon);
+        // Clamp SH values to prevent color explosion
+        // DC coefficient range ~[-3, 3] gives color range [0, 1] after SH_C0 transform
+        gaussians[tid].sh[i] = clamp(newSH, -5.0f, 5.0f);
     }
 }

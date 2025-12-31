@@ -4,6 +4,7 @@
 //
 
 #include "tiled_rasterizer.hpp"
+#include "ply_loader.hpp"  // For Gaussian struct
 #include <iostream>
 #include <algorithm>
 #include <cstring>
@@ -129,6 +130,21 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     
     ensureBufferCapacity(width, height, gaussianCount);
     
+    // DEBUG: Print a few input Gaussians (once)
+    static bool inputDebugPrinted = false;
+    if (!inputDebugPrinted) {
+        Gaussian* gPtr = (Gaussian*)gaussianBuffer->contents();
+        std::cout << "=== Input Gaussian Debug ===" << std::endl;
+        for (int i = 0; i < std::min(3, (int)gaussianCount); i++) {
+            Gaussian& g = gPtr[i];
+            std::cout << "Gaussian " << i << ": pos=(" << g.position.x << "," << g.position.y << "," << g.position.z
+                      << ") scale(log)=(" << g.scale.x << "," << g.scale.y << "," << g.scale.z
+                      << ") rot=(" << g.rotation.x << "," << g.rotation.y << "," << g.rotation.z << "," << g.rotation.w
+                      << ") opacity=" << g.opacity << std::endl;
+        }
+        inputDebugPrinted = true;
+    }
+    
     // Copy uniforms
     TiledUniforms u = uniforms;
     u.numTilesX = numTilesX;
@@ -165,6 +181,38 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     
     // Step 2: CPU-side tile binning and sorting
     ProjectedGaussian* projPtr = (ProjectedGaussian*)projectedGaussians->contents();
+    
+    // DEBUG: Print some projected Gaussian info (once)
+    static bool debugPrinted = false;
+    if (!debugPrinted) {
+        int validCount = 0;
+        float avgConicMag = 0;
+        float minDepth = 1e10, maxDepth = 0;
+        for (uint32_t i = 0; i < std::min((uint32_t)100, (uint32_t)gaussianCount); i++) {
+            const ProjectedGaussian& p = projPtr[i];
+            if (p.radius > 0) {
+                float conicMag = fabs(p.conic.x) + fabs(p.conic.y) + fabs(p.conic.z);
+                avgConicMag += conicMag;
+                if (p.depth > 0) {
+                    minDepth = std::min(minDepth, p.depth);
+                    maxDepth = std::max(maxDepth, p.depth);
+                }
+                validCount++;
+                if (validCount <= 5) {
+                    std::cout << "Gaussian " << i << ": screenPos=(" << p.screenPos.x << "," << p.screenPos.y
+                              << ") depth=" << p.depth << " radius=" << p.radius 
+                              << " conic=(" << p.conic.x << "," << p.conic.y << "," << p.conic.z
+                              << ") opacity=" << p.opacity << std::endl;
+                }
+            }
+        }
+        if (validCount > 0) {
+            std::cout << "Valid Gaussians in first 100: " << validCount 
+                      << ", avg conic magnitude: " << (avgConicMag/validCount) 
+                      << ", depth range: " << minDepth << " to " << maxDepth << std::endl;
+        }
+        debugPrinted = true;
+    }
     
     // First pass: count pairs
     uint32_t totalPairs = 0;

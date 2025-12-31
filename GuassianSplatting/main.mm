@@ -27,8 +27,12 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
         
         g.position = pt.position;
         
-        // Initial scale in LOG space: log(0.018) ≈ -4
-        g.scale = simd_make_float3(-4.0f, -4.0f, -4.0f);
+        // Initial scale in LOG space: 
+        // For points at depth ~4 with fx~4000, we want ~3 pixel radius
+        // size_2d = scale * fx / depth, so scale = size_2d * depth / fx = 3 * 4 / 4000 = 0.003
+        // log(0.003) ≈ -5.8, but clamped to -3 for stability
+        // exp(-3) = 0.05 which gives reasonable initial size
+        g.scale = simd_make_float3(-3.0f, -3.0f, -3.0f);
         
         // Identity quaternion: (w=1, x=0, y=0, z=0)
         // Stored as float4(.x=w, .y=x, .z=y, .w=z)
@@ -63,7 +67,7 @@ int main(int argc, char* argv[]) {
     std::string colmapPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/";
     std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4";
     std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
-    size_t numEpochs = 3;
+    size_t numEpochs = 10;  // Train for 10 epochs
     bool viewOnly = false;
     std::string viewPlyPath = "";
     
@@ -285,7 +289,17 @@ int main(int argc, char* argv[]) {
     std::cout << "Viewer scene center: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
     std::cout << "Viewer scene diagonal: " << diagonal << std::endl;
     
-    Camera viewerCamera = Camera(center, 0, 0.3f, 1.5f * diagonal,
+    // Use a much smaller distance - similar to the COLMAP training camera
+    // The trained Gaussians are optimized for depth ~4 from COLMAP camera
+    // So position viewer at similar distance from the actual Gaussian cluster
+    // The Gaussians near origin are the visible ones - position camera to see them
+    float viewDistance = 10.0f;  // Close enough to see small Gaussians
+    std::cout << "Viewer distance: " << viewDistance << " (vs original 1.5*diagonal=" << 1.5f*diagonal << ")" << std::endl;
+    
+    // Position camera to look at origin (where most Gaussians are) instead of computed center
+    simd_float3 viewTarget = simd_make_float3(0, 0, 0);  // Look at origin where trained Gaussians cluster
+    
+    Camera viewerCamera = Camera(viewTarget, 0, 0.3f, viewDistance,
                                   45.0f * M_PI / 180.0f, 800.0f / 600.0f,
                                   0.1f, 10.0f * diagonal);
     

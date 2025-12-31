@@ -76,7 +76,7 @@ struct GaussianGradients {
 constant float SH_C0 = 0.28209479177387814f;
 constant uint TILE_SIZE = 16;
 constant float MAX_RADIUS = 64.0f;
-constant float MAX_SCALE = 10.0f;  // Allow smaller scales (log range -10 to 10)
+constant float MAX_SCALE = 3.0f;  // Log scale range -3 to 3 (exp: 0.05 to 20)
 
 // Quaternion to rotation matrix
 // q.x=w, q.y=x, q.z=y, q.w=z
@@ -200,9 +200,11 @@ kernel void projectGaussians(
     // Project 3D covariance to 2D: cov2D = T * Sigma3D * T^T
     float3x3 cov2D = T * Sigma3D * transpose(T);
     
-    float a = cov2D[0][0];
-    float b = cov2D[0][1];
-    float c = cov2D[1][1];
+    // Metal matrix indexing: matrix[col][row]
+    // For symmetric matrix: [0][0]=top-left, [1][1]=bottom-right, [0][1]=[1][0]=off-diagonal
+    float a = cov2D[0][0];  // Column 0, Row 0 = (0,0)
+    float b = cov2D[1][0];  // Column 1, Row 0 = (0,1) - the off-diagonal term
+    float c = cov2D[1][1];  // Column 1, Row 1 = (1,1)
     
     // Low-pass filter
     a += 0.3;
@@ -308,6 +310,11 @@ kernel void tiledForward(
         if (p.radius <= 0) continue;
         
         float2 d = pixelPos - p.screenPos;
+        
+        // Debug: check if conic is valid
+        float conicMag = abs(p.conic.x) + abs(p.conic.y) + abs(p.conic.z);
+        if (conicMag < 0.0001) continue;  // Skip if conic is essentially zero
+        
         float power = -0.5 * (p.conic.x * d.x * d.x +
                               2.0 * p.conic.y * d.x * d.y +
                               p.conic.z * d.y * d.y);
@@ -365,12 +372,46 @@ kernel void tiledBackward(
     float3 diff = r_pix.rgb - gt_pix.rgb;
     float3 dL_dPixel = sign(diff) / 3.0;
     
-    float T = 1.0;
-    
+    // We need to traverse BACK-TO-FRONT for correct gradients
+    // First, find how many Gaussians contribute and compute T_final
     uint endIdx = min(lastIdx + 1, range.start + min(range.count, 256u));
     
-    for (uint sortIdx = range.start; sortIdx < endIdx && T > 0.0001; sortIdx++) {
+    // Pre-compute T (transmittance) for the forward pass to get T_final
+    float T_final = 1.0;
+    for (uint sortIdx = range.start; sortIdx < endIdx; sortIdx++) {
         uint gIdx = sortedIndices[sortIdx];
+        if (gIdx >= uniforms.numGaussians) continue;
+        
+        ProjectedGaussian p = projected[gIdx];
+        if (p.radius <= 0) continue;
+        
+        float2 d = pixelPos - p.screenPos;
+        float power = -0.5 * (p.conic.x * d.x * d.x +
+                              2.0 * p.conic.y * d.x * d.y +
+                              p.conic.z * d.y * d.y);
+        
+        if (power > 0.0 || power < -4.5) continue;
+        
+        float G = exp(power);
+        float alpha = min(p.opacity * G, 0.99f);
+        
+        if (alpha < 1.0 / 255.0) continue;
+        
+        float test_T = T_final * (1.0 - alpha);
+        if (test_T < 0.0001) break;
+        T_final = test_T;
+    }
+    
+    // Now traverse BACK-TO-FRONT for gradients
+    // T starts at T_final and we "undo" by dividing by (1-alpha)
+    float T = T_final;
+    float last_alpha = 0.0;
+    float3 accum_rec = float3(0.0);  // Accumulated color from Gaussians BEHIND current
+    float3 last_color = float3(0.0);
+    
+    // Iterate in reverse order (back to front)
+    for (int sortIdx = int(endIdx) - 1; sortIdx >= int(range.start); sortIdx--) {
+        uint gIdx = sortedIndices[uint(sortIdx)];
         
         if (gIdx >= uniforms.numGaussians) continue;
         
@@ -390,23 +431,39 @@ kernel void tiledBackward(
         
         if (alpha < 1.0 / 255.0) continue;
         
-        float T_i = T;
-        float weight = alpha * T_i;
+        // Recover T at this position by "undoing" the alpha blend
+        // In forward: T_next = T * (1 - alpha)
+        // So: T = T_next / (1 - alpha)
+        T = T / (1.0 - alpha);
+        
+        float weight = alpha * T;
         
         // ===== Color/SH gradients =====
         float3 dL_dColor = dL_dPixel * weight;
         
-        // ===== Alpha gradient =====
-        float dL_dAlpha = dot(dL_dPixel, p.color * T_i);
+        // ===== Alpha gradient (CORRECT FORMULA from 3DGS paper) =====
+        // The key insight: changing alpha affects:
+        // 1. This Gaussian's own contribution: color * alpha * T
+        // 2. All subsequent Gaussians' contributions via transmittance
+        // 
+        // accum_rec tracks the accumulated color from Gaussians BEHIND this one
+        // dL/dalpha = T * dot(dL_dPixel, color - accum_rec)
+        accum_rec = last_alpha * last_color + (1.0 - last_alpha) * accum_rec;
+        last_color = p.color;
+        
+        float dL_dAlpha = T * dot(dL_dPixel, p.color - accum_rec);
+        
+        last_alpha = alpha;
         
         // ===== Opacity gradient =====
         // alpha = sigmoid(raw_opacity) * G
         // dalpha/d_raw_opacity = sigmoid * (1-sigmoid) * G
-        float sig = p.opacity;
+        float sig = p.opacity;  // This is ALREADY sigmoid (from projection)
         float dAlpha_dRawOp = sig * (1.0 - sig) * G;
         float dL_dRawOpacity = dL_dAlpha * dAlpha_dRawOp;
         
         // ===== Gaussian gradient =====
+        // For position/scale gradients, we need dL/dG
         float dL_dG = dL_dAlpha * sig;
         
         // ===== Screen position gradient =====
@@ -545,6 +602,6 @@ kernel void tiledBackward(
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 3,
             clamp(dL_dq.w, -clampVal, clampVal), memory_order_relaxed);
         
-        T *= (1.0 - alpha);
+        // Note: T update is already handled at the start of the loop via T = T / (1 - alpha)
     }
 }

@@ -262,21 +262,97 @@ void MTLEngine::render(Camera& camera) {
     
     Uniforms uniforms;
     
+    static bool renderDebugPrinted = false;
+    
     if (useTrainingView && !trainingImages.empty()) {
         const TrainingImage& img = trainingImages[currentTrainingIndex];
         const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
         
         uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
-        uniforms.projectionMatrix = projectionFromColmap(cam, 0.1f, 1000.0f);
+        
+        // For display, we render to the window, not the training image size
+        // Scale focal length proportionally to window size
+        float scaleX = (float)windowWidth / (float)cam.width;
+        float scaleY = (float)windowHeight / (float)cam.height;
+        float scaledFx = cam.fx * scaleX;
+        float scaledFy = cam.fy * scaleY;
+        
+        // Create projection for window size with scaled focal lengths
+        float near = 0.1f;
+        float far = 1000.0f;
+        float cx = cam.cx * scaleX;
+        float cy = cam.cy * scaleY;
+        
+        simd_float4x4 proj = simd_matrix_from_rows(
+            simd_make_float4(2.0f * scaledFx / windowWidth, 0, 0, 0),
+            simd_make_float4(0, 2.0f * scaledFy / windowHeight, 0, 0),
+            simd_make_float4(1.0f - 2.0f * cx / windowWidth, 2.0f * cy / windowHeight - 1.0f, -(far + near) / (far - near), -1),
+            simd_make_float4(0, 0, -2.0f * far * near / (far - near), 0)
+        );
+        uniforms.projectionMatrix = simd_transpose(proj);  // Convert from row to column major
+        
         uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
-        uniforms.screenSize = simd_make_float2((float)cam.width, (float)cam.height);
-        uniforms.focalLength = simd_make_float2(cam.fx, cam.fy);
+        uniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
+        uniforms.focalLength = simd_make_float2(scaledFx, scaledFy);
         
         simd_float3x3 R;
         R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
         R.columns[1] = uniforms.viewMatrix.columns[1].xyz;
         R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
         uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
+        
+        if (!renderDebugPrinted) {
+            printf("\n=== RENDER DEBUG (Training View) ===\n");
+            printf("Window: %dx%d, COLMAP: %dx%d\n", windowWidth, windowHeight, cam.width, cam.height);
+            printf("Scale: scaleX=%.4f, scaleY=%.4f\n", scaleX, scaleY);
+            printf("Focal: original fx=%.2f fy=%.2f, scaled fx=%.2f fy=%.2f\n", 
+                   cam.fx, cam.fy, scaledFx, scaledFy);
+            printf("Principal: original cx=%.2f cy=%.2f, scaled cx=%.2f cy=%.2f\n",
+                   cam.cx, cam.cy, cx, cy);
+            printf("Camera position: (%.3f, %.3f, %.3f)\n", 
+                   uniforms.cameraPos.x, uniforms.cameraPos.y, uniforms.cameraPos.z);
+            printf("View matrix:\n");
+            for (int r = 0; r < 4; r++) {
+                printf("  [%.4f %.4f %.4f %.4f]\n",
+                       uniforms.viewMatrix.columns[0][r],
+                       uniforms.viewMatrix.columns[1][r],
+                       uniforms.viewMatrix.columns[2][r],
+                       uniforms.viewMatrix.columns[3][r]);
+            }
+            printf("Projection matrix:\n");
+            for (int r = 0; r < 4; r++) {
+                printf("  [%.4f %.4f %.4f %.4f]\n",
+                       uniforms.projectionMatrix.columns[0][r],
+                       uniforms.projectionMatrix.columns[1][r],
+                       uniforms.projectionMatrix.columns[2][r],
+                       uniforms.projectionMatrix.columns[3][r]);
+            }
+            
+            // Test transform a sample point
+            Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
+            simd_float3 testPos = gaussians[0].position;
+            simd_float4 viewPos = matrix_multiply(uniforms.viewMatrix, simd_make_float4(testPos, 1.0f));
+            simd_float4 clipPos = matrix_multiply(uniforms.viewProjectionMatrix, simd_make_float4(testPos, 1.0f));
+            printf("Sample Gaussian 0:\n");
+            printf("  world pos: (%.3f, %.3f, %.3f)\n", testPos.x, testPos.y, testPos.z);
+            printf("  view pos: (%.3f, %.3f, %.3f, %.3f)\n", viewPos.x, viewPos.y, viewPos.z, viewPos.w);
+            printf("  clip pos: (%.3f, %.3f, %.3f, %.3f)\n", clipPos.x, clipPos.y, clipPos.z, clipPos.w);
+            printf("  NDC: (%.3f, %.3f)\n", clipPos.x/clipPos.w, clipPos.y/clipPos.w);
+            printf("  depth (z in view): %.3f\n", viewPos.z);
+            printf("  scale (log): (%.3f, %.3f, %.3f)\n", 
+                   gaussians[0].scale.x, gaussians[0].scale.y, gaussians[0].scale.z);
+            printf("  scale (exp): (%.6f, %.6f, %.6f)\n", 
+                   exp(gaussians[0].scale.x), exp(gaussians[0].scale.y), exp(gaussians[0].scale.z));
+            
+            // Compute expected 2D size
+            float scale = exp(gaussians[0].scale.x);
+            float depth = viewPos.z;
+            float size2d = scale * scaledFx / depth;
+            printf("  Expected 2D size: scale * fx / depth = %.6f * %.2f / %.3f = %.2f pixels\n",
+                   scale, scaledFx, depth, size2d);
+            
+            renderDebugPrinted = true;
+        }
     } else {
         float fovY = 45.0f * M_PI / 180.0f;
         float fy = windowHeight / (2.0f * tan(fovY / 2.0f));
@@ -288,6 +364,49 @@ void MTLEngine::render(Camera& camera) {
         uniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
         uniforms.focalLength = simd_make_float2(fx, fy);
         uniforms.cameraPos = camera.get_position();
+        
+        if (!renderDebugPrinted && gaussianBuffer) {
+            printf("\n=== RENDER DEBUG (Free Camera) ===\n");
+            printf("Window: %dx%d\n", windowWidth, windowHeight);
+            printf("Focal: fx=%.2f fy=%.2f\n", fx, fy);
+            printf("Camera position: (%.3f, %.3f, %.3f)\n", 
+                   uniforms.cameraPos.x, uniforms.cameraPos.y, uniforms.cameraPos.z);
+            printf("View matrix:\n");
+            for (int r = 0; r < 4; r++) {
+                printf("  [%.4f %.4f %.4f %.4f]\n",
+                       uniforms.viewMatrix.columns[0][r],
+                       uniforms.viewMatrix.columns[1][r],
+                       uniforms.viewMatrix.columns[2][r],
+                       uniforms.viewMatrix.columns[3][r]);
+            }
+            
+            // Test transform a sample point
+            Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
+            simd_float3 testPos = gaussians[0].position;
+            simd_float4 viewPos = matrix_multiply(uniforms.viewMatrix, simd_make_float4(testPos, 1.0f));
+            simd_float4 clipPos = matrix_multiply(uniforms.viewProjectionMatrix, simd_make_float4(testPos, 1.0f));
+            printf("Sample Gaussian 0:\n");
+            printf("  world pos: (%.3f, %.3f, %.3f)\n", testPos.x, testPos.y, testPos.z);
+            printf("  view pos: (%.3f, %.3f, %.3f, %.3f)\n", viewPos.x, viewPos.y, viewPos.z, viewPos.w);
+            printf("  clip pos: (%.3f, %.3f, %.3f, %.3f)\n", clipPos.x, clipPos.y, clipPos.z, clipPos.w);
+            if (clipPos.w != 0) {
+                printf("  NDC: (%.3f, %.3f)\n", clipPos.x/clipPos.w, clipPos.y/clipPos.w);
+            }
+            printf("  depth (z in view): %.3f\n", viewPos.z);
+            printf("  scale (log): (%.3f, %.3f, %.3f)\n", 
+                   gaussians[0].scale.x, gaussians[0].scale.y, gaussians[0].scale.z);
+            printf("  scale (exp): (%.6f, %.6f, %.6f)\n", 
+                   exp(gaussians[0].scale.x), exp(gaussians[0].scale.y), exp(gaussians[0].scale.z));
+            
+            // Compute expected 2D size
+            float scale = exp(gaussians[0].scale.x);
+            float depth = viewPos.z;
+            float size2d = scale * fx / depth;
+            printf("  Expected 2D size: scale * fx / depth = %.6f * %.2f / %.3f = %.2f pixels\n",
+                   scale, fx, depth, size2d);
+            
+            renderDebugPrinted = true;
+        }
     }
     memcpy(uniformBuffer->contents(), &uniforms, sizeof(Uniforms));
     
@@ -338,24 +457,23 @@ void MTLEngine::loadTrainingData(const ColmapData& colmap, const std::string& im
 }
 
 simd_float4x4 MTLEngine::viewMatrixFromColmap(simd_float4 quat, simd_float3 translation) {
-    float w = quat.x, x = quat.y, y = quat.z, z = quat.w;
+    // COLMAP loader stores quaternion as: quat = (qx, qy, qz, qw)
+    // So quat.x=qx, quat.y=qy, quat.z=qz, quat.w=qw
+    float x = quat.x, y = quat.y, z = quat.z, w = quat.w;
     
-    // Camera-to-world rotation from quaternion
+    // COLMAP stores world-to-camera rotation and camera-space translation
+    // p_cam = R * p_world + t
+    // So the view matrix is simply [R | t]
     matrix_float3x3 R;
     R.columns[0] = simd_make_float3(1 - 2*(y*y + z*z), 2*(x*y + w*z), 2*(x*z - w*y));
     R.columns[1] = simd_make_float3(2*(x*y - w*z), 1 - 2*(x*x + z*z), 2*(y*z + w*x));
     R.columns[2] = simd_make_float3(2*(x*z + w*y), 2*(y*z - w*x), 1 - 2*(x*x + y*y));
     
-    // For world-to-view: invert the camera-to-world transform
-    // View matrix = [R^T | -R^T * t] where R is cam-to-world rotation, t is cam position
-    matrix_float3x3 Rt = simd_transpose(R);
-    simd_float3 viewTranslation = -simd_mul(Rt, translation);
-    
     simd_float4x4 view;
-    view.columns[0] = simd_make_float4(Rt.columns[0], 0);
-    view.columns[1] = simd_make_float4(Rt.columns[1], 0);
-    view.columns[2] = simd_make_float4(Rt.columns[2], 0);
-    view.columns[3] = simd_make_float4(viewTranslation, 1);
+    view.columns[0] = simd_make_float4(R.columns[0], 0);
+    view.columns[1] = simd_make_float4(R.columns[1], 0);
+    view.columns[2] = simd_make_float4(R.columns[2], 0);
+    view.columns[3] = simd_make_float4(translation, 1);
     
     return view;
 }
@@ -488,6 +606,16 @@ float MTLEngine::trainStep(size_t imageIndex) {
     const TrainingImage& img = trainingImages[imageIndex];
     const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
     
+    // DEBUG: Print uniforms once
+    static bool uniformsDebugPrinted = false;
+    if (!uniformsDebugPrinted) {
+        std::cout << "=== Training Uniforms Debug ===" << std::endl;
+        std::cout << "Image size: " << cam.width << "x" << cam.height << std::endl;
+        std::cout << "Focal length: fx=" << cam.fx << " fy=" << cam.fy << std::endl;
+        std::cout << "Principal point: cx=" << cam.cx << " cy=" << cam.cy << std::endl;
+        uniformsDebugPrinted = true;
+    }
+    
     if (!renderTarget || renderTarget->width() != cam.width || renderTarget->height() != cam.height) {
         createRenderTarget(cam.width, cam.height);
     }
@@ -515,16 +643,51 @@ float MTLEngine::trainStep(size_t imageIndex) {
     tiledRasterizer->backward(commandQueue, gaussianBuffer, gaussianGradients, gaussianCount,
                               uniforms, renderTarget, img.texture);
     
+    // DEBUG: Print gradient magnitudes once
+    static int gradDebugCount = 0;
+    if (gradDebugCount < 3) {
+        GaussianGradients* grads = (GaussianGradients*)gaussianGradients->contents();
+        float sumPosGrad = 0, sumOpacGrad = 0, sumSHGrad = 0, sumScaleGrad = 0;
+        int nonZeroCount = 0;
+        for (size_t i = 0; i < std::min(gaussianCount, (size_t)1000); i++) {
+            float posGrad = fabs(grads[i].position_x) + fabs(grads[i].position_y) + fabs(grads[i].position_z);
+            float scaleGrad = fabs(grads[i].scale_x) + fabs(grads[i].scale_y) + fabs(grads[i].scale_z);
+            sumPosGrad += posGrad;
+            sumOpacGrad += fabs(grads[i].opacity);
+            sumSHGrad += fabs(grads[i].sh[0]) + fabs(grads[i].sh[4]) + fabs(grads[i].sh[8]);
+            sumScaleGrad += scaleGrad;
+            if (posGrad > 0.0001) nonZeroCount++;
+        }
+        std::cout << "\n=== Gradient Debug (iter " << gradDebugCount << ") ===" << std::endl;
+        std::cout << "Avg position grad: " << sumPosGrad / 1000 << std::endl;
+        std::cout << "Avg opacity grad: " << sumOpacGrad / 1000 << std::endl;
+        std::cout << "Avg SH grad: " << sumSHGrad / 1000 << std::endl;
+        std::cout << "Avg scale grad: " << sumScaleGrad / 1000 << std::endl;
+        std::cout << "Non-zero grads in first 1000: " << nonZeroCount << std::endl;
+        
+        // Print first non-zero gradient
+        for (size_t i = 0; i < std::min(gaussianCount, (size_t)100); i++) {
+            if (fabs(grads[i].position_x) > 0.0001 || fabs(grads[i].opacity) > 0.0001) {
+                std::cout << "Gaussian " << i << " grad: pos=(" << grads[i].position_x << "," 
+                          << grads[i].position_y << "," << grads[i].position_z 
+                          << ") opacity=" << grads[i].opacity 
+                          << " sh0=" << grads[i].sh[0] << std::endl;
+                break;
+            }
+        }
+        gradDebugCount++;
+    }
+    
     // Accumulate for density control
     densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
     
-    // Optimizer step
+    // Optimizer step - reduced learning rates for stability
     optimizer->step(commandQueue, gaussianBuffer, gaussianGradients,
-                    0.0008f,   // position lr
-                    0.005f,     // scale lr
-                    0.001f,     // rotation lr
-                    0.1f,      // opacity lr
-                    0.005f);   // sh lr
+                    0.00016f,  // position lr (reduced from 0.0008)
+                    0.001f,    // scale lr (reduced from 0.005) 
+                    0.001f,    // rotation lr
+                    0.05f,     // opacity lr (reduced from 0.1)
+                    0.0025f);  // sh lr (reduced from 0.005)
     
     return loss;
 }
@@ -588,4 +751,56 @@ void MTLEngine::train(size_t numEpochs) {
     auto totalDuration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
     
     std::cout << "Training complete! Total time: " << totalDuration << "s" << std::endl;
+    
+    // Debug: Check color distribution after training
+    std::cout << "\n=== Color Debug After Training ===" << std::endl;
+    Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
+    
+    float minSH0 = FLT_MAX, maxSH0 = -FLT_MAX;
+    float minSH4 = FLT_MAX, maxSH4 = -FLT_MAX;
+    float minSH8 = FLT_MAX, maxSH8 = -FLT_MAX;
+    int validCount = 0;
+    float sumR = 0, sumG = 0, sumB = 0;
+    
+    for (size_t i = 0; i < gaussianCount; i++) {
+        float sh0 = gaussians[i].sh[0];
+        float sh4 = gaussians[i].sh[4];
+        float sh8 = gaussians[i].sh[8];
+        
+        if (!std::isnan(sh0) && !std::isnan(sh4) && !std::isnan(sh8)) {
+            minSH0 = std::min(minSH0, sh0);
+            maxSH0 = std::max(maxSH0, sh0);
+            minSH4 = std::min(minSH4, sh4);
+            maxSH4 = std::max(maxSH4, sh4);
+            minSH8 = std::min(minSH8, sh8);
+            maxSH8 = std::max(maxSH8, sh8);
+            
+            // Compute color: color = SH_C0 * sh_dc + 0.5
+            const float SH_C0 = 0.28209479f;
+            float r = SH_C0 * sh0 + 0.5f;
+            float g = SH_C0 * sh4 + 0.5f;
+            float b = SH_C0 * sh8 + 0.5f;
+            
+            sumR += std::clamp(r, 0.0f, 1.0f);
+            sumG += std::clamp(g, 0.0f, 1.0f);
+            sumB += std::clamp(b, 0.0f, 1.0f);
+            validCount++;
+        }
+    }
+    
+    std::cout << "SH[0] (R DC) range: [" << minSH0 << ", " << maxSH0 << "]" << std::endl;
+    std::cout << "SH[4] (G DC) range: [" << minSH4 << ", " << maxSH4 << "]" << std::endl;
+    std::cout << "SH[8] (B DC) range: [" << minSH8 << ", " << maxSH8 << "]" << std::endl;
+    std::cout << "Average color (RGB): (" << sumR/validCount << ", " << sumG/validCount << ", " << sumB/validCount << ")" << std::endl;
+    
+    // Print a few sample Gaussians
+    std::cout << "\nSample Gaussian Colors:" << std::endl;
+    for (int i = 0; i < 5 && i < (int)gaussianCount; i++) {
+        const float SH_C0 = 0.28209479f;
+        float r = std::clamp(SH_C0 * gaussians[i].sh[0] + 0.5f, 0.0f, 1.0f);
+        float g = std::clamp(SH_C0 * gaussians[i].sh[4] + 0.5f, 0.0f, 1.0f);
+        float b = std::clamp(SH_C0 * gaussians[i].sh[8] + 0.5f, 0.0f, 1.0f);
+        std::cout << "  Gaussian " << i << ": SH=(" << gaussians[i].sh[0] << ", " << gaussians[i].sh[4] << ", " << gaussians[i].sh[8]
+                  << ") -> Color=(" << r << ", " << g << ", " << b << ")" << std::endl;
+    }
 }

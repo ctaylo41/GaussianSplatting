@@ -19,7 +19,7 @@ static constexpr float GRAD_THRESHOLD = 0.0002f;
 static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;
 static constexpr float SCALE_SPLIT_THRESHOLD = 0.01f;  // World units (after exp)
 static constexpr float MAX_SCREEN_SIZE = 20.0f;
-static constexpr size_t MAX_GAUSSIANS = 500000;
+static constexpr size_t MAX_GAUSSIANS = 500000*2;
 static constexpr size_t DENSIFY_STOP_ITER = 15000;
 
 DensityController::DensityController(MTL::Device* device, MTL::Library* library)
