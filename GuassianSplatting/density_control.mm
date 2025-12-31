@@ -14,13 +14,22 @@
 #include <cmath>
 #include "gradients.hpp"
 
-// Paper's recommended thresholds
-static constexpr float GRAD_THRESHOLD = 0.0002f;
-static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;
-static constexpr float SCALE_SPLIT_THRESHOLD = 0.01f;  // World units (after exp)
-static constexpr float MAX_SCREEN_SIZE = 20.0f;
+// Paper's recommended thresholds (from official 3DGS)
+static constexpr float GRAD_THRESHOLD = 0.0002f;      // densify_grad_threshold
+static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  // min_opacity
+static constexpr float PERCENT_DENSE = 0.01f;         // percent_dense for clone vs split
 static constexpr size_t MAX_GAUSSIANS = 500000;
 static constexpr size_t DENSIFY_STOP_ITER = 15000;
+
+// Scene extent - will be set during initialization
+static float sceneExtent = 1.0f;  // Default, should be set to scene diagonal
+
+void DensityController::setSceneExtent(float extent) {
+    sceneExtent = extent;
+    std::cout << "Density control scene extent set to: " << extent << std::endl;
+    std::cout << "  Split threshold: " << (PERCENT_DENSE * extent) << " world units" << std::endl;
+    std::cout << "  Prune threshold: " << (0.1f * extent) << " world units" << std::endl;
+}
 
 DensityController::DensityController(MTL::Device* device, MTL::Library* library)
     : device(device)
@@ -77,7 +86,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     uint32_t* counts = (uint32_t*)gradientCount->contents();
     uint32_t* markers = (uint32_t*)markerBuffer->contents();
     
-    const float MAX_SCALE_LOG = 2.0f;  // Matches shader
+    const float MAX_SCALE_LOG = 10.0f;  // Must match tiled_shaders.metal MAX_SCALE
     
     // First pass: mark Gaussians
     for (size_t i = 0; i < gaussianCount; i++) {
@@ -104,16 +113,28 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG))),
             expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG)));
         
-        // Decision logic
-        if (opacity < OPACITY_PRUNE_THRESHOLD) {
+        // Official 3DGS thresholds (scene-relative)
+        float splitThreshold = PERCENT_DENSE * sceneExtent;  // Clone small, split large
+        float pruneThreshold = 0.1f * sceneExtent;           // Prune extremely large Gaussians
+        
+        // Decision logic (matches official 3DGS densify_and_prune)
+        bool shouldPrune = (opacity < OPACITY_PRUNE_THRESHOLD);
+        
+        // Also prune Gaussians that are too large in world space
+        if (maxScaleVal > pruneThreshold) {
+            shouldPrune = true;
+        }
+        
+        if (shouldPrune) {
             markers[i] = 1;
             stats.numPruned++;
         } else if (canDensify && avgGrad > GRAD_THRESHOLD) {
-            if (maxScaleVal > SCALE_SPLIT_THRESHOLD) {
-                markers[i] = 3;  // Split
+            // Official logic: clone if small, split if large
+            if (maxScaleVal > splitThreshold) {
+                markers[i] = 3;  // Split large Gaussians
                 stats.numSplit++;
             } else {
-                markers[i] = 2;  // Clone
+                markers[i] = 2;  // Clone small Gaussians
                 stats.numCloned++;
             }
         } else {
@@ -189,10 +210,11 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             float logScaleFactor = logf(scaleFactor);  // Add this to log scale
             
             // Get actual scale (apply exp to log scale)
+            // Use same MAX_SCALE_LOG as the rest of the codebase
             simd_float3 scale = simd_make_float3(
-                expf(std::clamp(g.scale.x, -3.0f, 3.0f)),
-                expf(std::clamp(g.scale.y, -3.0f, 3.0f)),
-                expf(std::clamp(g.scale.z, -3.0f, 3.0f))
+                expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
+                expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
+                expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG))
             );
             
             // Offset along major axis

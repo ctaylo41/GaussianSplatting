@@ -7,6 +7,11 @@
 //  - Opacity: stored as RAW pre-sigmoid value (shader applies sigmoid())
 //  - Rotation: stored as (w,x,y,z) in float4 where .x=w, .y=x, .z=y, .w=z
 //
+//  External PLY Compatibility:
+//  - Standard 3DGS PLY files store scales already in log space
+//  - Standard 3DGS PLY files store opacity in raw (pre-sigmoid) space
+//  - Rotation stored as (rot_0=w, rot_1=x, rot_2=y, rot_3=z)
+//
 
 #include "ply_loader.hpp"
 #include "tinyply.h"
@@ -14,6 +19,58 @@
 #include <iostream>
 #include <cmath>
 #include <float.h>
+#include <algorithm>
+
+// Detect if scales appear to be in linear space rather than log space
+// Log-space scales from 3DGS are typically in range [-10, 2]
+// Linear scales would be small positive numbers like [0.001, 1.0]
+//
+// Standard 3DGS PLY files store scales in LOG SPACE.
+// The log scale typically ranges from -8 to 0, giving linear scales of 0.0003 to 1.0
+// If we see scales that are all positive but less than 1, they might be LINEAR (not log)
+// If we see scales with negative values, they are LOG SPACE (standard)
+// If we see scales with positive values > 2, they are LOG SPACE (would give huge linear scales)
+bool detectLinearScales(const float* scale_data, size_t count, float& outMinVal, float& outMaxVal) {
+    if (count == 0) return false;
+    
+    int positiveCount = 0;
+    int negativeCount = 0;
+    float maxVal = -FLT_MAX;
+    float minVal = FLT_MAX;
+    
+    size_t sampleSize = std::min(count, (size_t)1000);
+    for (size_t i = 0; i < sampleSize; i++) {
+        for (int j = 0; j < 3; j++) {
+            float val = scale_data[i * 3 + j];
+            if (val > 0) positiveCount++;
+            if (val < 0) negativeCount++;
+            maxVal = std::max(maxVal, val);
+            minVal = std::min(minVal, val);
+        }
+    }
+    
+    outMinVal = minVal;
+    outMaxVal = maxVal;
+    
+    std::cout << "Scale analysis: min=" << minVal << " max=" << maxVal 
+              << " positive=" << positiveCount << " negative=" << negativeCount << std::endl;
+    
+    // If we have any negative values, it's definitely log space
+    if (negativeCount > 0) {
+        return false; // Log space
+    }
+    
+    // All positive: check the range
+    // Log scales > 2 would give exp() > 7.4 which is large
+    // Linear scales are typically small (< 1)
+    // If max is small and positive, likely linear
+    if (maxVal <= 1.0f && minVal > 0.0f) {
+        return true;  // Likely linear
+    }
+    
+    // Otherwise, assume log space (positive log scales are valid)
+    return false;
+}
 
 std::vector<Gaussian> load_ply(const std::string& file_path) {
     std::vector<Gaussian> gaussians;
@@ -90,6 +147,17 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
         const float* sh_dc_data = reinterpret_cast<const float*>(sh_dcs->buffer.get());
         const float* sh_rest_data = sh_rest ? reinterpret_cast<const float*>(sh_rest->buffer.get()) : nullptr;
 
+        // Auto-detect scale format
+        float scaleMin, scaleMax;
+        bool isLinearScale = detectLinearScales(scale_data, vertex_count, scaleMin, scaleMax);
+        if (isLinearScale) {
+            std::cout << "DETECTED: Linear scale format - will convert to log space" << std::endl;
+        } else {
+            std::cout << "DETECTED: Log scale format (standard 3DGS)" << std::endl;
+            std::cout << "  Log scale range: [" << scaleMin << ", " << scaleMax << "]" << std::endl;
+            std::cout << "  Linear scale range: [" << std::exp(scaleMin) << ", " << std::exp(scaleMax) << "]" << std::endl;
+        }
+
         gaussians.reserve(vertex_count);
         
         int numSkipped = 0;
@@ -110,10 +178,27 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
                 continue;
             }
             
-            // ===== SCALE: Keep as LOG space - DO NOT apply exp()! =====
-            g.scale = simd_make_float3(scale_data[i*3 + 0],
-                                       scale_data[i*3 + 1],
-                                       scale_data[i*3 + 2]);
+            // ===== SCALE: Handle both linear and log formats =====
+            float s0 = scale_data[i*3 + 0];
+            float s1 = scale_data[i*3 + 1];
+            float s2 = scale_data[i*3 + 2];
+            
+            if (isLinearScale) {
+                // Convert linear scales to log space
+                // Add small epsilon to avoid log(0)
+                s0 = std::log(std::max(s0, 1e-8f));
+                s1 = std::log(std::max(s1, 1e-8f));
+                s2 = std::log(std::max(s2, 1e-8f));
+            }
+            
+            // Clamp scales to reasonable range for viewing
+            // Higher limit for external PLY compatibility (training uses stricter 4.0)
+            const float MAX_LOG_SCALE = 8.0f;
+            s0 = std::clamp(s0, -MAX_LOG_SCALE, MAX_LOG_SCALE);
+            s1 = std::clamp(s1, -MAX_LOG_SCALE, MAX_LOG_SCALE);
+            s2 = std::clamp(s2, -MAX_LOG_SCALE, MAX_LOG_SCALE);
+            
+            g.scale = simd_make_float3(s0, s1, s2);
             
             // ===== ROTATION: PLY format is (rot_0=w, rot_1=x, rot_2=y, rot_3=z) =====
             float qw = rot_data[i*4 + 0];  // rot_0 = w

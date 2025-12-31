@@ -75,8 +75,8 @@ struct GaussianGradients {
 
 constant float SH_C0 = 0.28209479177387814f;
 constant uint TILE_SIZE = 16;
-constant float MAX_RADIUS = 64.0f;
-constant float MAX_SCALE = 2.0f;  // Log scale range -2 to 2 (exp: 0.14 to 7.4, max 55:1 aspect)
+constant float MAX_RADIUS = 512.0f;
+constant float MAX_SCALE = 10.0f;  // Higher limit OK with proper pruning (exp(10) ≈ 22026)
 
 // Quaternion to rotation matrix
 // q.x=w, q.y=x, q.z=y, q.w=z
@@ -561,13 +561,11 @@ kernel void tiledBackward(
         
         float3 dL_dLogScale = dL_dScale_val * scale;
         
-        // Add scale regularization to prevent extreme aspect ratios
-        // Penalize scales that are too different from the average
-        // This prevents extreme aspect ratios (rectangles instead of ellipsoids)
-        float avgScale = (g_orig.scale.x + g_orig.scale.y + g_orig.scale.z) / 3.0;
-        float scaleRegWeight = 0.1;  // Increased regularization strength
-        float3 scaleRegGrad = scaleRegWeight * (g_orig.scale - avgScale);
-        dL_dLogScale += scaleRegGrad;
+        // Official 3DGS: NO scale regularization
+        // Scale is controlled by:
+        // 1. Learning rate (0.005 default)
+        // 2. Pruning Gaussians larger than 0.1 * scene_extent
+        // 3. Splitting large Gaussians during densification
         
         float3x3 dL_dR = dL_dM * S;
         

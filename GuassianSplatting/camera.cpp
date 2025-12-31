@@ -35,6 +35,8 @@ void Camera::updateMatrices() {
     // Use left-hand coordinate system to match COLMAP convention
     // In left-hand: +Z forward, so objects in front have POSITIVE z in view space
     // This matches what the training shader expects
+    
+    
     view_matrix = matrix_look_at_left_hand(position.x, position.y, position.z, target.x, target.y, target.z, up.x, up.y, up.z);
     
     projection_matrix = matrix_perspective_left_hand(fov, aspect_ratio, near_plane, far_plane);

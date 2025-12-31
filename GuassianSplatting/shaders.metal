@@ -45,7 +45,9 @@ struct VertexOut {
 
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
-constant float MAX_SCALE = 2.0f;  // Log scale range -2 to 2 (exp: 0.14 to 7.4)
+// MAX_SCALE for viewing - higher limit to handle external PLY files
+// Training uses a stricter limit in tiled_shaders.metal
+constant float MAX_SCALE = 8.0f;  // Log scale range -8 to 8 for viewing compatibility
 
 float3 evalSH(float sh[12], float3 dir) {
     // Use only DC term to match training (which only trains DC)
@@ -118,7 +120,7 @@ float3 computeCovariance2D(float3 mean, float3x3 covariance3D, float4x4 viewMatr
     
     // Extract 2D covariance components
     float a = cov[0][0];
-    float b = cov[0][1];  // Off-diagonal
+    float b = cov[1][0];  // Off-diagonal
     float c = cov[1][1];
     
     return float3(a, b, c);
@@ -177,31 +179,51 @@ vertex VertexOut vertexShader(
     // Compute radius from eigenvalues of 2D covariance
     float det = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
     float radius;
+    float3 conic;
     
-    if (det > 0.0001 && cov2D.x > 0.0 && cov2D.z > 0.0) {
+    // Add numerical stability - ensure positive diagonal with minimum variance
+    // The low-pass filter (0.3) should already be applied in computeCovariance2D
+    float a = max(cov2D.x, 0.3f);  // Minimum variance  
+    float b = cov2D.y;
+    float c = max(cov2D.z, 0.3f);  // Minimum variance
+    
+    // Clamp off-diagonal to ensure positive definiteness
+    float maxB = sqrt(a * c) * 0.99f;
+    b = clamp(b, -maxB, maxB);
+    
+    det = a * c - b * b;
+    
+    if (det > 0.0001) {
         // Valid covariance - compute radius from eigenvalues
-        float mid = 0.5 * (cov2D.x + cov2D.z);
+        float mid = 0.5 * (a + c);
         float disc = max(0.0f, mid * mid - det);
         float lambda = mid + sqrt(disc);  // Largest eigenvalue
         radius = ceil(3.0 * sqrt(max(lambda, 0.1f)));
-    } else {
-        // Invalid covariance - use fixed radius
-        radius = 15.0;
-    }
-    
-    // Clamp radius
-    radius = clamp(radius, 1.0f, 64.0f);
-    
-    // Compute conic (inverse of 2D covariance) - CRITICAL for proper Gaussian shape
-    float3 conic;
-    if (det > 0.0001) {
+        radius = clamp(radius, 1.0f, 512.0f);  // Allow larger radius for external PLYs
+        
+        // Compute conic (inverse of 2D covariance)
         float invDet = 1.0 / det;
-        conic = float3(cov2D.z * invDet, -cov2D.y * invDet, cov2D.x * invDet);
-        // Clamp conic values to prevent numerical issues with very elongated Gaussians
-        conic = clamp(conic, float3(-10.0, -10.0, -10.0), float3(10.0, 10.0, 10.0));
+        conic = float3(c * invDet, -b * invDet, a * invDet);
+        
+        // Safety: check conic magnitude is reasonable for the radius
+        // At edge (d=radius), power should be ~-4.5
+        // power = -0.5 * conic_diag * radius^2 = -4.5 => conic_diag = 9/radius^2
+        // If conic is too small (huge covariance), scale it up
+        float expectedConic = 9.0f / (radius * radius);
+        float actualConic = 0.5f * (conic.x + conic.z);  // Average diagonal
+        
+        if (actualConic < expectedConic * 0.01f) {
+            // Conic is way too small - rescale to expected value
+            float scale = expectedConic / max(actualConic, 1e-10f);
+            conic *= sqrt(scale);  // Partial correction to avoid over-adjustment
+        }
     } else {
-        // Fallback to circular if covariance is degenerate
-        conic = float3(0.02, 0.0, 0.02);
+        // Fallback to circular Gaussian
+        radius = 15.0;
+        // Conic for radius 15: at d=15, want power = -4.5
+        // power = -0.5 * conic * d^2 = -0.5 * conic * 225 = -4.5
+        // conic = 9 / 225 = 0.04
+        conic = float3(0.04, 0.0, 0.04);
     }
     
     // Quad corners in normalized [-1,1] space

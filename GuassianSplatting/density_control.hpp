@@ -35,6 +35,9 @@ public:
                              size_t gaussianCount);
     
     void resetAccumulator(size_t gaussianCount);
+    
+    // Set scene extent for scene-relative thresholds (call before training)
+    static void setSceneExtent(float extent);
 
 private:
     MTL::Device* device;

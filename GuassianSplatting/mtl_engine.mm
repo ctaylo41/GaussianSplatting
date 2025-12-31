@@ -224,12 +224,28 @@ void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians) {
     gaussianBuffer = metalDevice->newBuffer(gaussians.data(), gaussianCount * sizeof(Gaussian),
                                             MTL::ResourceStorageModeShared);
     
+    // Compute scene extent for density control (official 3DGS approach)
+    float min_x = FLT_MAX, min_y = FLT_MAX, min_z = FLT_MAX;
+    float max_x = -FLT_MAX, max_y = -FLT_MAX, max_z = -FLT_MAX;
+    
     std::vector<simd_float3> positions(gaussianCount);
     for (size_t i = 0; i < gaussianCount; i++) {
         positions[i] = gaussians[i].position;
+        min_x = std::min(min_x, gaussians[i].position.x);
+        min_y = std::min(min_y, gaussians[i].position.y);
+        min_z = std::min(min_z, gaussians[i].position.z);
+        max_x = std::max(max_x, gaussians[i].position.x);
+        max_y = std::max(max_y, gaussians[i].position.y);
+        max_z = std::max(max_z, gaussians[i].position.z);
     }
     positionBuffer = metalDevice->newBuffer(positions.data(), gaussianCount * sizeof(simd_float3),
                                             MTL::ResourceStorageModeShared);
+    
+    // Set scene extent for density control (matches official 3DGS)
+    float sceneExtent = std::sqrt((max_x - min_x) * (max_x - min_x) +
+                                   (max_y - min_y) * (max_y - min_y) +
+                                   (max_z - min_z) * (max_z - min_z));
+    DensityController::setSceneExtent(sceneExtent);
     
     gpuSort = new GPURadixSort(metalDevice, 2000000);
     optimizer = new AdamOptimizer(metalDevice, shaderLibrary, 2000000);
@@ -312,7 +328,17 @@ void MTLEngine::render(Camera& camera) {
         const TrainingImage& img = trainingImages[currentTrainingIndex];
         const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
         
-        uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
+
+        simd_float4x4 flipZ = {
+            simd_make_float4(1, 0, 0, 0),
+            simd_make_float4(0, 1, 0, 0),
+            simd_make_float4(0, 0, -1, 0),
+            simd_make_float4(0, 0, 0, 1)
+        };
+        uniforms.viewMatrix = matrix_multiply(uniforms.viewMatrix, flipZ);
+        // Recompute viewProjectionMatrix
+        uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
+
         
         // For display, we render to the window, not the training image size
         // Scale focal length proportionally to window size

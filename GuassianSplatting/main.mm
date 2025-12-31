@@ -29,7 +29,7 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
         
         // Initial scale in LOG space: 
         // exp(-2) = 0.14 which gives reasonable initial size
-        // MAX_SCALE is now 2.0, so range is [-2, 2] -> [0.14, 7.4]
+        // MAX_SCALE is now 20.0, allowing range [-20, 20]
         g.scale = simd_make_float3(-2.0f, -2.0f, -2.0f);
         
         // Identity quaternion: (w=1, x=0, y=0, z=0)
