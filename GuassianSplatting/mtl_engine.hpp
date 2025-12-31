@@ -135,4 +135,6 @@ private:
     size_t currentImageIdx = 0;
     float epochLoss = 0.0f;
     size_t epochIterations = 0;
+    
+
 };

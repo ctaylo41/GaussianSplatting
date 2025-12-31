@@ -28,11 +28,9 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
         g.position = pt.position;
         
         // Initial scale in LOG space: 
-        // For points at depth ~4 with fx~4000, we want ~3 pixel radius
-        // size_2d = scale * fx / depth, so scale = size_2d * depth / fx = 3 * 4 / 4000 = 0.003
-        // log(0.003) ≈ -5.8, but clamped to -3 for stability
-        // exp(-3) = 0.05 which gives reasonable initial size
-        g.scale = simd_make_float3(-3.0f, -3.0f, -3.0f);
+        // exp(-2) = 0.14 which gives reasonable initial size
+        // MAX_SCALE is now 2.0, so range is [-2, 2] -> [0.14, 7.4]
+        g.scale = simd_make_float3(-2.0f, -2.0f, -2.0f);
         
         // Identity quaternion: (w=1, x=0, y=0, z=0)
         // Stored as float4(.x=w, .y=x, .z=y, .w=z)
@@ -289,15 +287,12 @@ int main(int argc, char* argv[]) {
     std::cout << "Viewer scene center: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
     std::cout << "Viewer scene diagonal: " << diagonal << std::endl;
     
-    // Use a much smaller distance - similar to the COLMAP training camera
-    // The trained Gaussians are optimized for depth ~4 from COLMAP camera
-    // So position viewer at similar distance from the actual Gaussian cluster
-    // The Gaussians near origin are the visible ones - position camera to see them
-    float viewDistance = 10.0f;  // Close enough to see small Gaussians
-    std::cout << "Viewer distance: " << viewDistance << " (vs original 1.5*diagonal=" << 1.5f*diagonal << ")" << std::endl;
+    // Use distance based on scene size - position camera to see the whole scene
+    float viewDistance = 1.5f * diagonal;
+    std::cout << "Viewer distance: " << viewDistance << std::endl;
     
-    // Position camera to look at origin (where most Gaussians are) instead of computed center
-    simd_float3 viewTarget = simd_make_float3(0, 0, 0);  // Look at origin where trained Gaussians cluster
+    // Position camera to look at the actual scene center
+    simd_float3 viewTarget = center;
     
     Camera viewerCamera = Camera(viewTarget, 0, 0.3f, viewDistance,
                                   45.0f * M_PI / 180.0f, 800.0f / 600.0f,

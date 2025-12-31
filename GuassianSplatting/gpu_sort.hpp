@@ -18,6 +18,9 @@ public:
     //sort gaussians by depth and return buffer of sorted indices
     MTL::Buffer* sort(MTL::CommandQueue* queue, MTL::Buffer* positionBuffer, simd_float3 cameraPos, size_t numElements);
     
+    // CPU fallback sort for debugging
+    MTL::Buffer* sortCPU(MTL::Buffer* positionBuffer, simd_float3 cameraPos, size_t numElements);
+    
     MTL::Buffer* getSortedIndices() { return valuesBuffer[0]; }
     
 private:
@@ -37,6 +40,10 @@ private:
     // histogram and prefix sums
     MTL::Buffer* histogramBuffer;
     MTL::Buffer* prefixSumBuffer;
+    MTL::Buffer* scatterOffsetsBuffer;  // Copy of prefix sums for scatter (atomic ops modify this)
+    
+    // CPU sort buffer
+    MTL::Buffer* cpuSortedIndices;
     
     void createPipelines(MTL::Device* device);
 };

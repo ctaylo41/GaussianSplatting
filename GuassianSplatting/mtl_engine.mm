@@ -9,6 +9,49 @@
 #include "image_loader.hpp"
 #include "gradients.hpp"
 #include <chrono>
+#include <fstream>
+
+// Debug: Save a Metal texture to a PPM file
+void saveTextureToPPM(MTL::Texture* texture, MTL::Device* device, MTL::CommandQueue* queue, const char* filename) {
+    uint32_t width = texture->width();
+    uint32_t height = texture->height();
+    size_t bytesPerPixel = 4;  // RGBA
+    size_t bytesPerRow = width * bytesPerPixel;
+    size_t totalBytes = bytesPerRow * height;
+    
+    // Create a shared buffer to read back the texture
+    MTL::Buffer* readbackBuffer = device->newBuffer(totalBytes, MTL::ResourceStorageModeShared);
+    
+    MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
+    MTL::BlitCommandEncoder* blit = cmdBuffer->blitCommandEncoder();
+    blit->copyFromTexture(texture, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(width, height, 1),
+                          readbackBuffer, 0, bytesPerRow, 0);
+    blit->endEncoding();
+    cmdBuffer->commit();
+    cmdBuffer->waitUntilCompleted();
+    
+    uint8_t* data = (uint8_t*)readbackBuffer->contents();
+    
+    // Write PPM file (simple format)
+    std::ofstream file(filename, std::ios::binary);
+    file << "P6\n" << width << " " << height << "\n255\n";
+    
+    // Convert RGBA float to RGB bytes
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            size_t offset = y * bytesPerRow + x * bytesPerPixel;
+            // Assuming texture format is RGBA8Unorm or similar
+            // If float, we need different handling
+            file.put(data[offset]);     // R
+            file.put(data[offset + 1]); // G
+            file.put(data[offset + 2]); // B
+        }
+    }
+    
+    file.close();
+    readbackBuffer->release();
+    printf("Saved render to %s (%dx%d)\n", filename, width, height);
+}
 
 void MTLEngine::init() {
     initDevice();
@@ -258,7 +301,8 @@ void MTLEngine::createDepthTexture() {
 }
 
 void MTLEngine::render(Camera& camera) {
-    MTL::Buffer* sortedIndices = gpuSort->sort(commandQueue, positionBuffer, camera.get_position(), gaussianCount);
+    // Use CPU sort for now (debugging GPU sort issues)
+    MTL::Buffer* sortedIndices = gpuSort->sortCPU(positionBuffer, camera.get_position(), gaussianCount);
     
     Uniforms uniforms;
     
@@ -606,26 +650,53 @@ float MTLEngine::trainStep(size_t imageIndex) {
     const TrainingImage& img = trainingImages[imageIndex];
     const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
     
+    // Get ACTUAL image dimensions from the loaded texture (may differ from COLMAP camera)
+    uint32_t actualWidth = img.texture->width();
+    uint32_t actualHeight = img.texture->height();
+    
+    // Scale factor from COLMAP resolution to actual image resolution
+    float scaleX = (float)actualWidth / (float)cam.width;
+    float scaleY = (float)actualHeight / (float)cam.height;
+    
+    // Scale camera intrinsics to match actual image size
+    float scaledFx = cam.fx * scaleX;
+    float scaledFy = cam.fy * scaleY;
+    float scaledCx = cam.cx * scaleX;
+    float scaledCy = cam.cy * scaleY;
+    
     // DEBUG: Print uniforms once
     static bool uniformsDebugPrinted = false;
     if (!uniformsDebugPrinted) {
         std::cout << "=== Training Uniforms Debug ===" << std::endl;
-        std::cout << "Image size: " << cam.width << "x" << cam.height << std::endl;
-        std::cout << "Focal length: fx=" << cam.fx << " fy=" << cam.fy << std::endl;
-        std::cout << "Principal point: cx=" << cam.cx << " cy=" << cam.cy << std::endl;
+        std::cout << "COLMAP camera size: " << cam.width << "x" << cam.height << std::endl;
+        std::cout << "Actual texture size: " << actualWidth << "x" << actualHeight << std::endl;
+        std::cout << "Scale factor: " << scaleX << "x" << scaleY << std::endl;
+        std::cout << "Original focal: fx=" << cam.fx << " fy=" << cam.fy << std::endl;
+        std::cout << "Scaled focal: fx=" << scaledFx << " fy=" << scaledFy << std::endl;
+        std::cout << "Original principal: cx=" << cam.cx << " cy=" << cam.cy << std::endl;
+        std::cout << "Scaled principal: cx=" << scaledCx << " cy=" << scaledCy << std::endl;
         uniformsDebugPrinted = true;
     }
     
-    if (!renderTarget || renderTarget->width() != cam.width || renderTarget->height() != cam.height) {
-        createRenderTarget(cam.width, cam.height);
+    if (!renderTarget || renderTarget->width() != actualWidth || renderTarget->height() != actualHeight) {
+        createRenderTarget(actualWidth, actualHeight);
     }
+    
+    // Create scaled camera for projection
+    ColmapCamera scaledCam = cam;
+    scaledCam.width = actualWidth;
+    scaledCam.height = actualHeight;
+    scaledCam.fx = scaledFx;
+    scaledCam.fy = scaledFy;
+    scaledCam.cx = scaledCx;
+    scaledCam.cy = scaledCy;
     
     TiledUniforms uniforms;
     uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
-    uniforms.projectionMatrix = projectionFromColmap(cam, 0.1f, 1000.0f);
+    uniforms.projectionMatrix = projectionFromColmap(scaledCam, 0.1f, 1000.0f);
     uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
-    uniforms.screenSize = simd_make_float2((float)cam.width, (float)cam.height);
-    uniforms.focalLength = simd_make_float2(cam.fx, cam.fy);
+    uniforms.screenSize = simd_make_float2((float)actualWidth, (float)actualHeight);
+    uniforms.focalLength = simd_make_float2(scaledFx, scaledFy);
     
     simd_float3x3 R;
     R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
@@ -635,6 +706,20 @@ float MTLEngine::trainStep(size_t imageIndex) {
     
     // Forward pass
     tiledRasterizer->forward(commandQueue, gaussianBuffer, gaussianCount, uniforms, renderTarget);
+    
+    // DEBUG: Save training render less frequently
+    static int saveCounter = 0;
+    if (saveCounter % 500 == 0) {
+        char filename[64];
+        snprintf(filename, sizeof(filename), "/tmp/train_render_%04d.ppm", saveCounter);
+        saveTextureToPPM(renderTarget, metalDevice, commandQueue, filename);
+        
+        // Also save ground truth for comparison
+        char gtFilename[64];
+        snprintf(gtFilename, sizeof(gtFilename), "/tmp/ground_truth_%04d.ppm", saveCounter);
+        saveTextureToPPM(img.texture, metalDevice, commandQueue, gtFilename);
+    }
+    saveCounter++;
     
     // Compute loss
     float loss = computeLoss(renderTarget, img.texture);

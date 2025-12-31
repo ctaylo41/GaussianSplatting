@@ -45,7 +45,7 @@ struct VertexOut {
 
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
-constant float MAX_SCALE = 3.0f;  // Log scale range -3 to 3 (exp: 0.05 to 20)
+constant float MAX_SCALE = 2.0f;  // Log scale range -2 to 2 (exp: 0.14 to 7.4)
 
 float3 evalSH(float sh[12], float3 dir) {
     // Use only DC term to match training (which only trains DC)
@@ -197,6 +197,8 @@ vertex VertexOut vertexShader(
     if (det > 0.0001) {
         float invDet = 1.0 / det;
         conic = float3(cov2D.z * invDet, -cov2D.y * invDet, cov2D.x * invDet);
+        // Clamp conic values to prevent numerical issues with very elongated Gaussians
+        conic = clamp(conic, float3(-10.0, -10.0, -10.0), float3(10.0, 10.0, 10.0));
     } else {
         // Fallback to circular if covariance is degenerate
         conic = float3(0.02, 0.0, 0.02);
@@ -224,7 +226,7 @@ vertex VertexOut vertexShader(
     float3 viewDir = normalize(g.position - uniforms.cameraPos);
     out.color = evalSH(g.sh, viewDir);
     
-    // Apply sigmoid to raw opacity - this is the ONLY place sigmoid() is applied
+    // Apply sigmoid to r1237 × 822aw opacity - this is the ONLY place sigmoid() is applied
     out.opacity = 1.0 / (1.0 + exp(-clamp(g.opacity, -8.0f, 8.0f)));
     
     // Center screen position (for debugging, not used in current frag shader)
@@ -435,7 +437,8 @@ kernel void adamStep(
         float v_hat = v / bc2;
         float newSH = gaussians[tid].sh[i] - lrs[4] * m_hat / (sqrt(v_hat) + epsilon);
         // Clamp SH values to prevent color explosion
-        // DC coefficient range ~[-3, 3] gives color range [0, 1] after SH_C0 transform
-        gaussians[tid].sh[i] = clamp(newSH, -5.0f, 5.0f);
+        // With SH_C0=0.282: color = SH*0.282 + 0.5
+        // SH in [-2, 2] gives color in [0.06, 0.94] - prevents saturation
+        gaussians[tid].sh[i] = clamp(newSH, -2.0f, 2.0f);
     }
 }

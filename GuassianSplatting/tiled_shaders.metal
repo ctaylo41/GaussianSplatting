@@ -76,7 +76,7 @@ struct GaussianGradients {
 constant float SH_C0 = 0.28209479177387814f;
 constant uint TILE_SIZE = 16;
 constant float MAX_RADIUS = 64.0f;
-constant float MAX_SCALE = 3.0f;  // Log scale range -3 to 3 (exp: 0.05 to 20)
+constant float MAX_SCALE = 2.0f;  // Log scale range -2 to 2 (exp: 0.14 to 7.4, max 55:1 aspect)
 
 // Quaternion to rotation matrix
 // q.x=w, q.y=x, q.z=y, q.w=z
@@ -439,7 +439,13 @@ kernel void tiledBackward(
         float weight = alpha * T;
         
         // ===== Color/SH gradients =====
+        // IMPORTANT: Account for clamping in forward pass
+        // If color was clamped at 0 or 1, gradient should be 0
         float3 dL_dColor = dL_dPixel * weight;
+        // If p.color is at 0 or 1 limit, zero the gradient to prevent SH explosion
+        if (p.color.r <= 0.01 || p.color.r >= 0.99) dL_dColor.r = 0;
+        if (p.color.g <= 0.01 || p.color.g >= 0.99) dL_dColor.g = 0;
+        if (p.color.b <= 0.01 || p.color.b >= 0.99) dL_dColor.b = 0;
         
         // ===== Alpha gradient (CORRECT FORMULA from 3DGS paper) =====
         // The key insight: changing alpha affects:
@@ -554,6 +560,15 @@ kernel void tiledBackward(
         dL_dScale_val.z = dot(Rt[2], dL_dM[2]);
         
         float3 dL_dLogScale = dL_dScale_val * scale;
+        
+        // Add scale regularization to prevent extreme aspect ratios
+        // Penalize scales that are too different from the average
+        // This prevents extreme aspect ratios (rectangles instead of ellipsoids)
+        float avgScale = (g_orig.scale.x + g_orig.scale.y + g_orig.scale.z) / 3.0;
+        float scaleRegWeight = 0.1;  // Increased regularization strength
+        float3 scaleRegGrad = scaleRegWeight * (g_orig.scale - avgScale);
+        dL_dLogScale += scaleRegGrad;
+        
         float3x3 dL_dR = dL_dM * S;
         
         float4 dL_dq = float4(0);
