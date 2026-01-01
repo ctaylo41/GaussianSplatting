@@ -78,7 +78,7 @@ struct GaussianGradients {
 constant float SH_C0 = 0.28209479177387814f;
 constant uint TILE_SIZE = 16;
 constant float MAX_RADIUS = 512.0f;
-constant float MAX_SCALE = 10.0f;  // Higher limit OK with proper pruning (exp(10) ≈ 22026)
+constant float MAX_SCALE = 5.0f;  // exp(5) ≈ 148 - more reasonable max scale
 
 // Quaternion to rotation matrix
 // q.x=w, q.y=x, q.z=y, q.w=z
@@ -153,6 +153,15 @@ kernel void projectGaussians(
     // ===== SCALE: Apply exp() to log scale =====
     float3 logScale = clamp(g.scale, -MAX_SCALE, MAX_SCALE);
     float3 scale = exp(logScale);
+    
+    // Prevent extremely elongated Gaussians (max 20:1 aspect ratio)
+    float maxScale = max(max(scale.x, scale.y), scale.z);
+    float minScale = min(min(scale.x, scale.y), scale.z);
+    if (maxScale > 20.0f * minScale) {
+        // Clamp the max scale to prevent extreme elongation
+        float targetMax = 20.0f * minScale;
+        scale = scale * (targetMax / maxScale);
+    }
     
     // Normalize quaternion
     float4 q = g.rotation;
@@ -500,28 +509,28 @@ kernel void tiledBackward(
         // ===== World position gradient =====
         // Chain rule: dL/dViewPos = dL/dScreenPos * dScreenPos/dViewPos
         // 
-        // Forward pass (with Y-flip for COLMAP):
-        //   screenPos.x = (ndc.x * 0.5 + 0.5) * width
-        //   screenPos.y = (-ndc.y * 0.5 + 0.5) * height  (Y inverted)
-        //   where ndc = proj(view) and view.x ≈ fx * viewX / z, view.y ≈ -fy * viewY / z (Y-flip in proj)
+        // Forward pass (perspective projection):
+        //   screenX ∝ fx * viewX / viewZ
+        //   screenY ∝ fy * viewY / viewZ
         //
-        // Combined: screenX = (fx/z * viewX / clipW + 0.5) * width (simplified)
-        //           screenY = (0.5 - (-fy/z * viewY / clipW)) * height (double negative = positive)
-        //                   = (0.5 + fy/z * viewY / clipW) * height
-        //
-        // Derivatives:
-        //   dScreenX/dViewX = fx * width / (z * clipW * 2) ≈ fx / z (for orthographic approx near center)
-        //   dScreenY/dViewY = fy / z (positive after both flips cancel)
-        //   dScreenY/dViewZ has positive sign (viewY increase -> screenY increase after flips)
+        // Derivatives (dScreenPos in pixels, dViewPos in world units):
+        //   dScreenX/dViewX = fx / z
+        //   dScreenY/dViewY = fy / z  
+        //   dScreenX/dViewZ = -fx * (viewX/z) / z = -fx * txtz / z
+        //   dScreenY/dViewZ = -fy * (viewY/z) / z = -fy * tytz / z
         float z = p.depth;
         float fx = uniforms.focalLength.x;
         float fy = uniforms.focalLength.y;
         
+        // Compute normalized view ratios (same as forward pass Jacobian)
+        float txtz = p.viewPos_xy.x / z;
+        float tytz = p.viewPos_xy.y / z;
+        
         float3 dL_dViewPos;
         dL_dViewPos.x = dL_dScreenPos.x * fx / z;
-        dL_dViewPos.y = dL_dScreenPos.y * fy / z;  // Y gradient: both Y-flip in proj and screen inversion cancel
-        dL_dViewPos.z = -dL_dScreenPos.x * fx * p.viewPos_xy.x / (z * z)
-                        + dL_dScreenPos.y * fy * p.viewPos_xy.y / (z * z);  // Sign change for Y due to inversions
+        dL_dViewPos.y = dL_dScreenPos.y * fy / z;
+        dL_dViewPos.z = -dL_dScreenPos.x * fx * txtz / z
+                        -dL_dScreenPos.y * fy * tytz / z;
         
         // Extract view rotation (columns = rotation matrix)
         // viewMatrix is world-to-view, so transpose gives view-to-world
@@ -572,8 +581,8 @@ kernel void tiledBackward(
         // dL/dSigma3D = T^T * dL/dCov2D * T
         // But we need dL/dM where Sigma3D = M * M^T, so dL/dM = 2 * dL/dSigma3D * M
         float3 t_cam = float3(p.viewPos_xy, p.depth);
-        float txtz = t_cam.x / t_cam.z;
-        float tytz = t_cam.y / t_cam.z;
+        txtz = t_cam.x / t_cam.z;
+        tytz = t_cam.y / t_cam.z;
         
         // Jacobian (must match forward pass - NO Y flip for covariance)
         float J00 = fx / t_cam.z;
@@ -663,7 +672,9 @@ kernel void tiledBackward(
             dot(dL_dR[2], float3(x, y, 0))
         );
         
-        float clampVal = 1.0f;
+        // Per-pixel gradient clamp - CRITICAL to prevent explosion
+        // A Gaussian may receive gradients from 1000s of pixels, so this must be small
+        float clampVal = 0.01f;
         
         // Atomic accumulation
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0],

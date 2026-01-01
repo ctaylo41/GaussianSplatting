@@ -15,6 +15,17 @@ MTL::Texture* loadImageAsTexture(MTL::Device* device, const std::string& path) {
     unsigned char* image = stbi_load(path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
     assert(image!=NULL);
     
+    size_t bytesPerRow = 4 * width;
+    unsigned char* tempRow = new unsigned char[bytesPerRow];
+    for (int y = 0; y < height / 2; y++) {
+        unsigned char* topRow = image + y * bytesPerRow;
+        unsigned char* bottomRow = image + (height - 1 - y) * bytesPerRow;
+        memcpy(tempRow, topRow, bytesPerRow);
+        memcpy(topRow, bottomRow, bytesPerRow);
+        memcpy(bottomRow, tempRow, bytesPerRow);
+    }
+    delete[] tempRow; 
+    
     MTL::TextureDescriptor* textureDescriptor = MTL::TextureDescriptor::alloc()->init();
     textureDescriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
     textureDescriptor->setWidth(width);
@@ -24,7 +35,6 @@ MTL::Texture* loadImageAsTexture(MTL::Device* device, const std::string& path) {
     MTL::Texture* texture = device->newTexture(textureDescriptor);
     
     MTL::Region region = MTL::Region(0,0,0, width, height, 1);
-    NS::UInteger bytesPerRow = 4 * width;
     texture->replaceRegion(region, 0, image, bytesPerRow);
     
     textureDescriptor->release();

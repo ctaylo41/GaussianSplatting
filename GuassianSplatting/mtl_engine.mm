@@ -812,13 +812,13 @@ float MTLEngine::trainStep(size_t imageIndex) {
     // Accumulate for density control
     densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
     
-    // Optimizer step - official 3DGS learning rates
+    // Optimizer step - reduced learning rates to prevent explosion
     optimizer->step(commandQueue, gaussianBuffer, gaussianGradients,
                     0.00016f,  // position lr (official default)
-                    0.005f,    // scale lr (official default)
-                    0.01f,      // rotation lr (OFF - debugging)
-                    0.05f,     // opacity lr (ENABLED - needed to make Gaussians visible)
-                    0.000f);   // sh lr (OFF for testing)
+                    0.001f,    // scale lr (reduced from 0.005 to prevent elongation)
+                    0.001f,    // rotation lr (reduced for stability)
+                    0.05f,     // opacity lr
+                    0.0025f);  // sh lr (official default)
 //    Gaussian* g = (Gaussian*)gaussianBuffer->contents();
 //    float minSH = 1e10, maxSH = -1e10;
 //    for (size_t i = 0; i < std::min(gaussianCount, (size_t)1000); i++) {
