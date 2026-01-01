@@ -39,6 +39,8 @@ struct ProjectedGaussian {
     uint tileMaxX;
     uint tileMaxY;
     float2 viewPos_xy;
+    // Store cov2D for backward pass (needed for correct gradient)
+    float3 cov2D;       // (a, b, c) - the 2D covariance BEFORE inversion
 };
 
 struct TileRange {
@@ -118,7 +120,9 @@ kernel void projectGaussians(
     float4 viewPos = uniforms.viewMatrix * worldPos;
     float4 clipPos = uniforms.viewProjectionMatrix * worldPos;
     
-    // Behind camera or too close
+    // COLMAP uses OpenCV convention: camera looks down +Z axis
+    // Objects in FRONT of camera have POSITIVE viewZ
+    // clipPos.w = viewZ (with our projection), so should be positive for visible objects
     if (clipPos.w <= 0.1 || viewPos.z <= 0.1) {
         projected[tid] = proj;
         return;
@@ -132,12 +136,18 @@ kernel void projectGaussians(
         return;
     }
     
-    // Screen position (Y flipped for screen coordinates)
+    // Screen position from NDC
+    // COLMAP Y-down + our projection Y-flip means: 
+    //   Top of COLMAP image (small pixel y) -> NDC y negative
+    //   Bottom of COLMAP image (large pixel y) -> NDC y positive
+    // Metal texture origin is top-left (row 0 = top)
+    // Standard conversion: screenY = (ndc.y + 1) / 2 * height  
+    // But we need to invert because of Y-flip: screenY = (1 - ndc.y) / 2 * height
     proj.screenPos = float2(
         (ndc.x * 0.5 + 0.5) * uniforms.screenSize.x,
-        (1.0 - (ndc.y * 0.5 + 0.5)) * uniforms.screenSize.y
+        (ndc.y * 0.5 + 0.5) * uniforms.screenSize.y  // Standard NDC to screen (projection already flipped Y)
     );
-    proj.depth = viewPos.z;
+    proj.depth = viewPos.z;  // Store positive depth (COLMAP: +Z is forward)
     proj.viewPos_xy = viewPos.xy;
     
     // ===== SCALE: Apply exp() to log scale =====
@@ -160,7 +170,8 @@ kernel void projectGaussians(
     float3x3 M = R * S;
     float3x3 Sigma3D = M * transpose(M);
     
-    // View space projection using same approach as shaders.metal
+    // View space projection using same approach as official 3DGS
+    // COLMAP convention: objects in front have positive viewZ
     float z_cam = viewPos.z;
     float fx = uniforms.focalLength.x;
     float fy = uniforms.focalLength.y;
@@ -173,6 +184,8 @@ kernel void projectGaussians(
     
     // Jacobian of projection (perspective projection derivative)
     // Maps 3D view space -> 2D screen space
+    // Official 3DGS does NOT include Y flip in Jacobian for covariance
+    // (covariance is a shape - ellipse looks same either way)
     float J00 = fx / z_cam;
     float J02 = -fx * txtz / z_cam;
     float J11 = fy / z_cam;
@@ -190,25 +203,28 @@ kernel void projectGaussians(
     
     // View matrix rotation (world-to-view)
     // matrix[i] in Metal gives COLUMN i
-    float3x3 W = float3x3(uniforms.viewMatrix[0].xyz, 
-                          uniforms.viewMatrix[1].xyz, 
+    float3x3 W = float3x3(uniforms.viewMatrix[0].xyz,
+                          uniforms.viewMatrix[1].xyz,
                           uniforms.viewMatrix[2].xyz);
     
     // Combined transform: T = J * W projects world covariance to screen
     float3x3 T = J * W;
     
     // Project 3D covariance to 2D: cov2D = T * Sigma3D * T^T
-    float3x3 cov2D = T * Sigma3D * transpose(T);
+    float3x3 cov2D_mat = T * Sigma3D * transpose(T);
     
     // Metal matrix indexing: matrix[col][row]
     // For symmetric matrix: [0][0]=top-left, [1][1]=bottom-right, [0][1]=[1][0]=off-diagonal
-    float a = cov2D[0][0];  // Column 0, Row 0 = (0,0)
-    float b = cov2D[1][0];  // Column 1, Row 0 = (0,1) - the off-diagonal term
-    float c = cov2D[1][1];  // Column 1, Row 1 = (1,1)
+    float a = cov2D_mat[0][0];  // Column 0, Row 0 = (0,0)
+    float b = cov2D_mat[1][0];  // Column 1, Row 0 = (0,1) - the off-diagonal term
+    float c = cov2D_mat[1][1];  // Column 1, Row 1 = (1,1)
     
-    // Low-pass filter
+    // Low-pass filter (add before storing for backward pass)
     a += 0.3;
     c += 0.3;
+    
+    // Store cov2D for backward pass AFTER low-pass filter
+    proj.cov2D = float3(a, b, c);
     
     float det = a * c - b * b;
     if (det < 0.0001) {
@@ -250,10 +266,10 @@ kernel void projectGaussians(
     proj.tileMaxX = min(uint(maxX) / TILE_SIZE, uniforms.numTilesX - 1);
     proj.tileMaxY = min(uint(maxY) / TILE_SIZE, uniforms.numTilesY - 1);
     
-    // Limit tile coverage
+    // Limit tile coverage (increased from 64 to allow larger Gaussians)
     uint tilesX = proj.tileMaxX - proj.tileMinX + 1;
     uint tilesY = proj.tileMaxY - proj.tileMinY + 1;
-    if (tilesX * tilesY > 64) {
+    if (tilesX * tilesY > 256) {
         proj.radius = 0;
         projected[tid] = proj;
         return;
@@ -405,9 +421,7 @@ kernel void tiledBackward(
     // Now traverse BACK-TO-FRONT for gradients
     // T starts at T_final and we "undo" by dividing by (1-alpha)
     float T = T_final;
-    float last_alpha = 0.0;
-    float3 accum_rec = float3(0.0);  // Accumulated color from Gaussians BEHIND current
-    float3 last_color = float3(0.0);
+    float3 accum_rec = float3(0.0);  // Accumulated color from Gaussians BEHIND current (already processed)
     
     // Iterate in reverse order (back to front)
     for (int sortIdx = int(endIdx) - 1; sortIdx >= int(range.start); sortIdx--) {
@@ -434,7 +448,7 @@ kernel void tiledBackward(
         // Recover T at this position by "undoing" the alpha blend
         // In forward: T_next = T * (1 - alpha)
         // So: T = T_next / (1 - alpha)
-        T = T / (1.0 - alpha);
+        T = T / max(1.0 - alpha, 0.0001);
         
         float weight = alpha * T;
         
@@ -451,15 +465,18 @@ kernel void tiledBackward(
         // The key insight: changing alpha affects:
         // 1. This Gaussian's own contribution: color * alpha * T
         // 2. All subsequent Gaussians' contributions via transmittance
-        // 
+        //
         // accum_rec tracks the accumulated color from Gaussians BEHIND this one
+        // (already processed in back-to-front order)
         // dL/dalpha = T * dot(dL_dPixel, color - accum_rec)
-        accum_rec = last_alpha * last_color + (1.0 - last_alpha) * accum_rec;
-        last_color = p.color;
-        
+        //
+        // IMPORTANT: Use accum_rec BEFORE updating it (it represents what's behind current Gaussian)
         float dL_dAlpha = T * dot(dL_dPixel, p.color - accum_rec);
         
-        last_alpha = alpha;
+        // NOW update accum_rec to include current Gaussian for the next (closer) Gaussian
+        // accum_rec_new = alpha * color + (1-alpha) * accum_rec_old
+        // This represents: contribution from current Gaussian + attenuated contribution from behind
+        accum_rec = alpha * p.color + (1.0 - alpha) * accum_rec;
         
         // ===== Opacity gradient =====
         // alpha = sigmoid(raw_opacity) * G
@@ -473,22 +490,38 @@ kernel void tiledBackward(
         float dL_dG = dL_dAlpha * sig;
         
         // ===== Screen position gradient =====
-        float2 conic_d = float2(
+        // power = -0.5 * (conic.x * d.x^2 + 2 * conic.y * d.x * d.y + conic.z * d.y^2)
+        // d(power)/d(screenPos) = -d(power)/d(d) = conic * d (for symmetric quadratic)
+        float2 dL_dScreenPos = dL_dG * G * float2(
             p.conic.x * d.x + p.conic.y * d.y,
             p.conic.y * d.x + p.conic.z * d.y
         );
-        float2 dL_dScreenPos = dL_dG * G * conic_d;
         
         // ===== World position gradient =====
+        // Chain rule: dL/dViewPos = dL/dScreenPos * dScreenPos/dViewPos
+        // 
+        // Forward pass (with Y-flip for COLMAP):
+        //   screenPos.x = (ndc.x * 0.5 + 0.5) * width
+        //   screenPos.y = (-ndc.y * 0.5 + 0.5) * height  (Y inverted)
+        //   where ndc = proj(view) and view.x ≈ fx * viewX / z, view.y ≈ -fy * viewY / z (Y-flip in proj)
+        //
+        // Combined: screenX = (fx/z * viewX / clipW + 0.5) * width (simplified)
+        //           screenY = (0.5 - (-fy/z * viewY / clipW)) * height (double negative = positive)
+        //                   = (0.5 + fy/z * viewY / clipW) * height
+        //
+        // Derivatives:
+        //   dScreenX/dViewX = fx * width / (z * clipW * 2) ≈ fx / z (for orthographic approx near center)
+        //   dScreenY/dViewY = fy / z (positive after both flips cancel)
+        //   dScreenY/dViewZ has positive sign (viewY increase -> screenY increase after flips)
         float z = p.depth;
         float fx = uniforms.focalLength.x;
         float fy = uniforms.focalLength.y;
         
         float3 dL_dViewPos;
         dL_dViewPos.x = dL_dScreenPos.x * fx / z;
-        dL_dViewPos.y = -dL_dScreenPos.y * fy / z;  // Y flip
+        dL_dViewPos.y = dL_dScreenPos.y * fy / z;  // Y gradient: both Y-flip in proj and screen inversion cancel
         dL_dViewPos.z = -dL_dScreenPos.x * fx * p.viewPos_xy.x / (z * z)
-                        + dL_dScreenPos.y * fy * p.viewPos_xy.y / (z * z);
+                        + dL_dScreenPos.y * fy * p.viewPos_xy.y / (z * z);  // Sign change for Y due to inversions
         
         // Extract view rotation (columns = rotation matrix)
         // viewMatrix is world-to-view, so transpose gives view-to-world
@@ -500,87 +533,137 @@ kernel void tiledBackward(
         // viewRot already contains columns of rotation, transpose gives view-to-world
         float3 dL_dWorldPos = transpose(viewRot) * dL_dViewPos;
         
-        // ===== Proper Scale and Rotation Gradients =====
-        // 1. Conic gradient
+        // ===== Conic gradient =====
+        // power = -0.5 * (conic.x * dx^2 + 2 * conic.y * dx*dy + conic.z * dy^2)
+        // dL/dconic = dL/dG * dG/dpower * dpower/dconic
+        //           = dL_dG * G * (-0.5) * (dx^2, 2*dx*dy, dy^2)
+        // Note: official 3DGS uses -0.5f factor for off-diagonal
         float3 dL_dConic;
-        dL_dConic.x = dL_dG * G * (-0.5 * d.x * d.x);
-        dL_dConic.y = dL_dG * G * (-1.0 * d.x * d.y);
-        dL_dConic.z = dL_dG * G * (-0.5 * d.y * d.y);
+        dL_dConic.x = -0.5f * dL_dG * G * d.x * d.x;
+        dL_dConic.y = -0.5f * dL_dG * G * 2.0f * d.x * d.y;  // Factor of 2 because conic.y appears with 2* in power
+        dL_dConic.z = -0.5f * dL_dG * G * d.y * d.y;
         
-        // 2. Cov2D gradient: dL_dCov2D = -Conic * dL_dConic * Conic
-        float3 c = p.conic;
-        float t00 = dL_dConic.x * c.x + dL_dConic.y * c.y;
-        float t01 = dL_dConic.x * c.y + dL_dConic.y * c.z;
-        float t10 = dL_dConic.y * c.x + dL_dConic.z * c.y;
-        float t11 = dL_dConic.y * c.y + dL_dConic.z * c.z;
+        // ===== Cov2D gradient (CORRECT formula from official backward.cu) =====
+        // conic = inverse(cov2D), so dL/dCov2D requires derivative of matrix inverse
+        // For 2x2 symmetric matrix [[a,b],[b,c]] with det = a*c - b*b:
+        // inv = [[c, -b], [-b, a]] / det
+        // The derivative is complex - use formula from backward.cu
+        float cov_a = p.cov2D.x;
+        float cov_b = p.cov2D.y;
+        float cov_c = p.cov2D.z;
+        
+        float denom = cov_a * cov_c - cov_b * cov_b;
+        float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
         
         float3 dL_dCov2D;
-        dL_dCov2D.x = -(c.x * t00 + c.y * t10);
-        dL_dCov2D.y = -(c.x * t01 + c.y * t11);
-        dL_dCov2D.z = -(c.y * t01 + c.z * t11);
+        // From backward.cu: these formulas come from differentiating conic = inv(cov2D)
+        dL_dCov2D.x = denom2inv * (-cov_c * cov_c * dL_dConic.x
+                                   + 2.0f * cov_b * cov_c * dL_dConic.y
+                                   + (denom - cov_a * cov_c) * dL_dConic.z);
+        dL_dCov2D.z = denom2inv * (-cov_a * cov_a * dL_dConic.z
+                                   + 2.0f * cov_a * cov_b * dL_dConic.y
+                                   + (denom - cov_a * cov_c) * dL_dConic.x);
+        dL_dCov2D.y = denom2inv * 2.0f * (cov_b * cov_c * dL_dConic.x
+                                          - (denom + 2.0f * cov_b * cov_b) * dL_dConic.y
+                                          + cov_a * cov_b * dL_dConic.z);
         
-        // 3. Cov3D gradient
+        // ===== Cov3D gradient =====
+        // cov2D = T * Sigma3D * T^T where T = J * W (Jacobian * view rotation)
+        // dL/dSigma3D = T^T * dL/dCov2D * T
+        // But we need dL/dM where Sigma3D = M * M^T, so dL/dM = 2 * dL/dSigma3D * M
         float3 t_cam = float3(p.viewPos_xy, p.depth);
         float txtz = t_cam.x / t_cam.z;
         float tytz = t_cam.y / t_cam.z;
         
+        // Jacobian (must match forward pass - NO Y flip for covariance)
         float J00 = fx / t_cam.z;
         float J02 = -fx * txtz / t_cam.z;
         float J11 = fy / t_cam.z;
         float J12 = -fy * tytz / t_cam.z;
         
-        float3 T0 = float3(J00, 0, J02) * viewRot;
-        float3 T1 = float3(0, J11, J12) * viewRot;
+        // T = J * W, compute T rows for gradient computation
+        // T[0] = (J00, 0, J02) * W = J00 * W[0] + J02 * W[2]
+        // T[1] = (0, J11, J12) * W = J11 * W[1] + J12 * W[2]
+        float3 T0 = J00 * viewRot[0] + J02 * viewRot[2];
+        float3 T1 = J11 * viewRot[1] + J12 * viewRot[2];
         
+        // dL/dCov3D = T^T * dL/dCov2D_mat * T
+        // For symmetric 2D covariance stored as (a, b, c):
+        // dL_dCov2D_mat = [[dL_dCov2D.x, dL_dCov2D.y], [dL_dCov2D.y, dL_dCov2D.z]]
+        // A = dL_dCov2D.x * T0 + dL_dCov2D.y * T1 (first row of dL_dCov2D_mat * T)
+        // B = dL_dCov2D.y * T0 + dL_dCov2D.z * T1 (second row of dL_dCov2D_mat * T)
         float3 A = dL_dCov2D.x * T0 + dL_dCov2D.y * T1;
         float3 B = dL_dCov2D.y * T0 + dL_dCov2D.z * T1;
         
+        // dL_dCov3D[i] = T0[i] * A + T1[i] * B (outer product sum)
         float3x3 dL_dCov3D;
-        dL_dCov3D[0] = A * T0.x + B * T1.x;
-        dL_dCov3D[1] = A * T0.y + B * T1.y;
-        dL_dCov3D[2] = A * T0.z + B * T1.z;
+        dL_dCov3D[0] = T0.x * A + T1.x * B;
+        dL_dCov3D[1] = T0.y * A + T1.y * B;
+        dL_dCov3D[2] = T0.z * A + T1.z * B;
         
-        // 4. Scale and Rotation gradients
+        // ===== Scale and Rotation gradients =====
+        // Sigma3D = M * M^T where M = R * S
+        // dL/dM = 2 * dL/dSigma3D * M (for symmetric Sigma3D)
         Gaussian g_orig = gaussians[gIdx];
         float3 scale = exp(clamp(g_orig.scale, -MAX_SCALE, MAX_SCALE));
         float3x3 R = quatToMat(g_orig.rotation);
-        // Diagonal scale matrix - Metal column constructor
         float3x3 S = float3x3(
-            float3(scale.x, 0, 0),  // Column 0
-            float3(0, scale.y, 0),  // Column 1
-            float3(0, 0, scale.z)   // Column 2
+            float3(scale.x, 0, 0),
+            float3(0, scale.y, 0),
+            float3(0, 0, scale.z)
         );
         float3x3 M = R * S;
         
-        float3x3 dL_dM = 2.0 * dL_dCov3D * M;
-        float3x3 Rt = transpose(R);
-        float3 dL_dScale_val;
-        dL_dScale_val.x = dot(Rt[0], dL_dM[0]);
-        dL_dScale_val.y = dot(Rt[1], dL_dM[1]);
-        dL_dScale_val.z = dot(Rt[2], dL_dM[2]);
+        // dL_dM = 2 * dL_dCov3D * M
+        float3x3 dL_dM = 2.0f * dL_dCov3D * M;
         
+        // Scale gradient: dL/dS = R^T * dL/dM
+        // For diagonal S, we only need diagonal elements
+        float3x3 Rt = transpose(R);
+        float3x3 RtdLdM = Rt * dL_dM;
+        float3 dL_dScale_val = float3(RtdLdM[0][0], RtdLdM[1][1], RtdLdM[2][2]);
+        
+        // Convert to log scale gradient: dL/d(log_s) = dL/ds * s
         float3 dL_dLogScale = dL_dScale_val * scale;
         
-        // Official 3DGS: NO scale regularization
-        // Scale is controlled by:
-        // 1. Learning rate (0.005 default)
-        // 2. Pruning Gaussians larger than 0.1 * scene_extent
-        // 3. Splitting large Gaussians during densification
+        // Rotation gradient: dL/dR = dL/dM * S^T = dL/dM * S (S is diagonal)
+        float3x3 dL_dR = float3x3(
+            dL_dM[0] * scale.x,
+            dL_dM[1] * scale.y,
+            dL_dM[2] * scale.z
+        );
         
-        float3x3 dL_dR = dL_dM * S;
-        
+        // Quaternion gradient from rotation matrix gradient
+        // Using the standard formula for dR/dq
         float4 dL_dq = float4(0);
         float w = g_orig.rotation.x;
         float x = g_orig.rotation.y;
         float y = g_orig.rotation.z;
-        float z_rot = g_orig.rotation.w; // Rename to avoid conflict with z coordinate
+        float z_rot = g_orig.rotation.w;
         
-        dL_dq.x = dot(dL_dR[0], float3(0, 2*z_rot, -2*y)) + dot(dL_dR[1], float3(-2*z_rot, 0, 2*x)) + dot(dL_dR[2], float3(2*y, -2*x, 0));
-        dL_dq.y = dot(dL_dR[0], float3(0, 2*y, 2*z_rot)) + dot(dL_dR[1], float3(2*y, -4*x, -2*w)) + dot(dL_dR[2], float3(2*z_rot, 2*w, -4*x));
-        dL_dq.z = dot(dL_dR[0], float3(-4*y, 2*x, -2*w)) + dot(dL_dR[1], float3(2*x, 0, 2*z_rot)) + dot(dL_dR[2], float3(2*w, 2*z_rot, -4*y));
-        dL_dq.w = dot(dL_dR[0], float3(-4*z_rot, 2*w, 2*x)) + dot(dL_dR[1], float3(-2*w, -4*z_rot, 2*y)) + dot(dL_dR[2], float3(2*x, 2*y, 0));
+        // Derivatives of R w.r.t. quaternion components (from standard formulas)
+        dL_dq.x = 2.0f * (
+            dot(dL_dR[0], float3(0, z_rot, -y)) +
+            dot(dL_dR[1], float3(-z_rot, 0, x)) +
+            dot(dL_dR[2], float3(y, -x, 0))
+        );
+        dL_dq.y = 2.0f * (
+            dot(dL_dR[0], float3(0, y, z_rot)) +
+            dot(dL_dR[1], float3(y, -2*x, w)) +
+            dot(dL_dR[2], float3(z_rot, -w, -2*x))
+        );
+        dL_dq.z = 2.0f * (
+            dot(dL_dR[0], float3(-2*y, x, w)) +
+            dot(dL_dR[1], float3(x, 0, z_rot)) +
+            dot(dL_dR[2], float3(-w, z_rot, -2*y))
+        );
+        dL_dq.w = 2.0f * (
+            dot(dL_dR[0], float3(-2*z_rot, -w, x)) +
+            dot(dL_dR[1], float3(w, -2*z_rot, y)) +
+            dot(dL_dR[2], float3(x, y, 0))
+        );
         
-        float clampVal = 1.0;
+        float clampVal = 1.0f;
         
         // Atomic accumulation
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0],
@@ -606,6 +689,7 @@ kernel void tiledBackward(
             clamp(dL_dLogScale.y, -clampVal, clampVal), memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_z,
             clamp(dL_dLogScale.z, -clampVal, clampVal), memory_order_relaxed);
+        
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 0,
             clamp(dL_dq.x, -clampVal, clampVal), memory_order_relaxed);
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 1,
@@ -614,7 +698,5 @@ kernel void tiledBackward(
             clamp(dL_dq.z, -clampVal, clampVal), memory_order_relaxed);
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 3,
             clamp(dL_dq.w, -clampVal, clampVal), memory_order_relaxed);
-        
-        // Note: T update is already handled at the start of the loop via T = T / (1 - alpha)
     }
 }

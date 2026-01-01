@@ -30,6 +30,7 @@ struct ProjectedGaussian {
     uint32_t tileMaxX;
     uint32_t tileMaxY;
     simd_float2 viewPos_xy;  // For gradient computation
+    simd_float3 cov2D;       // (a, b, c) - 2D covariance BEFORE inversion (for backward pass)
 };
 
 struct TiledUniforms {

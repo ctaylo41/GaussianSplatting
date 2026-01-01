@@ -328,16 +328,8 @@ void MTLEngine::render(Camera& camera) {
         const TrainingImage& img = trainingImages[currentTrainingIndex];
         const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
         
-
-        simd_float4x4 flipZ = {
-            simd_make_float4(1, 0, 0, 0),
-            simd_make_float4(0, 1, 0, 0),
-            simd_make_float4(0, 0, -1, 0),
-            simd_make_float4(0, 0, 0, 1)
-        };
-        uniforms.viewMatrix = matrix_multiply(uniforms.viewMatrix, flipZ);
-        // Recompute viewProjectionMatrix
-        uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
+        // Set view matrix from COLMAP pose (must be done BEFORE any transformations)
+        uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
 
         
         // For display, we render to the window, not the training image size
@@ -353,13 +345,17 @@ void MTLEngine::render(Camera& camera) {
         float cx = cam.cx * scaleX;
         float cy = cam.cy * scaleY;
         
-        simd_float4x4 proj = simd_matrix_from_rows(
-            simd_make_float4(2.0f * scaledFx / windowWidth, 0, 0, 0),
-            simd_make_float4(0, 2.0f * scaledFy / windowHeight, 0, 0),
-            simd_make_float4(1.0f - 2.0f * cx / windowWidth, 2.0f * cy / windowHeight - 1.0f, -(far + near) / (far - near), -1),
-            simd_make_float4(0, 0, -2.0f * far * near / (far - near), 0)
-        );
-        uniforms.projectionMatrix = simd_transpose(proj);  // Convert from row to column major
+        // COLMAP uses OpenCV convention: +Z forward, Y-down
+        // Build projection matrix in column-major format directly (like projectionFromColmap)
+        simd_float4x4 proj = {0};
+        proj.columns[0][0] = 2.0f * scaledFx / windowWidth;
+        proj.columns[1][1] = -2.0f * scaledFy / windowHeight;  // Y flip for COLMAP Y-down
+        proj.columns[2][0] = 1.0f - 2.0f * cx / windowWidth;
+        proj.columns[2][1] = 2.0f * cy / windowHeight - 1.0f;
+        proj.columns[2][2] = far / (far - near);
+        proj.columns[2][3] = 1.0f;  // clipW = viewZ (COLMAP +Z forward)
+        proj.columns[3][2] = -(far * near) / (far - near);
+        uniforms.projectionMatrix = proj;
         
         uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
         uniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
@@ -556,13 +552,17 @@ simd_float4x4 MTLEngine::projectionFromColmap(const ColmapCamera& cam, float nea
     float w = (float)cam.width;
     float h = (float)cam.height;
     
+    // COLMAP uses OpenCV convention: camera looks down +Z axis (objects in front have positive viewZ)
+    // COLMAP image Y-axis points DOWN (origin at top-left)
+    // Metal NDC: X=[-1,1] left-to-right, Y=[-1,1] bottom-to-top, Z=[0,1] near-to-far
+    // We flip Y in projection to match COLMAP's Y-down with Metal's Y-up NDC
     simd_float4x4 proj = {0};
     proj.columns[0][0] = 2.0f * fx / w;
-    proj.columns[1][1] = 2.0f * fy / h;
-    proj.columns[2][0] = (w - 2.0f * cx) / w;
-    proj.columns[2][1] = (2.0f * cy - h) / h;
+    proj.columns[1][1] = -2.0f * fy / h;  // NEGATIVE to flip Y (COLMAP Y-down -> Metal Y-up)
+    proj.columns[2][0] = 1.0f - 2.0f * cx / w;  // X offset
+    proj.columns[2][1] = 2.0f * cy / h - 1.0f;  // Y offset (adjusted for flip)
     proj.columns[2][2] = farZ / (farZ - nearZ);
-    proj.columns[2][3] = 1.0f;
+    proj.columns[2][3] = 1.0f;  // POSITIVE: clipW = viewZ (COLMAP has +Z forward)
     proj.columns[3][2] = -(farZ * nearZ) / (farZ - nearZ);
     
     return proj;
@@ -730,6 +730,26 @@ float MTLEngine::trainStep(size_t imageIndex) {
     R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
     uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
     
+    // DEBUG: Check view-space coordinates for first Gaussian
+    static bool viewDebugPrinted = false;
+    if (!viewDebugPrinted) {
+        Gaussian* gs = (Gaussian*)gaussianBuffer->contents();
+        simd_float4 worldPos = simd_make_float4(gs[0].position, 1.0f);
+        simd_float4 viewPos = matrix_multiply(uniforms.viewMatrix, worldPos);
+        simd_float4 clipPos = matrix_multiply(uniforms.viewProjectionMatrix, worldPos);
+        simd_float3 ndc = simd_make_float3(clipPos.x/clipPos.w, clipPos.y/clipPos.w, clipPos.z/clipPos.w);
+        simd_float2 screenPos = simd_make_float2((ndc.x * 0.5f + 0.5f) * actualWidth,
+                                                  (ndc.y * 0.5f + 0.5f) * actualHeight);
+        std::cout << "=== View Transform Debug ===" << std::endl;
+        std::cout << "World pos: (" << worldPos.x << ", " << worldPos.y << ", " << worldPos.z << ")" << std::endl;
+        std::cout << "View pos: (" << viewPos.x << ", " << viewPos.y << ", " << viewPos.z << ")" << std::endl;
+        std::cout << "Clip pos: (" << clipPos.x << ", " << clipPos.y << ", " << clipPos.z << ", w=" << clipPos.w << ")" << std::endl;
+        std::cout << "NDC: (" << ndc.x << ", " << ndc.y << ", " << ndc.z << ")" << std::endl;
+        std::cout << "Screen pos: (" << screenPos.x << ", " << screenPos.y << ")" << std::endl;
+        std::cout << "Screen size: " << actualWidth << "x" << actualHeight << std::endl;
+        viewDebugPrinted = true;
+    }
+    
     // Forward pass
     tiledRasterizer->forward(commandQueue, gaussianBuffer, gaussianCount, uniforms, renderTarget);
     
@@ -792,13 +812,31 @@ float MTLEngine::trainStep(size_t imageIndex) {
     // Accumulate for density control
     densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
     
-    // Optimizer step - reduced learning rates for stability
+    // Optimizer step - official 3DGS learning rates
     optimizer->step(commandQueue, gaussianBuffer, gaussianGradients,
-                    0.00016f,  // position lr (reduced from 0.0008)
-                    0.001f,    // scale lr (reduced from 0.005) 
-                    0.001f,    // rotation lr
-                    0.05f,     // opacity lr (reduced from 0.1)
-                    0.0025f);  // sh lr (reduced from 0.005)
+                    0.00016f,  // position lr (official default)
+                    0.005f,    // scale lr (official default)
+                    0.01f,      // rotation lr (OFF - debugging)
+                    0.05f,     // opacity lr (ENABLED - needed to make Gaussians visible)
+                    0.000f);   // sh lr (OFF for testing)
+//    Gaussian* g = (Gaussian*)gaussianBuffer->contents();
+//    float minSH = 1e10, maxSH = -1e10;
+//    for (size_t i = 0; i < std::min(gaussianCount, (size_t)1000); i++) {
+//        for (int j = 0; j < 12; j++) {
+//            minSH = std::min(minSH, g[i].sh[j]);
+//            maxSH = std::max(maxSH, g[i].sh[j]);
+//        }
+//    }
+//    std::cout << "SH range: [" << minSH << ", " << maxSH << "]" << std::endl;
+
+    Gaussian* g = (Gaussian*)gaussianBuffer->contents();
+    float avgOpacity = 0, avgZ = 0;
+    for (int i = 0; i < 100; i++) {
+        avgOpacity += 1.0f / (1.0f + exp(-g[i].opacity));  // sigmoid
+        avgZ += g[i].position.z;
+    }
+    std::cout << "Avg opacity: " << avgOpacity/100 << " Avg Z: " << avgZ/100 << std::endl;
+
     
     return loss;
 }

@@ -22,22 +22,31 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
     // SH_C0 constant for DC term
     const float SH_C0 = 0.28209479177387814f;
     
+    // Initial scale in log space
+    // The projected 2D size is approximately: focal_length * scale / depth
+    // With focal ~1163, typical depth ~50-300, we want ~3-10 pixel radius
+    // scale = radius * depth / focal = 5 * 100 / 1163 ≈ 0.43
+    // But points close to camera (depth ~5) with scale 0.43 give radius ~100 pixels
+    // Use smaller scale: exp(-5) = 0.0067 world units
+    // At depth 5: radius ≈ 1163 * 0.0067 / 5 * 3 ≈ 4.7 pixels (good!)
+    // At depth 100: radius ≈ 1163 * 0.0067 / 100 * 3 ≈ 0.2 pixels (small but OK for start)
+    const float initialLogScale = -5.0f;  // exp(-5) ≈ 0.0067 world units
+    
     for (const auto& pt : colmap.points) {
         Gaussian g;
         
         g.position = pt.position;
         
-        // Initial scale in LOG space: 
-        // exp(-2) = 0.14 which gives reasonable initial size
-        // MAX_SCALE is now 20.0, allowing range [-20, 20]
-        g.scale = simd_make_float3(-2.0f, -2.0f, -2.0f);
+        // Initial scale in LOG space
+        g.scale = simd_make_float3(initialLogScale, initialLogScale, initialLogScale);
         
         // Identity quaternion: (w=1, x=0, y=0, z=0)
         // Stored as float4(.x=w, .y=x, .z=y, .w=z)
         g.rotation = simd_make_float4(1.0f, 0.0f, 0.0f, 0.0f);
         
-        // Initial opacity in RAW space: sigmoid(-2) ≈ 0.12
-        g.opacity = -2.0f;
+        // Initial opacity in RAW space: sigmoid(0) = 0.5
+        // Start with visible opacity so gradients can flow
+        g.opacity = 0.0f;
         
         // Initialize SH coefficients
         for (int i = 0; i < 12; i++) {
@@ -65,7 +74,7 @@ int main(int argc, char* argv[]) {
     std::string colmapPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/";
     std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4";
     std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
-    size_t numEpochs = 10;  // Train for 10 epochs
+    size_t numEpochs = 6;  // Train for 10 epochs
     bool viewOnly = false;
     std::string viewPlyPath = "";
     

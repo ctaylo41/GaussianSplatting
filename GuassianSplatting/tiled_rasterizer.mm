@@ -104,6 +104,12 @@ void TiledRasterizer::ensureBufferCapacity(uint32_t width, uint32_t height, size
 }
 
 void TiledRasterizer::ensurePairsCapacity(uint32_t requiredPairs) {
+    // Sanity check - don't allocate more than 100M pairs (prevents corruption issues)
+    if (requiredPairs > 100000000) {
+        std::cerr << "WARNING: requiredPairs too large (" << requiredPairs << "), clamping to 100M" << std::endl;
+        requiredPairs = 100000000;
+    }
+    
     if (requiredPairs <= maxPairs) return;
     
     // Grow by 1.5x or to required size, whichever is larger
@@ -220,8 +226,15 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         const ProjectedGaussian& p = projPtr[gIdx];
         if (p.radius <= 0 || p.tileMinX > p.tileMaxX || p.tileMinY > p.tileMaxY) continue;
         
+        // Validate tile bounds to prevent corruption from bad gradients
+        if (p.tileMinX > 10000 || p.tileMaxX > 10000 || p.tileMinY > 10000 || p.tileMaxY > 10000) continue;
+        
         uint32_t tilesX = p.tileMaxX - p.tileMinX + 1;
         uint32_t tilesY = p.tileMaxY - p.tileMinY + 1;
+        
+        // Skip if this Gaussian covers too many tiles (likely corrupted)
+        if (tilesX * tilesY > 64) continue;
+        
         totalPairs += tilesX * tilesY;
     }
     
@@ -229,6 +242,12 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         // Clear tile ranges
         memset(tileRanges->contents(), 0, maxTiles * sizeof(TileRange));
         return;
+    }
+    
+    // Clamp totalPairs to prevent memory explosion
+    if (totalPairs > 50000000) {
+        std::cerr << "WARNING: totalPairs clamped from " << totalPairs << " to 50M" << std::endl;
+        totalPairs = 50000000;
     }
     
     // Ensure buffer capacity
@@ -241,6 +260,13 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     for (uint32_t gIdx = 0; gIdx < gaussianCount; gIdx++) {
         const ProjectedGaussian& p = projPtr[gIdx];
         if (p.radius <= 0 || p.tileMinX > p.tileMaxX || p.tileMinY > p.tileMaxY) continue;
+        
+        // Same validation as counting pass
+        if (p.tileMinX > 10000 || p.tileMaxX > 10000 || p.tileMinY > 10000 || p.tileMaxY > 10000) continue;
+        
+        uint32_t tilesX = p.tileMaxX - p.tileMinX + 1;
+        uint32_t tilesY = p.tileMaxY - p.tileMinY + 1;
+        if (tilesX * tilesY > 64) continue;
         
         // Convert depth to sortable key
         uint32_t depthKey = *reinterpret_cast<const uint32_t*>(&p.depth);
