@@ -30,8 +30,7 @@ struct Uniforms {
     float4x4 viewProjectionMatrix;
     float2 screenSize;
     float2 focalLength;
-    float3 cameraPos;
-    float _pad;
+    float3 cameraPos;        // 16 bytes (includes implicit 4-byte padding)
 };
 
 struct VertexOut {

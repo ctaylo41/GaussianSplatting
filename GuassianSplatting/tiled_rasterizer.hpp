@@ -43,8 +43,7 @@ struct TiledUniforms {
     simd_float4x4 viewProjectionMatrix;
     simd_float2 screenSize;
     simd_float2 focalLength;
-    simd_float3 cameraPos;
-    float _pad1;
+    simd_float3 cameraPos;     // 16 bytes (12 data + 4 implicit padding)
     uint32_t numTilesX;
     uint32_t numTilesY;
     uint32_t numGaussians;

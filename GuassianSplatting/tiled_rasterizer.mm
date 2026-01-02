@@ -277,7 +277,8 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         uint32_t tilesY = p.tileMaxY - p.tileMinY + 1;
         
         // Skip if this Gaussian covers too many tiles (likely corrupted)
-        if (tilesX * tilesY > 64) continue;
+        // Must match shader limit of 256 tiles
+        if (tilesX * tilesY > 256) continue;
         
         totalPairs += tilesX * tilesY;
     }
@@ -310,7 +311,8 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         
         uint32_t tilesX = p.tileMaxX - p.tileMinX + 1;
         uint32_t tilesY = p.tileMaxY - p.tileMinY + 1;
-        if (tilesX * tilesY > 64) continue;
+        // Must match shader limit of 256 tiles
+        if (tilesX * tilesY > 256) continue;
         
         // Convert depth to sortable key
         uint32_t depthKey = *reinterpret_cast<const uint32_t*>(&p.depth);
