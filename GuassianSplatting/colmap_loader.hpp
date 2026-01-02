@@ -40,3 +40,5 @@ struct ColmapData {
 };
 
 ColmapData loadColmap(const std::string& path);
+float computeSceneExtent(const ColmapData& colmap);
+simd_float3 getCameraWorldPosition(const ColmapImage& img);

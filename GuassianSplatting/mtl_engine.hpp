@@ -34,7 +34,7 @@ public:
     void init();
     void run(Camera& camera);
     void cleanup();
-    void loadGaussians(const std::vector<Gaussian>& gaussians);
+    void loadGaussians(const std::vector<Gaussian>& gaussians, float sceneExtent = 0.0f);
     void loadTrainingData(const ColmapData& colmap, const std::string& imagePath);
     void train(size_t numEpochs);
     void initHeadless();
@@ -120,8 +120,13 @@ private:
     TiledRasterizer* tiledRasterizer = nullptr;
     MTL::Buffer* gaussianGradients = nullptr;
     
-    // Training step
-    float trainStep(size_t imageIndex);
+    // Training step with learning rate parameters
+    float trainStep(size_t imageIndex, 
+                    float lr_position = 0.00016f,
+                    float lr_scale = 0.005f,
+                    float lr_rotation = 0.001f,
+                    float lr_opacity = 0.05f,
+                    float lr_sh = 0.0025f);
     void updatePositionBuffer();
     
     // Optimizer and density control

@@ -174,3 +174,69 @@ ColmapData loadColmap(const std::string& path) {
     data.points = loadPoints(path + "/points3D.bin");
     return data;
 }
+
+simd_float3 getCameraWorldPosition(const ColmapImage& img) {
+    // COLMAP stores quaternion as (qw, qx, qy, qz)
+    // Build rotation matrix from quaternion
+    float qw = img.rotation.x;  // You stored w in .x
+    float qx = img.rotation.y;
+    float qy = img.rotation.z;
+    float qz = img.rotation.w;
+    
+    // Rotation matrix R from quaternion
+    float r00 = 1 - 2*(qy*qy + qz*qz);
+    float r01 = 2*(qx*qy - qz*qw);
+    float r02 = 2*(qx*qz + qy*qw);
+    float r10 = 2*(qx*qy + qz*qw);
+    float r11 = 1 - 2*(qx*qx + qz*qz);
+    float r12 = 2*(qy*qz - qx*qw);
+    float r20 = 2*(qx*qz - qy*qw);
+    float r21 = 2*(qy*qz + qx*qw);
+    float r22 = 1 - 2*(qx*qx + qy*qy);
+    
+    // Camera center C = -R^T * t
+    float tx = img.translation.x;
+    float ty = img.translation.y;
+    float tz = img.translation.z;
+    
+    // R^T * t (transpose of R times t)
+    float cx = -(r00*tx + r10*ty + r20*tz);
+    float cy = -(r01*tx + r11*ty + r21*tz);
+    float cz = -(r02*tx + r12*ty + r22*tz);
+    
+    return simd_make_float3(cx, cy, cz);
+}
+
+float computeSceneExtent(const ColmapData& colmap) {
+    // Get all camera world positions
+    std::vector<simd_float3> camPositions;
+    for (const auto& img : colmap.images) {
+        camPositions.push_back(getCameraWorldPosition(img));
+    }
+    
+    // Compute centroid
+    simd_float3 centroid = {0, 0, 0};
+    for (const auto& p : camPositions) {
+        centroid.x += p.x;
+        centroid.y += p.y;
+        centroid.z += p.z;
+    }
+    centroid.x /= camPositions.size();
+    centroid.y /= camPositions.size();
+    centroid.z /= camPositions.size();
+    
+    // Find max distance from centroid
+    float maxDist = 0;
+    for (const auto& p : camPositions) {
+        float dist = simd_length(p - centroid);
+        maxDist = std::max(maxDist, dist);
+    }
+    
+    // This is the "nerf_normalization" radius from official code
+    float radius = maxDist * 1.1f;
+    
+    std::cout << "Camera centroid: (" << centroid.x << ", " << centroid.y << ", " << centroid.z << ")" << std::endl;
+    std::cout << "Camera extent (radius): " << radius << std::endl;
+    
+    return radius;
+}

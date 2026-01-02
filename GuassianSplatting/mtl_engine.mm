@@ -219,32 +219,37 @@ void MTLEngine::scrollCallback(GLFWwindow* window, double xoffset, double yoffse
     engine->activeCamera->zoom(-yoffset * zoomSpeed);
 }
 
-void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians) {
+void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians, float sceneExtent) {
     gaussianCount = gaussians.size();
     gaussianBuffer = metalDevice->newBuffer(gaussians.data(), gaussianCount * sizeof(Gaussian),
                                             MTL::ResourceStorageModeShared);
     
-    // Compute scene extent for density control (official 3DGS approach)
-    float min_x = FLT_MAX, min_y = FLT_MAX, min_z = FLT_MAX;
-    float max_x = -FLT_MAX, max_y = -FLT_MAX, max_z = -FLT_MAX;
-    
-    std::vector<simd_float3> positions(gaussianCount);
+    // Create position buffer for sorting
+    positionBuffer = metalDevice->newBuffer(gaussianCount * sizeof(simd_float3),
+                                            MTL::ResourceStorageModeShared);
+    simd_float3* positions = (simd_float3*)positionBuffer->contents();
     for (size_t i = 0; i < gaussianCount; i++) {
         positions[i] = gaussians[i].position;
-        min_x = std::min(min_x, gaussians[i].position.x);
-        min_y = std::min(min_y, gaussians[i].position.y);
-        min_z = std::min(min_z, gaussians[i].position.z);
-        max_x = std::max(max_x, gaussians[i].position.x);
-        max_y = std::max(max_y, gaussians[i].position.y);
-        max_z = std::max(max_z, gaussians[i].position.z);
     }
-    positionBuffer = metalDevice->newBuffer(positions.data(), gaussianCount * sizeof(simd_float3),
-                                            MTL::ResourceStorageModeShared);
     
-    // Set scene extent for density control (matches official 3DGS)
-    float sceneExtent = std::sqrt((max_x - min_x) * (max_x - min_x) +
-                                   (max_y - min_y) * (max_y - min_y) +
-                                   (max_z - min_z) * (max_z - min_z));
+    // Use the camera-based scene extent for density control
+    if (sceneExtent <= 0.0f) {
+        // Fallback: compute from point cloud (not ideal)
+        float min_x = FLT_MAX, max_x = -FLT_MAX;
+        float min_y = FLT_MAX, max_y = -FLT_MAX;
+        float min_z = FLT_MAX, max_z = -FLT_MAX;
+        for (const auto& g : gaussians) {
+            min_x = std::min(min_x, g.position.x); max_x = std::max(max_x, g.position.x);
+            min_y = std::min(min_y, g.position.y); max_y = std::max(max_y, g.position.y);
+            min_z = std::min(min_z, g.position.z); max_z = std::max(max_z, g.position.z);
+        }
+        sceneExtent = sqrtf((max_x-min_x)*(max_x-min_x) + 
+                           (max_y-min_y)*(max_y-min_y) + 
+                           (max_z-min_z)*(max_z-min_z));
+        std::cout << "WARNING: Using point cloud extent (fallback): " << sceneExtent << std::endl;
+    }
+    
+    std::cout << "Density control using scene extent: " << sceneExtent << std::endl;
     DensityController::setSceneExtent(sceneExtent);
     
     gpuSort = new GPURadixSort(metalDevice, 2000000);
@@ -746,7 +751,12 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
     return totalLoss / pixelCount;
 }
 
-float MTLEngine::trainStep(size_t imageIndex) {
+float MTLEngine::trainStep(size_t imageIndex, 
+                           float lr_position,
+                           float lr_scale,
+                           float lr_rotation,
+                           float lr_opacity,
+                           float lr_sh) {
     if (imageIndex >= trainingImages.size()) return 0.0f;
     
     const TrainingImage& img = trainingImages[imageIndex];
@@ -895,14 +905,13 @@ float MTLEngine::trainStep(size_t imageIndex) {
     // Accumulate for density control
     densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
     
-    // Optimizer step - learning rates matched to official 3DGS
-    // Official values from arguments/__init__.py in graphdeco-inria/gaussian-splatting
+    // Optimizer step with decayed learning rates
     optimizer->step(commandQueue, gaussianBuffer, gaussianGradients,
-                    0.00016f,  // position lr (official: position_lr_init = 0.00016)
-                    0.005f,    // scale lr (official: scaling_lr = 0.005)
-                    0.001f,    // rotation lr (official: rotation_lr = 0.001)
-                    0.025f,    // opacity lr (official: opacity_lr = 0.025)
-                    0.0025f);  // sh lr (official: feature_lr = 0.0025)
+                    lr_position,   // decayed position lr
+                    lr_scale,      // scale lr (official: scaling_lr = 0.005)
+                    lr_rotation,   // rotation lr (official: rotation_lr = 0.001)
+                    lr_opacity,    // opacity lr (official: opacity_lr = 0.025)
+                    lr_sh);        // sh lr (official: feature_lr = 0.0025)
 //    Gaussian* g = (Gaussian*)gaussianBuffer->contents();
 //    float minSH = 1e10, maxSH = -1e10;
 //    for (size_t i = 0; i < std::min(gaussianCount, (size_t)1000); i++) {
@@ -949,6 +958,13 @@ void MTLEngine::updatePositionBuffer() {
     }
 }
 
+// Exponential learning rate decay (matches official 3DGS)
+static float exponentialLRDecay(float lr_init, float lr_final, size_t currentIter, size_t maxIter) {
+    if (currentIter >= maxIter) return lr_final;
+    float t = static_cast<float>(currentIter) / static_cast<float>(maxIter);
+    return lr_init * std::pow(lr_final / lr_init, t);
+}
+
 void MTLEngine::train(size_t numEpochs) {
     std::cout << "Starting training for " << numEpochs << " epochs..." << std::endl;
     std::cout << "Gaussians: " << gaussianCount << " | Images: " << trainingImages.size() << std::endl;
@@ -959,6 +975,23 @@ void MTLEngine::train(size_t numEpochs) {
     const size_t DENSIFY_UNTIL_ITER = 15000;
     const float OPACITY_RESET_VALUE = -4.6f;  // sigmoid^-1(0.01) ≈ -4.6
     
+    // ============================================================
+    // LEARNING RATE CONFIGURATION (matching official 3DGS)
+    // ============================================================
+    // Position LR decays exponentially from init to final
+    const float POSITION_LR_INIT = 0.00016f;
+    const float POSITION_LR_FINAL = 0.0000016f;  // 100x smaller at end
+    const float SCALE_LR = 0.005f;
+    const float ROTATION_LR = 0.001f;
+    const float OPACITY_LR = 0.05f;
+    const float SH_LR = 0.0025f;
+    
+    // Total iterations for LR scheduling
+    const size_t totalExpectedIters = numEpochs * trainingImages.size();
+    
+    std::cout << "Learning rate decay: position " << POSITION_LR_INIT 
+              << " -> " << POSITION_LR_FINAL << " over " << totalExpectedIters << " iterations" << std::endl;
+    
     auto startTime = std::chrono::high_resolution_clock::now();
     size_t totalIterations = 0;
     
@@ -967,7 +1000,11 @@ void MTLEngine::train(size_t numEpochs) {
         auto epochStart = std::chrono::high_resolution_clock::now();
         
         for (size_t imgIdx = 0; imgIdx < trainingImages.size(); imgIdx++) {
-            float loss = trainStep(imgIdx);
+            // Compute decayed learning rates
+            float currentPositionLR = exponentialLRDecay(POSITION_LR_INIT, POSITION_LR_FINAL, 
+                                                          totalIterations, totalExpectedIters);
+            
+            float loss = trainStep(imgIdx, currentPositionLR, SCALE_LR, ROTATION_LR, OPACITY_LR, SH_LR);
             epochLoss += loss;
             totalIterations++;
             
@@ -1026,9 +1063,14 @@ void MTLEngine::train(size_t numEpochs) {
         auto epochEnd = std::chrono::high_resolution_clock::now();
         auto epochDuration = std::chrono::duration_cast<std::chrono::seconds>(epochEnd - epochStart).count();
         
+        // Compute current position LR for logging
+        float currentLR = exponentialLRDecay(POSITION_LR_INIT, POSITION_LR_FINAL, 
+                                             totalIterations, totalExpectedIters);
+        
         std::cout << std::endl << "=== Epoch " << epoch << " | Loss: "
                   << (epochLoss / trainingImages.size())
                   << " | Gaussians: " << gaussianCount
+                  << " | pos_lr: " << currentLR
                   << " | Time: " << epochDuration << "s ===" << std::endl;
     }
     

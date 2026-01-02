@@ -171,7 +171,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG)));
         
         // Official 3DGS thresholds (scene-relative)
-        float splitThreshold = PERCENT_DENSE * sceneExtent;  // Clone small, split large
+        float splitThreshold = 0.01f * sceneExtent;  // Clone small, split large
         float pruneThreshold = 0.1f * sceneExtent;           // Prune extremely large Gaussians
         
         // Decision logic (matches official 3DGS densify_and_prune)

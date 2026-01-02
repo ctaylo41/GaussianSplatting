@@ -51,33 +51,27 @@ float computeMeanNearestNeighborDistance(const std::vector<ColmapPoint>& points,
     return (count > 0) ? (sum / count) : 0.1f;  // Default if no neighbors
 }
 
-std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
+std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneExtent) {
     std::vector<Gaussian> gaussians;
     gaussians.reserve(colmap.points.size());
     
     // SH_C0 constant for DC term
     const float SH_C0 = 0.28209479177387814f;
     
-    // ============================================================
-    // COMPUTE SCENE EXTENT for scene-relative initialization
-    // ============================================================
-    float min_x = FLT_MAX, min_y = FLT_MAX, min_z = FLT_MAX;
-    float max_x = -FLT_MAX, max_y = -FLT_MAX, max_z = -FLT_MAX;
+    // Scene extent is now passed in (computed from cameras)
+    std::cout << "Using scene extent: " << sceneExtent << std::endl;
     
-    for (const auto& pt : colmap.points) {
-        min_x = fmin(min_x, pt.position.x);
-        max_x = fmax(max_x, pt.position.x);
-        min_y = fmin(min_y, pt.position.y);
-        max_y = fmax(max_y, pt.position.y);
-        min_z = fmin(min_z, pt.position.z);
-        max_z = fmax(max_z, pt.position.z);
+    std::cout << "\n=== Camera Position Debug ===" << std::endl;
+    for (int i = 0; i < std::min(5, (int)colmap.images.size()); i++) {
+        simd_float3 pos = getCameraWorldPosition(colmap.images[i]);
+        std::cout << "Camera " << i << " world pos: ("
+                  << pos.x << ", " << pos.y << ", " << pos.z << ")" << std::endl;
+        std::cout << "  Raw translation: ("
+                  << colmap.images[i].translation.x << ", "
+                  << colmap.images[i].translation.y << ", "
+                  << colmap.images[i].translation.z << ")" << std::endl;
     }
-    
-    float sceneExtent = sqrtf((max_x - min_x) * (max_x - min_x) +
-                               (max_y - min_y) * (max_y - min_y) +
-                               (max_z - min_z) * (max_z - min_z));
-    
-    std::cout << "Scene extent: " << sceneExtent << std::endl;
+
     
     // ============================================================
     // OPTION 1: Compute per-point scale from nearest neighbors (RECOMMENDED)
@@ -193,8 +187,6 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
 
 
 
-
-
 int main(int argc, char* argv[]) {
     
     // Default paths - can be overridden with command line args
@@ -271,7 +263,7 @@ int main(int argc, char* argv[]) {
         
         MTLEngine engine;
         engine.init();
-        engine.loadGaussians(gaussians);
+        engine.loadGaussians(gaussians, diagonal);
         
         std::cout << "\nControls:" << std::endl;
         std::cout << "  Left mouse drag: Orbit camera" << std::endl;
@@ -294,7 +286,12 @@ int main(int argc, char* argv[]) {
     
     ColmapData colmap = loadColmap(colmapPath);
     
-    auto gaussians = gaussiansFromColmap(colmap);
+    // Compute scene extent from camera positions BEFORE creating gaussians
+    float sceneExtent = computeSceneExtent(colmap);
+    std::cout << "Scene extent (from cameras): " << sceneExtent << std::endl;
+
+    
+    auto gaussians = gaussiansFromColmap(colmap,sceneExtent);
     
     // Debug struct layout
     printf("=== Struct Layout ===\n");
@@ -363,7 +360,7 @@ int main(int argc, char* argv[]) {
     MTLEngine engine;
     engine.initHeadless();
     engine.loadTrainingData(colmap, imagePath);
-    engine.loadGaussians(gaussians);
+    engine.loadGaussians(gaussians, sceneExtent);
     
     printf("\n=== Starting Training ===\n");
     engine.train(numEpochs);
