@@ -15,6 +15,42 @@
 #include "image_loader.hpp"
 #include "ply_exporter.hpp"
 
+float computeMeanNearestNeighborDistance(const std::vector<ColmapPoint>& points,
+                                          size_t pointIdx,
+                                          int k = 3) {
+    const auto& pt = points[pointIdx];
+    
+    // Use a max-heap to find k smallest distances
+    std::priority_queue<float> nearestDistances;
+    
+    for (size_t i = 0; i < points.size(); i++) {
+        if (i == pointIdx) continue;
+        
+        float dx = points[i].position.x - pt.position.x;
+        float dy = points[i].position.y - pt.position.y;
+        float dz = points[i].position.z - pt.position.z;
+        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+        
+        if (nearestDistances.size() < k) {
+            nearestDistances.push(dist);
+        } else if (dist < nearestDistances.top()) {
+            nearestDistances.pop();
+            nearestDistances.push(dist);
+        }
+    }
+    
+    // Compute mean of k nearest distances
+    float sum = 0.0f;
+    int count = 0;
+    while (!nearestDistances.empty()) {
+        sum += nearestDistances.top();
+        nearestDistances.pop();
+        count++;
+    }
+    
+    return (count > 0) ? (sum / count) : 0.1f;  // Default if no neighbors
+}
+
 std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
     std::vector<Gaussian> gaussians;
     gaussians.reserve(colmap.points.size());
@@ -22,23 +58,93 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
     // SH_C0 constant for DC term
     const float SH_C0 = 0.28209479177387814f;
     
-    // Initial scale in log space
-    // The projected 2D size is approximately: focal_length * scale / depth
-    // With focal ~1163, typical depth ~50-300, we want ~3-10 pixel radius
-    // scale = radius * depth / focal = 5 * 100 / 1163 ≈ 0.43
-    // But points close to camera (depth ~5) with scale 0.43 give radius ~100 pixels
-    // Use smaller scale: exp(-5) = 0.0067 world units
-    // At depth 5: radius ≈ 1163 * 0.0067 / 5 * 3 ≈ 4.7 pixels (good!)
-    // At depth 100: radius ≈ 1163 * 0.0067 / 100 * 3 ≈ 0.2 pixels (small but OK for start)
-    const float initialLogScale = -5.0f;  // exp(-5) ≈ 0.0067 world units
+    // ============================================================
+    // COMPUTE SCENE EXTENT for scene-relative initialization
+    // ============================================================
+    float min_x = FLT_MAX, min_y = FLT_MAX, min_z = FLT_MAX;
+    float max_x = -FLT_MAX, max_y = -FLT_MAX, max_z = -FLT_MAX;
     
     for (const auto& pt : colmap.points) {
+        min_x = fmin(min_x, pt.position.x);
+        max_x = fmax(max_x, pt.position.x);
+        min_y = fmin(min_y, pt.position.y);
+        max_y = fmax(max_y, pt.position.y);
+        min_z = fmin(min_z, pt.position.z);
+        max_z = fmax(max_z, pt.position.z);
+    }
+    
+    float sceneExtent = sqrtf((max_x - min_x) * (max_x - min_x) +
+                               (max_y - min_y) * (max_y - min_y) +
+                               (max_z - min_z) * (max_z - min_z));
+    
+    std::cout << "Scene extent: " << sceneExtent << std::endl;
+    
+    // ============================================================
+    // OPTION 1: Compute per-point scale from nearest neighbors (RECOMMENDED)
+    // This matches the official implementation
+    // ============================================================
+    std::cout << "Computing initial scales from nearest neighbor distances..." << std::endl;
+    
+    std::vector<float> initialScales(colmap.points.size());
+    
+    // For large point clouds, sampling can speed this up
+    bool useSampling = (colmap.points.size() > 10000);
+    
+    if (useSampling) {
+        // Compute for a sample and use median for the rest
+        std::vector<float> sampleScales;
+        size_t sampleSize = std::min((size_t)1000, colmap.points.size());
+        size_t step = colmap.points.size() / sampleSize;
+        
+        for (size_t i = 0; i < colmap.points.size(); i += step) {
+            float dist = computeMeanNearestNeighborDistance(colmap.points, i, 3);
+            sampleScales.push_back(dist);
+        }
+        
+        // Use median as default scale
+        std::sort(sampleScales.begin(), sampleScales.end());
+        float medianScale = sampleScales[sampleScales.size() / 2];
+        
+        std::cout << "Using median nearest neighbor distance: " << medianScale << std::endl;
+        
+        for (size_t i = 0; i < colmap.points.size(); i++) {
+            initialScales[i] = medianScale;
+        }
+    } else {
+        // Compute for all points (slower but more accurate)
+        for (size_t i = 0; i < colmap.points.size(); i++) {
+            initialScales[i] = computeMeanNearestNeighborDistance(colmap.points, i, 3);
+            
+            if (i % 5000 == 0) {
+                std::cout << "\rProcessed " << i << "/" << colmap.points.size() << std::flush;
+            }
+        }
+        std::cout << std::endl;
+    }
+    
+    // ============================================================
+    // CREATE GAUSSIANS
+    // ============================================================
+    for (size_t i = 0; i < colmap.points.size(); i++) {
+        const auto& pt = colmap.points[i];
         Gaussian g;
         
         g.position = pt.position;
         
-        // Initial scale in LOG space
-        g.scale = simd_make_float3(initialLogScale, initialLogScale, initialLogScale);
+        // ============================================================
+        // SCALE INITIALIZATION (LOG SPACE)
+        // Use nearest neighbor distance, clamped to reasonable range
+        // ============================================================
+        float scale = initialScales[i];
+        
+        // Clamp scale to reasonable range relative to scene
+        float minScale = 0.0001f * sceneExtent;  // Very small minimum
+        float maxScale = 0.1f * sceneExtent;     // Reasonable maximum
+        scale = std::clamp(scale, minScale, maxScale);
+        
+        // Convert to log space
+        float logScale = std::log(scale);
+        g.scale = simd_make_float3(logScale, logScale, logScale);
         
         // Identity quaternion: (w=1, x=0, y=0, z=0)
         // Stored as float4(.x=w, .y=x, .z=y, .w=z)
@@ -49,8 +155,8 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
         g.opacity = 0.0f;
         
         // Initialize SH coefficients
-        for (int i = 0; i < 12; i++) {
-            g.sh[i] = 0.0f;
+        for (int j = 0; j < 12; j++) {
+            g.sh[j] = 0.0f;
         }
         
         // Set DC terms (indices 0, 4, 8)
@@ -64,8 +170,29 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap) {
     
     std::cout << "Created " << gaussians.size() << " Gaussians from COLMAP points" << std::endl;
     
+    // Print scale statistics
+    float minLogScale = FLT_MAX, maxLogScale = -FLT_MAX, avgLogScale = 0;
+    for (const auto& g : gaussians) {
+        minLogScale = fmin(minLogScale, g.scale.x);
+        maxLogScale = fmax(maxLogScale, g.scale.x);
+        avgLogScale += g.scale.x;
+    }
+    avgLogScale /= gaussians.size();
+    
+    std::cout << "Scale stats (log): min=" << minLogScale
+              << " max=" << maxLogScale
+              << " avg=" << avgLogScale << std::endl;
+    std::cout << "Scale stats (world): min=" << expf(minLogScale)
+              << " max=" << expf(maxLogScale)
+              << " avg=" << expf(avgLogScale) << std::endl;
+    
     return gaussians;
 }
+
+
+
+
+
 
 
 int main(int argc, char* argv[]) {
@@ -74,7 +201,7 @@ int main(int argc, char* argv[]) {
     std::string colmapPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/";
     std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4";
     std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
-    size_t numEpochs = 6;  // Train for 10 epochs
+    size_t numEpochs = 20;  // Train for 10 epochs
     bool viewOnly = false;
     std::string viewPlyPath = "";
     

@@ -17,18 +17,39 @@
 // Paper's recommended thresholds (from official 3DGS)
 static constexpr float GRAD_THRESHOLD = 0.0002f;      // densify_grad_threshold
 static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  // min_opacity
-static constexpr float PERCENT_DENSE = 0.01f;         // percent_dense for clone vs split
+static constexpr float PERCENT_DENSE = 0.001f;         // percent_dense for clone vs split
 static constexpr size_t MAX_GAUSSIANS = 500000;
-static constexpr size_t DENSIFY_STOP_ITER = 15000;
+static constexpr size_t DENSIFY_FROM_ITER = 500;      // Start densification
+static constexpr size_t DENSIFY_UNTIL_ITER = 15000;   // Stop densification
+static constexpr float MAX_SCALE_LOG = 4.0f;          // Clamp scale values
 
 // Scene extent - will be set during initialization
 static float sceneExtent = 1.0f;  // Default, should be set to scene diagonal
+
+float computeApproxScreenRadius(const Gaussian& g,
+                                 float focalLength,
+                                 float avgDepth,
+                                 float imageWidth) {
+    // Get max scale in world units
+    float maxScale = fmaxf(fmaxf(
+        expf(std::clamp(g.scale.x, -4.0f, 4.0f)),
+        expf(std::clamp(g.scale.y, -4.0f, 4.0f))),
+        expf(std::clamp(g.scale.z, -4.0f, 4.0f)));
+    
+    // Approximate screen radius: focal * scale / depth * multiplier
+    // 3 sigma covers 99% of Gaussian, so multiply by 3
+    float screenRadius = focalLength * maxScale * 3.0f / avgDepth;
+    
+    // Normalize to fraction of image width
+    return screenRadius / imageWidth;
+}
+
 
 void DensityController::setSceneExtent(float extent) {
     sceneExtent = extent;
     std::cout << "Density control scene extent set to: " << extent << std::endl;
     std::cout << "  Split threshold: " << (PERCENT_DENSE * extent) << " world units" << std::endl;
-    std::cout << "  Prune threshold: " << (0.1f * extent) << " world units" << std::endl;
+    std::cout << "  Prune threshold (world): " << (0.1f * extent) << " world units" << std::endl;
 }
 
 DensityController::DensityController(MTL::Device* device, MTL::Library* library)
@@ -38,32 +59,64 @@ DensityController::DensityController(MTL::Device* device, MTL::Library* library)
     gradientAccum = device->newBuffer(maxGaussians * sizeof(float), MTL::ResourceStorageModeShared);
     gradientCount = device->newBuffer(maxGaussians * sizeof(uint32_t), MTL::ResourceStorageModeShared);
     markerBuffer = device->newBuffer(maxGaussians * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    
+    // NEW: Store position gradients for gradient-directed cloning
+    positionGradAccum = device->newBuffer(maxGaussians * sizeof(simd_float3), MTL::ResourceStorageModeShared);
+    
+    resetAccumulator(maxGaussians);
 }
 
 DensityController::~DensityController() {
-    gradientAccum->release();
-    gradientCount->release();
-    markerBuffer->release();
+    if (gradientAccum) gradientAccum->release();
+    if (gradientCount) gradientCount->release();
+    if (markerBuffer) markerBuffer->release();
+    if (positionGradAccum) positionGradAccum->release();
 }
 
 void DensityController::resetAccumulator(size_t gaussianCount) {
     memset(gradientAccum->contents(), 0, gaussianCount * sizeof(float));
     memset(gradientCount->contents(), 0, gaussianCount * sizeof(uint32_t));
+    memset(positionGradAccum->contents(), 0, gaussianCount * sizeof(simd_float3));
 }
 
-void DensityController::accumulateGradients(MTL::CommandQueue *queue, MTL::Buffer *gradients, size_t gaussianCount) {
+void DensityController::accumulateGradients(MTL::CommandQueue* queue,
+                                            MTL::Buffer* gradients,
+                                            size_t gaussianCount) {
+    // Accumulate gradient magnitudes for density control decisions
+    // This runs on CPU for simplicity - could be GPU compute shader
+    
+    // Must match gradients.hpp and tiled_shaders.metal
+    struct GaussianGradients {
+        float position_x, position_y, position_z;
+        float opacity;
+        float scale_x, scale_y, scale_z;
+        float _pad1;
+        simd_float4 rotation;
+        float sh[12];
+        float viewspace_grad_x;  // Screen-space gradient for density control
+        float viewspace_grad_y;
+        float _pad2, _pad3;
+    };
+    
     GaussianGradients* grads = (GaussianGradients*)gradients->contents();
-    float* accum = (float*)gradientAccum->contents();
-    uint32_t* count = (uint32_t*)gradientCount->contents();
+    float* accumGrad = (float*)gradientAccum->contents();
+    uint32_t* counts = (uint32_t*)gradientCount->contents();
+    simd_float3* posGradAccum = (simd_float3*)positionGradAccum->contents();
     
     for (size_t i = 0; i < gaussianCount; i++) {
-        float gradMag = sqrtf(grads[i].position_x * grads[i].position_x +
-                              grads[i].position_y * grads[i].position_y +
-                              grads[i].position_z * grads[i].position_z);
+        // Use VIEWSPACE (screen-space) gradients for density control
+        // This matches official 3DGS which uses viewspace_point_tensor.grad[:, :2]
+        float gradMag = sqrtf(grads[i].viewspace_grad_x * grads[i].viewspace_grad_x +
+                              grads[i].viewspace_grad_y * grads[i].viewspace_grad_y);
         
         if (!std::isnan(gradMag) && !std::isinf(gradMag)) {
-            accum[i] += gradMag;
-            count[i]++;
+            accumGrad[i] += gradMag;
+            counts[i]++;
+            
+            // Accumulate position gradients for gradient-directed cloning
+            posGradAccum[i].x += grads[i].position_x;
+            posGradAccum[i].y += grads[i].position_y;
+            posGradAccum[i].z += grads[i].position_z;
         }
     }
 }
@@ -76,35 +129,39 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
                                       size_t iteration,
                                       float gradThreshold,
                                       float minOpacity,
-                                      float maxScale) {
+                                      float maxScale,
+                                      float focalLength,
+                                      float imageWidth,
+                                      float avgDepth) {
+
     DensityStats stats = {0, 0, 0};
     
-    bool canDensify = (iteration < DENSIFY_STOP_ITER) && (gaussianCount < MAX_GAUSSIANS);
+    // Check if we should densify at this iteration
+    bool canDensify = (iteration >= DENSIFY_FROM_ITER && iteration < DENSIFY_UNTIL_ITER);
+    
+    if (!canDensify && iteration >= DENSIFY_UNTIL_ITER) {
+        std::cout << "Densification stopped at iteration " << iteration << std::endl;
+        resetAccumulator(gaussianCount);
+        return stats;
+    }
     
     Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
+    uint32_t* markers = (uint32_t*)markerBuffer->contents();
     float* accumGrad = (float*)gradientAccum->contents();
     uint32_t* counts = (uint32_t*)gradientCount->contents();
-    uint32_t* markers = (uint32_t*)markerBuffer->contents();
+    simd_float3* posGradAccum = (simd_float3*)positionGradAccum->contents();
     
-    const float MAX_SCALE_LOG = 10.0f;  // Must match tiled_shaders.metal MAX_SCALE
+    // Viewspace pruning threshold (20% of image width is too big)
+    const float maxScreenFraction = 0.2f;
     
-    // First pass: mark Gaussians
+    // First pass: decide what to do with each Gaussian
     for (size_t i = 0; i < gaussianCount; i++) {
         Gaussian& g = gaussians[i];
         
-        // Prune corrupted Gaussians
-        if (std::isnan(g.position.x) || std::isnan(g.position.y) || std::isnan(g.position.z) ||
-            std::isinf(g.position.x) || std::isinf(g.position.y) || std::isinf(g.position.z) ||
-            std::abs(g.position.x) > 1e6 || std::abs(g.position.y) > 1e6 || std::abs(g.position.z) > 1e6) {
-            markers[i] = 1;  // Prune
-            stats.numPruned++;
-            continue;
-        }
+        // Compute sigmoid opacity
+        float opacity = 1.0f / (1.0f + expf(-g.opacity));
         
-        // Compute opacity after sigmoid (scale is log, opacity is raw)
-        float rawOp = std::clamp(g.opacity, -8.0f, 8.0f);
-        float opacity = 1.0f / (1.0f + expf(-rawOp));
-        
+        // Get average gradient
         float avgGrad = (counts[i] > 0) ? (accumGrad[i] / counts[i]) : 0.0f;
         
         // Compute max scale in WORLD units (apply exp to log scale)
@@ -125,8 +182,14 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             shouldPrune = true;
         }
         
+        // Viewspace-based pruning: prune Gaussians with large screen-space footprints
+        float screenFraction = computeApproxScreenRadius(g, focalLength, avgDepth, imageWidth);
+        if (screenFraction > maxScreenFraction) {
+            shouldPrune = true;
+        }
+        
         if (shouldPrune) {
-            markers[i] = 1;
+            markers[i] = 1;  // Prune
             stats.numPruned++;
         } else if (canDensify && avgGrad > GRAD_THRESHOLD) {
             // Official logic: clone if small, split if large
@@ -147,21 +210,22 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     
     if (newCount > MAX_GAUSSIANS) {
         size_t excess = newCount - MAX_GAUSSIANS;
-        size_t reduced = 0;
         
-        for (size_t i = 0; i < gaussianCount && reduced < excess; i++) {
+        // Reduce clones first
+        for (size_t i = 0; i < gaussianCount && excess > 0; i++) {
             if (markers[i] == 2) {
                 markers[i] = 0;
                 stats.numCloned--;
-                reduced++;
+                excess--;
             }
         }
         
-        for (size_t i = 0; i < gaussianCount && reduced < excess; i++) {
+        // Then reduce splits
+        for (size_t i = 0; i < gaussianCount && excess > 0; i++) {
             if (markers[i] == 3) {
                 markers[i] = 0;
                 stats.numSplit--;
-                reduced++;
+                excess--;
             }
         }
         
@@ -191,16 +255,34 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             newPositions[writeIdx] = g.position;
             writeIdx++;
         } else if (marker == 2) {
-            // Clone
+            // Clone: Keep original
             newGaussians[writeIdx] = g;
             newPositions[writeIdx] = g.position;
             writeIdx++;
             
+            // Create clone moved in gradient direction (official behavior)
             Gaussian cloned = g;
-            float perturbScale = 0.001f;
-            cloned.position.x += perturbScale * ((float)rand() / RAND_MAX - 0.5f);
-            cloned.position.y += perturbScale * ((float)rand() / RAND_MAX - 0.5f);
-            cloned.position.z += perturbScale * ((float)rand() / RAND_MAX - 0.5f);
+            
+            // Get accumulated position gradient
+            simd_float3 posGrad = posGradAccum[i];
+            float gradNorm = sqrtf(posGrad.x * posGrad.x + posGrad.y * posGrad.y + posGrad.z * posGrad.z);
+            
+            if (gradNorm > 1e-8f) {
+                // Normalize and scale by actual Gaussian size
+                float actualScale = expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG));
+                float moveDistance = actualScale * 2.0f;  // Move by 2x the Gaussian's scale
+                
+                cloned.position.x += (posGrad.x / gradNorm) * moveDistance;
+                cloned.position.y += (posGrad.y / gradNorm) * moveDistance;
+                cloned.position.z += (posGrad.z / gradNorm) * moveDistance;
+            } else {
+                // Fallback: small random perturbation proportional to scale
+                float actualScale = expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG));
+                cloned.position.x += actualScale * ((float)rand() / RAND_MAX - 0.5f);
+                cloned.position.y += actualScale * ((float)rand() / RAND_MAX - 0.5f);
+                cloned.position.z += actualScale * ((float)rand() / RAND_MAX - 0.5f);
+            }
+            
             newGaussians[writeIdx] = cloned;
             newPositions[writeIdx] = cloned.position;
             writeIdx++;
@@ -210,22 +292,27 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             float logScaleFactor = logf(scaleFactor);  // Add this to log scale
             
             // Get actual scale (apply exp to log scale)
-            // Use same MAX_SCALE_LOG as the rest of the codebase
             simd_float3 scale = simd_make_float3(
                 expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
                 expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
                 expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG))
             );
             
-            // Offset along major axis
+            // Sample offset from Gaussian distribution (official uses PDF sampling)
+            // Simplified: offset along major axis scaled by actual size
             simd_float3 offset;
-            if (scale.x >= scale.y && scale.x >= scale.z) {
-                offset = simd_make_float3(scale.x * 0.5f, 0, 0);
-            } else if (scale.y >= scale.z) {
-                offset = simd_make_float3(0, scale.y * 0.5f, 0);
-            } else {
-                offset = simd_make_float3(0, 0, scale.z * 0.5f);
+            float maxS = fmaxf(fmaxf(scale.x, scale.y), scale.z);
+            
+            // Random direction scaled by Gaussian
+            float rx = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+            float ry = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+            float rz = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+            float rNorm = sqrtf(rx*rx + ry*ry + rz*rz);
+            if (rNorm > 0.001f) {
+                rx /= rNorm; ry /= rNorm; rz /= rNorm;
             }
+            
+            offset = simd_make_float3(rx * scale.x, ry * scale.y, rz * scale.z);
             
             // Rotate offset by Gaussian's rotation
             // q.x=w, q.y=x, q.z=y, q.w=z

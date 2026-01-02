@@ -26,13 +26,19 @@ public:
     void step(MTL::CommandQueue* queue,
               MTL::Buffer* gausians,
               MTL::Buffer* gradients,
-              float lr_position = 0.00001f,
-              float lr_scale = 0.001f,
-              float lr_rotation = 0.0005f,
-              float lr_opacity = 0.01f,
-              float lr_sh = 0.001f);
+              float lr_position = 0.00016f,   // Official default
+              float lr_scale = 0.005f,        // Official default
+              float lr_rotation = 0.001f,     // Official default
+              float lr_opacity = 0.05f,       // Official default
+              float lr_sh = 0.0025f);         // Official default
     
     void reset();
+    
+    // Resize buffers when Gaussian count increases (after density control)
+    void resizeIfNeeded(size_t newNumGaussians);
+    
+    // Reset opacity momentum after opacity reset
+    void resetOpacityMomentum();
 
 private:
     MTL::Device* device;
@@ -54,4 +60,6 @@ private:
     
     size_t numGaussians;
     uint32_t timestep = 0;
+    
+    void allocateBuffers(size_t count);
 };

@@ -113,7 +113,9 @@ std::vector<ColmapImage> loadImages(const std::string& path) {
 
         ColmapImage image;
         image.id = image_id;
-        image.rotation = simd_make_float4(static_cast<float>(qx), static_cast<float>(qy), static_cast<float>(qz), static_cast<float>(qw));
+        // Store quaternion as float4(.x=w, .y=x, .z=y, .w=z) to match Gaussian convention
+        // COLMAP binary format reads: qw, qx, qy, qz (in that order)
+        image.rotation = simd_make_float4(static_cast<float>(qw), static_cast<float>(qx), static_cast<float>(qy), static_cast<float>(qz));
         image.translation = simd_make_float3(static_cast<float>(tx), static_cast<float>(ty), static_cast<float>(tz));
         image.cameraId = cameraId;
         image.filename = name;

@@ -20,11 +20,16 @@ AdamOptimizer::AdamOptimizer(MTL::Device* device, MTL::Library* library, size_t 
     
     func->release();
     
-    size_t posSize = numGaussians * sizeof(simd_float3);
-    size_t scaleSize = numGaussians * sizeof(simd_float3);
-    size_t rotSize = numGaussians * sizeof(simd_float4);
-    size_t opacitySize = numGaussians * sizeof(float);
-    size_t shSize = numGaussians * 12 * sizeof(float);
+    allocateBuffers(numGaussians);
+    reset();
+}
+
+void AdamOptimizer::allocateBuffers(size_t count) {
+    size_t posSize = count * sizeof(simd_float3);
+    size_t scaleSize = count * sizeof(simd_float3);
+    size_t rotSize = count * sizeof(simd_float4);
+    size_t opacitySize = count * sizeof(float);
+    size_t shSize = count * 12 * sizeof(float);
     
     m_position = device->newBuffer(posSize, MTL::ResourceStorageModeShared);
     m_scale = device->newBuffer(scaleSize, MTL::ResourceStorageModeShared);
@@ -39,8 +44,6 @@ AdamOptimizer::AdamOptimizer(MTL::Device* device, MTL::Library* library, size_t 
     v_sh = device->newBuffer(shSize, MTL::ResourceStorageModeShared);
     
     paramsBuffer = device->newBuffer(sizeof(AdamParams), MTL::ResourceStorageModeShared);
-    
-    reset();
 }
 
 AdamOptimizer::~AdamOptimizer() {
@@ -70,6 +73,50 @@ void AdamOptimizer::reset() {
     memset(v_rotation->contents(), 0, v_rotation->length());
     memset(v_opacity->contents(), 0, v_opacity->length());
     memset(v_sh->contents(), 0, v_sh->length());
+}
+
+void AdamOptimizer::resizeIfNeeded(size_t newNumGaussians) {
+    if (newNumGaussians <= numGaussians) return;
+    
+    std::cout << "Resizing optimizer buffers from " << numGaussians << " to " << newNumGaussians << std::endl;
+    
+    auto resizeBuffer = [this](MTL::Buffer*& buf, size_t newSize) {
+        MTL::Buffer* newBuf = device->newBuffer(newSize, MTL::ResourceStorageModeShared);
+        // Copy existing data
+        size_t copySize = std::min(buf->length(), newSize);
+        memcpy(newBuf->contents(), buf->contents(), copySize);
+        // Zero-initialize new space
+        if (newSize > buf->length()) {
+            memset((char*)newBuf->contents() + buf->length(), 0, newSize - buf->length());
+        }
+        buf->release();
+        buf = newBuf;
+    };
+    
+    size_t posSize = newNumGaussians * sizeof(simd_float3);
+    size_t scaleSize = newNumGaussians * sizeof(simd_float3);
+    size_t rotSize = newNumGaussians * sizeof(simd_float4);
+    size_t opacitySize = newNumGaussians * sizeof(float);
+    size_t shSize = newNumGaussians * 12 * sizeof(float);
+    
+    resizeBuffer(m_position, posSize);
+    resizeBuffer(m_scale, scaleSize);
+    resizeBuffer(m_rotation, rotSize);
+    resizeBuffer(m_opacity, opacitySize);
+    resizeBuffer(m_sh, shSize);
+    resizeBuffer(v_position, posSize);
+    resizeBuffer(v_scale, scaleSize);
+    resizeBuffer(v_rotation, rotSize);
+    resizeBuffer(v_opacity, opacitySize);
+    resizeBuffer(v_sh, shSize);
+    
+    numGaussians = newNumGaussians;
+}
+
+void AdamOptimizer::resetOpacityMomentum() {
+    // Reset momentum for opacity to allow fresh learning after opacity reset
+    memset(m_opacity->contents(), 0, numGaussians * sizeof(float));
+    memset(v_opacity->contents(), 0, numGaussians * sizeof(float));
 }
 
 void AdamOptimizer::step(MTL::CommandQueue* queue,
@@ -120,3 +167,4 @@ void AdamOptimizer::step(MTL::CommandQueue* queue,
     cmd->commit();
     cmd->waitUntilCompleted();
 }
+

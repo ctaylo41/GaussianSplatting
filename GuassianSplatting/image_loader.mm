@@ -16,15 +16,9 @@ MTL::Texture* loadImageAsTexture(MTL::Device* device, const std::string& path) {
     assert(image!=NULL);
     
     size_t bytesPerRow = 4 * width;
-    unsigned char* tempRow = new unsigned char[bytesPerRow];
-    for (int y = 0; y < height / 2; y++) {
-        unsigned char* topRow = image + y * bytesPerRow;
-        unsigned char* bottomRow = image + (height - 1 - y) * bytesPerRow;
-        memcpy(tempRow, topRow, bytesPerRow);
-        memcpy(topRow, bottomRow, bytesPerRow);
-        memcpy(bottomRow, tempRow, bytesPerRow);
-    }
-    delete[] tempRow; 
+    // NOTE: Do NOT flip the image. COLMAP uses top-left origin (Y-down),
+    // and Metal textures also have top-left origin (row 0 = top).
+    // The projection matrix handles any Y-coordinate mapping for NDC.
     
     MTL::TextureDescriptor* textureDescriptor = MTL::TextureDescriptor::alloc()->init();
     textureDescriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);

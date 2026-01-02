@@ -73,6 +73,13 @@ struct GaussianGradients {
     float _pad1;
     float4 rotation;
     float sh[12];
+    
+    // Viewspace (screen-space) gradients for density control
+    // Official 3DGS uses these for densification decisions
+    float viewspace_grad_x;
+    float viewspace_grad_y;
+    float _pad2;
+    float _pad3;
 };
 
 constant float SH_C0 = 0.28209479177387814f;
@@ -500,11 +507,17 @@ kernel void tiledBackward(
         
         // ===== Screen position gradient =====
         // power = -0.5 * (conic.x * d.x^2 + 2 * conic.y * d.x * d.y + conic.z * d.y^2)
-        // d(power)/d(screenPos) = -d(power)/d(d) = conic * d (for symmetric quadratic)
-        float2 dL_dScreenPos = dL_dG * G * float2(
-            p.conic.x * d.x + p.conic.y * d.y,
-            p.conic.y * d.x + p.conic.z * d.y
-        );
+        // G = exp(power)
+        // dG/d(d) = G * dpower/d(d) = G * (-0.5) * 2 * [conic.x*dx + conic.y*dy, conic.y*dx + conic.z*dy]
+        //         = -G * [conic.x*dx + conic.y*dy, conic.y*dx + conic.z*dy]
+        // Official 3DGS uses: dG_ddelx = -gdx * con_o.x - gdy * con_o.y (note negative sign!)
+        // where gdx = G * d.x, gdy = G * d.y
+        float gdx = G * d.x;
+        float gdy = G * d.y;
+        float dG_ddelx = -gdx * p.conic.x - gdy * p.conic.y;
+        float dG_ddely = -gdy * p.conic.z - gdx * p.conic.y;
+        
+        float2 dL_dScreenPos = dL_dG * float2(dG_ddelx, dG_ddely);
         
         // ===== World position gradient =====
         // Chain rule: dL/dViewPos = dL/dScreenPos * dScreenPos/dViewPos
@@ -693,6 +706,13 @@ kernel void tiledBackward(
             clamp(dL_dWorldPos.y, -clampVal, clampVal), memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_z,
             clamp(dL_dWorldPos.z, -clampVal, clampVal), memory_order_relaxed);
+        
+        // Viewspace (screen-space) gradients for density control
+        // Official 3DGS uses norm of these 2D gradients for densification
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_x,
+            clamp(dL_dScreenPos.x, -clampVal, clampVal), memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_y,
+            clamp(dL_dScreenPos.y, -clampVal, clampVal), memory_order_relaxed);
         
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_x,
             clamp(dL_dLogScale.x, -clampVal, clampVal), memory_order_relaxed);

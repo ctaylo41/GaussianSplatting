@@ -18,4 +18,11 @@ struct GaussianGradients {
     float _pad1;
     simd_float4 rotation;
     float sh[12];
+    
+    // Viewspace (screen-space) gradients for density control
+    // Official 3DGS uses these for densification decisions, not world-space gradients
+    float viewspace_grad_x;  // dL/dScreenPos.x
+    float viewspace_grad_y;  // dL/dScreenPos.y
+    float _pad2;
+    float _pad3;
 };

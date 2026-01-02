@@ -26,9 +26,12 @@ public:
                        MTL::Buffer* gradientAccum,
                        size_t& gaussianCount,
                        size_t iteration,
-                       float gradThreshold = 0.002f,
+                       float gradThreshold = 0.0002f,
                        float minOpacity = 0.005f,
-                       float maxScale = 0.5f);
+                       float maxScale = 0.5f,
+                       float focalLength = 500.0f,
+                       float imageWidth = 800.0f,
+                       float avgDepth = 5.0f);
     
     void accumulateGradients(MTL::CommandQueue* queue,
                              MTL::Buffer* gradients,
@@ -45,6 +48,9 @@ private:
     MTL::Buffer* gradientAccum;
     MTL::Buffer* gradientCount;
     MTL::Buffer* markerBuffer;
+    
+    // NEW: Store position gradients for gradient-directed cloning
+    MTL::Buffer* positionGradAccum;
     
     size_t maxGaussians;
 };

@@ -347,11 +347,13 @@ void MTLEngine::render(Camera& camera) {
         
         // COLMAP uses OpenCV convention: +Z forward, Y-down
         // Build projection matrix in column-major format directly (like projectionFromColmap)
+        // Projection matrix matching projectionFromColmap() for consistency
+        // COLMAP Y-down + Metal texture top-left origin = NO Y flip needed
         simd_float4x4 proj = {0};
         proj.columns[0][0] = 2.0f * scaledFx / windowWidth;
-        proj.columns[1][1] = -2.0f * scaledFy / windowHeight;  // Y flip for COLMAP Y-down
-        proj.columns[2][0] = 1.0f - 2.0f * cx / windowWidth;
-        proj.columns[2][1] = 2.0f * cy / windowHeight - 1.0f;
+        proj.columns[1][1] = 2.0f * scaledFy / windowHeight;  // POSITIVE: matches projectionFromColmap()
+        proj.columns[2][0] = 2.0f * cx / windowWidth - 1.0f;  // Consistent offset formula
+        proj.columns[2][1] = 2.0f * cy / windowHeight - 1.0f; // Consistent offset formula
         proj.columns[2][2] = far / (far - near);
         proj.columns[2][3] = 1.0f;  // clipW = viewZ (COLMAP +Z forward)
         proj.columns[3][2] = -(far * near) / (far - near);
@@ -523,17 +525,77 @@ void MTLEngine::loadTrainingData(const ColmapData& colmap, const std::string& im
 }
 
 simd_float4x4 MTLEngine::viewMatrixFromColmap(simd_float4 quat, simd_float3 translation) {
-    // COLMAP loader stores quaternion as: quat = (qx, qy, qz, qw)
-    // So quat.x=qx, quat.y=qy, quat.z=qz, quat.w=qw
-    float x = quat.x, y = quat.y, z = quat.z, w = quat.w;
+    // Quaternion convention: float4(.x=w, .y=x, .z=y, .w=z)
+    // This matches the Gaussian rotation convention used throughout the codebase
+    float w = quat.x, x = quat.y, y = quat.z, z = quat.w;
     
-    // COLMAP stores world-to-camera rotation and camera-space translation
-    // p_cam = R * p_world + t
-    // So the view matrix is simply [R | t]
+    // COLMAP stores world-to-camera rotation R and camera-space translation t
+    // Transform: p_cam = R * p_world + t
+    //
+    // Standard quaternion to rotation matrix (R):
+    // R = | 1-2(y²+z²)   2(xy-wz)    2(xz+wy)  |
+    //     | 2(xy+wz)    1-2(x²+z²)   2(yz-wx)  |
+    //     | 2(xz-wy)     2(yz+wx)   1-2(x²+y²) |
+    //
+    // Metal uses column-major matrices and (matrix * vector) computes:
+    //   result[i] = dot(row i of matrix, vector)
+    // where row i of matrix = (col0[i], col1[i], col2[i], col3[i])
+    //
+    // For viewPos = viewMatrix * worldPos to compute R * worldPos + t:
+    // We need row 0 of viewMatrix to be row 0 of [R|t] = (R[0][0], R[0][1], R[0][2], t.x)
+    // In column-major storage: col0[0]=R[0][0], col1[0]=R[0][1], col2[0]=R[0][2], col3[0]=t.x
+    //
+    // So column j of viewMatrix should contain R[*][j] (j-th column of R) in its first 3 elements
+    // Wait no - we want row i of viewMatrix = row i of [R|t]
+    // Metal column major: row i is (col0[i], col1[i], col2[i], col3[i])
+    // So we need: col0[i] = R[i][0], col1[i] = R[i][1], col2[i] = R[i][2], col3[i] = t[i]
+    // This means: col j = (R[0][j], R[1][j], R[2][j], 0 or 1) = column j of R
+    //
+    // Build R (column-major, so R.columns[j] = j-th column of rotation matrix):
     matrix_float3x3 R;
+    // Column 0 of R: (R[0][0], R[1][0], R[2][0])
     R.columns[0] = simd_make_float3(1 - 2*(y*y + z*z), 2*(x*y + w*z), 2*(x*z - w*y));
+    // Column 1 of R: (R[0][1], R[1][1], R[2][1])
     R.columns[1] = simd_make_float3(2*(x*y - w*z), 1 - 2*(x*x + z*z), 2*(y*z + w*x));
+    // Column 2 of R: (R[0][2], R[1][2], R[2][2])
     R.columns[2] = simd_make_float3(2*(x*z + w*y), 2*(y*z - w*x), 1 - 2*(x*x + y*y));
+    
+    // Build 4x4 view matrix [R | t]
+    // For (matrix * vec4(pos, 1)) = R*pos + t:
+    // We need the 4x4 matrix such that row i = (R[i][0], R[i][1], R[i][2], t[i])
+    // In column major: col0 = (R[0][0], R[1][0], R[2][0], 0) = (R.columns[0], 0)... NO!
+    //
+    // Let me think again. In column-major:
+    //   viewMatrix.columns[j][i] = element at row i, col j
+    //
+    // We want: viewMatrix * vec4(p, 1) = vec4(R*p + t, 1)
+    //   result[0] = row0 · input = col0[0]*p.x + col1[0]*p.y + col2[0]*p.z + col3[0]*1
+    //             = R[0][0]*p.x + R[0][1]*p.y + R[0][2]*p.z + t.x  ✓
+    //
+    // So we need: col0[0] = R[0][0], col1[0] = R[0][1], col2[0] = R[0][2], col3[0] = t.x
+    //             col0[1] = R[1][0], col1[1] = R[1][1], col2[1] = R[1][2], col3[1] = t.y
+    //             etc.
+    //
+    // This means: columns[j] = (R[0][j], R[1][j], R[2][j], 0) for j=0,1,2
+    //             columns[3] = (t.x, t.y, t.z, 1)
+    //
+    // And R.columns[j] = (R[0][j], R[1][j], R[2][j]) which IS the j-th column of R matrix!
+    // So the original code was correct! Let me verify the quaternion formula...
+    //
+    // Standard quaternion to matrix (row-major R[row][col]):
+    //   R[0][0] = 1 - 2*(y*y + z*z)
+    //   R[0][1] = 2*(x*y - w*z)
+    //   R[0][2] = 2*(x*z + w*y)
+    //   R[1][0] = 2*(x*y + w*z)
+    //   R[1][1] = 1 - 2*(x*x + z*z)
+    //   R[1][2] = 2*(y*z - w*x)
+    //   R[2][0] = 2*(x*z - w*y)
+    //   R[2][1] = 2*(y*z + w*x)
+    //   R[2][2] = 1 - 2*(x*x + y*y)
+    //
+    // Column 0 should be (R[0][0], R[1][0], R[2][0]) = (1-2(y²+z²), 2(xy+wz), 2(xz-wy)) ✓
+    //
+    // OK the rotation matrix is correct. The issue must be elsewhere!
     
     simd_float4x4 view;
     view.columns[0] = simd_make_float4(R.columns[0], 0);
@@ -552,17 +614,31 @@ simd_float4x4 MTLEngine::projectionFromColmap(const ColmapCamera& cam, float nea
     float w = (float)cam.width;
     float h = (float)cam.height;
     
-    // COLMAP uses OpenCV convention: camera looks down +Z axis (objects in front have positive viewZ)
-    // COLMAP image Y-axis points DOWN (origin at top-left)
-    // Metal NDC: X=[-1,1] left-to-right, Y=[-1,1] bottom-to-top, Z=[0,1] near-to-far
-    // We flip Y in projection to match COLMAP's Y-down with Metal's Y-up NDC
+    // COLMAP projection: pixel_x = fx * X/Z + cx, pixel_y = fy * Y/Z + cy
+    // We want: screen_pos = (ndc * 0.5 + 0.5) * size  to equal COLMAP pixel coordinates
+    // 
+    // For X: ndc_x * 0.5 + 0.5 = (fx * X/Z + cx) / w
+    //        ndc_x = 2 * fx * X / (w * Z) + (2*cx/w - 1)
+    //
+    // For Y: ndc_y * 0.5 + 0.5 = (fy * Y/Z + cy) / h
+    //        ndc_y = 2 * fy * Y / (h * Z) + (2*cy/h - 1)
+    //
+    // Matrix form: clip = P * view, ndc = clip.xyz / clip.w
+    // With clip.w = Z (for COLMAP's +Z forward convention):
+    //   ndc_x = clip.x / Z = (P[0][0] * X + P[2][0] * Z) / Z = P[0][0] * X/Z + P[2][0]
+    //   ndc_y = clip.y / Z = (P[1][1] * Y + P[2][1] * Z) / Z = P[1][1] * Y/Z + P[2][1]
+    //
+    // Therefore: P[0][0] = 2*fx/w, P[2][0] = 2*cx/w - 1
+    //            P[1][1] = 2*fy/h, P[2][1] = 2*cy/h - 1
+    //            (NO NEGATIVE on fy - COLMAP Y-down matches Metal texture top-left origin)
+    
     simd_float4x4 proj = {0};
     proj.columns[0][0] = 2.0f * fx / w;
-    proj.columns[1][1] = -2.0f * fy / h;  // NEGATIVE to flip Y (COLMAP Y-down -> Metal Y-up)
-    proj.columns[2][0] = 1.0f - 2.0f * cx / w;  // X offset
-    proj.columns[2][1] = 2.0f * cy / h - 1.0f;  // Y offset (adjusted for flip)
+    proj.columns[1][1] = 2.0f * fy / h;  // POSITIVE: COLMAP Y-down, Metal texture origin top-left
+    proj.columns[2][0] = 2.0f * cx / w - 1.0f;
+    proj.columns[2][1] = 2.0f * cy / h - 1.0f;
     proj.columns[2][2] = farZ / (farZ - nearZ);
-    proj.columns[2][3] = 1.0f;  // POSITIVE: clipW = viewZ (COLMAP has +Z forward)
+    proj.columns[2][3] = 1.0f;  // clip.w = view.z (COLMAP +Z forward)
     proj.columns[3][2] = -(farZ * nearZ) / (farZ - nearZ);
     
     return proj;
@@ -803,6 +879,13 @@ float MTLEngine::trainStep(size_t imageIndex) {
                           << grads[i].position_y << "," << grads[i].position_z 
                           << ") opacity=" << grads[i].opacity 
                           << " sh0=" << grads[i].sh[0] << std::endl;
+                
+                // Print full SH gradient magnitude for this Gaussian
+                float avgSHGrad = 0;
+                for (int j = 0; j < 12; j++) {
+                    avgSHGrad += fabsf(grads[i].sh[j]);
+                }
+                std::cout << "SH grad magnitude: " << avgSHGrad << std::endl;
                 break;
             }
         }
@@ -812,13 +895,14 @@ float MTLEngine::trainStep(size_t imageIndex) {
     // Accumulate for density control
     densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
     
-    // Optimizer step - reduced learning rates to prevent explosion
+    // Optimizer step - learning rates matched to official 3DGS
+    // Official values from arguments/__init__.py in graphdeco-inria/gaussian-splatting
     optimizer->step(commandQueue, gaussianBuffer, gaussianGradients,
-                    0.00016f,  // position lr (official default)
-                    0.001f,    // scale lr (reduced from 0.005 to prevent elongation)
-                    0.001f,    // rotation lr (reduced for stability)
-                    0.05f,     // opacity lr
-                    0.0025f);  // sh lr (official default)
+                    0.00016f,  // position lr (official: position_lr_init = 0.00016)
+                    0.005f,    // scale lr (official: scaling_lr = 0.005)
+                    0.001f,    // rotation lr (official: rotation_lr = 0.001)
+                    0.025f,    // opacity lr (official: opacity_lr = 0.025)
+                    0.0025f);  // sh lr (official: feature_lr = 0.0025)
 //    Gaussian* g = (Gaussian*)gaussianBuffer->contents();
 //    float minSH = 1e10, maxSH = -1e10;
 //    for (size_t i = 0; i < std::min(gaussianCount, (size_t)1000); i++) {
@@ -830,12 +914,27 @@ float MTLEngine::trainStep(size_t imageIndex) {
 //    std::cout << "SH range: [" << minSH << ", " << maxSH << "]" << std::endl;
 
     Gaussian* g = (Gaussian*)gaussianBuffer->contents();
-    float avgOpacity = 0, avgZ = 0;
-    for (int i = 0; i < 100; i++) {
+    float avgOpacity = 0, avgZ = 0, avgX = 0, avgY = 0;
+    float avgScaleX = 0, avgScaleY = 0, avgScaleZ = 0;
+    float avgSH0 = 0, avgSH4 = 0, avgSH8 = 0;  // DC components for R, G, B
+    const int sampleCount = std::min((size_t)100, gaussianCount);
+    for (int i = 0; i < sampleCount; i++) {
         avgOpacity += 1.0f / (1.0f + exp(-g[i].opacity));  // sigmoid
+        avgX += g[i].position.x;
+        avgY += g[i].position.y;
         avgZ += g[i].position.z;
+        avgScaleX += exp(g[i].scale.x);  // log-scale to world
+        avgScaleY += exp(g[i].scale.y);
+        avgScaleZ += exp(g[i].scale.z);
+        avgSH0 += g[i].sh[0];   // R DC
+        avgSH4 += g[i].sh[4];   // G DC
+        avgSH8 += g[i].sh[8];   // B DC
     }
-    std::cout << "Avg opacity: " << avgOpacity/100 << " Avg Z: " << avgZ/100 << std::endl;
+    printf("Pos:(%.2f,%.2f,%.2f) Scale:%.4f Op:%.3f SH:(%.2f,%.2f,%.2f)\n",
+           avgX/sampleCount, avgY/sampleCount, avgZ/sampleCount,
+           (avgScaleX + avgScaleY + avgScaleZ) / (3 * sampleCount),
+           avgOpacity/sampleCount,
+           avgSH0/sampleCount, avgSH4/sampleCount, avgSH8/sampleCount);
 
     
     return loss;
@@ -853,6 +952,12 @@ void MTLEngine::updatePositionBuffer() {
 void MTLEngine::train(size_t numEpochs) {
     std::cout << "Starting training for " << numEpochs << " epochs..." << std::endl;
     std::cout << "Gaussians: " << gaussianCount << " | Images: " << trainingImages.size() << std::endl;
+    
+    // Training configuration (matching official 3DGS)
+    const size_t OPACITY_RESET_INTERVAL = 3000;
+    const size_t DENSIFY_FROM_ITER = 500;
+    const size_t DENSIFY_UNTIL_ITER = 15000;
+    const float OPACITY_RESET_VALUE = -4.6f;  // sigmoid^-1(0.01) ≈ -4.6
     
     auto startTime = std::chrono::high_resolution_clock::now();
     size_t totalIterations = 0;
@@ -872,15 +977,46 @@ void MTLEngine::train(size_t numEpochs) {
                           << "] Loss: " << (epochLoss / (imgIdx + 1)) << std::flush;
             }
             
-            // Density control
-            if (totalIterations % densityControlInterval == 0 && totalIterations > 500) {
+            // ============================================================
+            // OPACITY RESET (Critical for preventing floaters)
+            // Official 3DGS resets opacity every 3000 iterations
+            // ============================================================
+            if (totalIterations % OPACITY_RESET_INTERVAL == 0) {
+                std::cout << std::endl << "Resetting opacity at iteration " << totalIterations << std::endl;
+                
+                Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
+                for (size_t i = 0; i < gaussianCount; i++) {
+                    // Reset to low opacity (sigmoid(−4.6) ≈ 0.01)
+                    // This allows pruning to remove floaters on next density control
+                    gaussians[i].opacity = OPACITY_RESET_VALUE;
+                }
+                
+                // Also reset optimizer momentum for opacity to allow fresh learning
+                // (Optional but recommended - need to expose reset method in optimizer)
+            }
+            
+            // ============================================================
+            // DENSITY CONTROL
+            // Only run between iterations 500 and 15000
+            // ============================================================
+            bool shouldDensify = (totalIterations >= DENSIFY_FROM_ITER &&
+                                  totalIterations < DENSIFY_UNTIL_ITER &&
+                                  totalIterations % densityControlInterval == 0);
+            
+            if (shouldDensify) {
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
                                          nullptr, gaussianCount, totalIterations);
                 
+                // Resize gradient buffer if needed
                 if (gaussianGradients->length() < gaussianCount * sizeof(GaussianGradients)) {
                     gaussianGradients->release();
                     gaussianGradients = metalDevice->newBuffer(gaussianCount * sizeof(GaussianGradients),
                                                                MTL::ResourceStorageModeShared);
+                }
+                
+                // Resize optimizer buffers if needed
+                if (optimizer) {
+                    optimizer->resizeIfNeeded(gaussianCount);
                 }
             }
         }
@@ -900,56 +1036,4 @@ void MTLEngine::train(size_t numEpochs) {
     auto totalDuration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
     
     std::cout << "Training complete! Total time: " << totalDuration << "s" << std::endl;
-    
-    // Debug: Check color distribution after training
-    std::cout << "\n=== Color Debug After Training ===" << std::endl;
-    Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
-    
-    float minSH0 = FLT_MAX, maxSH0 = -FLT_MAX;
-    float minSH4 = FLT_MAX, maxSH4 = -FLT_MAX;
-    float minSH8 = FLT_MAX, maxSH8 = -FLT_MAX;
-    int validCount = 0;
-    float sumR = 0, sumG = 0, sumB = 0;
-    
-    for (size_t i = 0; i < gaussianCount; i++) {
-        float sh0 = gaussians[i].sh[0];
-        float sh4 = gaussians[i].sh[4];
-        float sh8 = gaussians[i].sh[8];
-        
-        if (!std::isnan(sh0) && !std::isnan(sh4) && !std::isnan(sh8)) {
-            minSH0 = std::min(minSH0, sh0);
-            maxSH0 = std::max(maxSH0, sh0);
-            minSH4 = std::min(minSH4, sh4);
-            maxSH4 = std::max(maxSH4, sh4);
-            minSH8 = std::min(minSH8, sh8);
-            maxSH8 = std::max(maxSH8, sh8);
-            
-            // Compute color: color = SH_C0 * sh_dc + 0.5
-            const float SH_C0 = 0.28209479f;
-            float r = SH_C0 * sh0 + 0.5f;
-            float g = SH_C0 * sh4 + 0.5f;
-            float b = SH_C0 * sh8 + 0.5f;
-            
-            sumR += std::clamp(r, 0.0f, 1.0f);
-            sumG += std::clamp(g, 0.0f, 1.0f);
-            sumB += std::clamp(b, 0.0f, 1.0f);
-            validCount++;
-        }
-    }
-    
-    std::cout << "SH[0] (R DC) range: [" << minSH0 << ", " << maxSH0 << "]" << std::endl;
-    std::cout << "SH[4] (G DC) range: [" << minSH4 << ", " << maxSH4 << "]" << std::endl;
-    std::cout << "SH[8] (B DC) range: [" << minSH8 << ", " << maxSH8 << "]" << std::endl;
-    std::cout << "Average color (RGB): (" << sumR/validCount << ", " << sumG/validCount << ", " << sumB/validCount << ")" << std::endl;
-    
-    // Print a few sample Gaussians
-    std::cout << "\nSample Gaussian Colors:" << std::endl;
-    for (int i = 0; i < 5 && i < (int)gaussianCount; i++) {
-        const float SH_C0 = 0.28209479f;
-        float r = std::clamp(SH_C0 * gaussians[i].sh[0] + 0.5f, 0.0f, 1.0f);
-        float g = std::clamp(SH_C0 * gaussians[i].sh[4] + 0.5f, 0.0f, 1.0f);
-        float b = std::clamp(SH_C0 * gaussians[i].sh[8] + 0.5f, 0.0f, 1.0f);
-        std::cout << "  Gaussian " << i << ": SH=(" << gaussians[i].sh[0] << ", " << gaussians[i].sh[4] << ", " << gaussians[i].sh[8]
-                  << ") -> Color=(" << r << ", " << g << ", " << b << ")" << std::endl;
-    }
 }

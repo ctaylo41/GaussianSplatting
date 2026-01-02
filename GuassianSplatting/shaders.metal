@@ -48,6 +48,9 @@ constant float SH_C1 = 0.4886025119029199f;
 // MAX_SCALE for viewing - higher limit to handle external PLY files
 // Training uses a stricter limit in tiled_shaders.metal
 constant float MAX_SCALE = 8.0f;  // Log scale range -8 to 8 for viewing compatibility
+// Stricter MAX_SCALE for training to prevent Gaussians from growing too large
+// MAX_SCALE = 2.0 gives exp(2) ≈ 7.4 world units max (more conservative)
+constant float MAX_SCALE_TRAIN = 2.0f;
 
 float3 evalSH(float sh[12], float3 dir) {
     // Use only DC term to match training (which only trains DC)
@@ -404,6 +407,7 @@ kernel void adamStep(
     }
     
     // Scale update (stays in log space)
+    // Use stricter MAX_SCALE_TRAIN during training to prevent elongation
     {
         float3 grad = clamp(float3(g.scale_x, g.scale_y, g.scale_z), -clip, clip);
         float3 m = beta1 * m_scale[tid] + (1.0 - beta1) * grad;
@@ -414,7 +418,7 @@ kernel void adamStep(
         float3 m_hat = m / bc1;
         float3 v_hat = v / bc2;
         float3 newScale = gaussians[tid].scale - lrs[1] * m_hat / (sqrt(v_hat) + epsilon);
-        gaussians[tid].scale = clamp(newScale, -MAX_SCALE, MAX_SCALE);
+        gaussians[tid].scale = clamp(newScale, -MAX_SCALE_TRAIN, MAX_SCALE_TRAIN);
     }
     
     // Rotation update
