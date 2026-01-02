@@ -39,10 +39,22 @@ public:
     
     // Reset opacity momentum after opacity reset
     void resetOpacityMomentum();
+    
+    // Debug: print Adam state for first Gaussian
+    void debugPrintState(int gaussianIdx = 0);
+    
+    // Get current timestep
+    uint32_t getTimestep() const { return timestep; }
+    
+    // Read GPU debug buffer after step
+    void printGPUDebug();
 
 private:
     MTL::Device* device;
     MTL::ComputePipelineState* adamPSO;
+    
+    // GPU debug buffer - 16 floats for debugging
+    MTL::Buffer* debugBuffer;
     
     MTL::Buffer* m_position;
     MTL::Buffer* m_scale;

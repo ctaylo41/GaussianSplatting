@@ -817,25 +817,6 @@ float MTLEngine::trainStep(size_t imageIndex,
     uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
     
     // DEBUG: Check view-space coordinates for first Gaussian
-    static bool viewDebugPrinted = false;
-    if (!viewDebugPrinted) {
-        Gaussian* gs = (Gaussian*)gaussianBuffer->contents();
-        simd_float4 worldPos = simd_make_float4(gs[0].position, 1.0f);
-        simd_float4 viewPos = matrix_multiply(uniforms.viewMatrix, worldPos);
-        simd_float4 clipPos = matrix_multiply(uniforms.viewProjectionMatrix, worldPos);
-        simd_float3 ndc = simd_make_float3(clipPos.x/clipPos.w, clipPos.y/clipPos.w, clipPos.z/clipPos.w);
-        simd_float2 screenPos = simd_make_float2((ndc.x * 0.5f + 0.5f) * actualWidth,
-                                                  (ndc.y * 0.5f + 0.5f) * actualHeight);
-        std::cout << "=== View Transform Debug ===" << std::endl;
-        std::cout << "World pos: (" << worldPos.x << ", " << worldPos.y << ", " << worldPos.z << ")" << std::endl;
-        std::cout << "View pos: (" << viewPos.x << ", " << viewPos.y << ", " << viewPos.z << ")" << std::endl;
-        std::cout << "Clip pos: (" << clipPos.x << ", " << clipPos.y << ", " << clipPos.z << ", w=" << clipPos.w << ")" << std::endl;
-        std::cout << "NDC: (" << ndc.x << ", " << ndc.y << ", " << ndc.z << ")" << std::endl;
-        std::cout << "Screen pos: (" << screenPos.x << ", " << screenPos.y << ")" << std::endl;
-        std::cout << "Screen size: " << actualWidth << "x" << actualHeight << std::endl;
-        viewDebugPrinted = true;
-    }
-    
     // Forward pass
     tiledRasterizer->forward(commandQueue, gaussianBuffer, gaussianCount, uniforms, renderTarget);
     
@@ -860,48 +841,6 @@ float MTLEngine::trainStep(size_t imageIndex,
     tiledRasterizer->backward(commandQueue, gaussianBuffer, gaussianGradients, gaussianCount,
                               uniforms, renderTarget, img.texture);
     
-    // DEBUG: Print gradient magnitudes once
-    static int gradDebugCount = 0;
-    if (gradDebugCount < 3) {
-        GaussianGradients* grads = (GaussianGradients*)gaussianGradients->contents();
-        float sumPosGrad = 0, sumOpacGrad = 0, sumSHGrad = 0, sumScaleGrad = 0;
-        int nonZeroCount = 0;
-        for (size_t i = 0; i < std::min(gaussianCount, (size_t)1000); i++) {
-            float posGrad = fabs(grads[i].position_x) + fabs(grads[i].position_y) + fabs(grads[i].position_z);
-            float scaleGrad = fabs(grads[i].scale_x) + fabs(grads[i].scale_y) + fabs(grads[i].scale_z);
-            sumPosGrad += posGrad;
-            sumOpacGrad += fabs(grads[i].opacity);
-            sumSHGrad += fabs(grads[i].sh[0]) + fabs(grads[i].sh[4]) + fabs(grads[i].sh[8]);
-            sumScaleGrad += scaleGrad;
-            if (posGrad > 0.0001) nonZeroCount++;
-        }
-        std::cout << "\n=== Gradient Debug (iter " << gradDebugCount << ") ===" << std::endl;
-        std::cout << "Avg position grad: " << sumPosGrad / 1000 << std::endl;
-        std::cout << "Avg opacity grad: " << sumOpacGrad / 1000 << std::endl;
-        std::cout << "Avg SH grad: " << sumSHGrad / 1000 << std::endl;
-        std::cout << "Avg scale grad: " << sumScaleGrad / 1000 << std::endl;
-        std::cout << "Non-zero grads in first 1000: " << nonZeroCount << std::endl;
-        
-        // Print first non-zero gradient
-        for (size_t i = 0; i < std::min(gaussianCount, (size_t)100); i++) {
-            if (fabs(grads[i].position_x) > 0.0001 || fabs(grads[i].opacity) > 0.0001) {
-                std::cout << "Gaussian " << i << " grad: pos=(" << grads[i].position_x << "," 
-                          << grads[i].position_y << "," << grads[i].position_z 
-                          << ") opacity=" << grads[i].opacity 
-                          << " sh0=" << grads[i].sh[0] << std::endl;
-                
-                // Print full SH gradient magnitude for this Gaussian
-                float avgSHGrad = 0;
-                for (int j = 0; j < 12; j++) {
-                    avgSHGrad += fabsf(grads[i].sh[j]);
-                }
-                std::cout << "SH grad magnitude: " << avgSHGrad << std::endl;
-                break;
-            }
-        }
-        gradDebugCount++;
-    }
-    
     // Accumulate for density control
     densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
     
@@ -912,39 +851,19 @@ float MTLEngine::trainStep(size_t imageIndex,
                     lr_rotation,   // rotation lr (official: rotation_lr = 0.001)
                     lr_opacity,    // opacity lr (official: opacity_lr = 0.025)
                     lr_sh);        // sh lr (official: feature_lr = 0.0025)
-//    Gaussian* g = (Gaussian*)gaussianBuffer->contents();
-//    float minSH = 1e10, maxSH = -1e10;
-//    for (size_t i = 0; i < std::min(gaussianCount, (size_t)1000); i++) {
-//        for (int j = 0; j < 12; j++) {
-//            minSH = std::min(minSH, g[i].sh[j]);
-//            maxSH = std::max(maxSH, g[i].sh[j]);
-//        }
-//    }
-//    std::cout << "SH range: [" << minSH << ", " << maxSH << "]" << std::endl;
-
-    Gaussian* g = (Gaussian*)gaussianBuffer->contents();
-    float avgOpacity = 0, avgZ = 0, avgX = 0, avgY = 0;
-    float avgScaleX = 0, avgScaleY = 0, avgScaleZ = 0;
-    float avgSH0 = 0, avgSH4 = 0, avgSH8 = 0;  // DC components for R, G, B
-    const int sampleCount = std::min((size_t)100, gaussianCount);
-    for (int i = 0; i < sampleCount; i++) {
-        avgOpacity += 1.0f / (1.0f + exp(-g[i].opacity));  // sigmoid
-        avgX += g[i].position.x;
-        avgY += g[i].position.y;
-        avgZ += g[i].position.z;
-        avgScaleX += exp(g[i].scale.x);  // log-scale to world
-        avgScaleY += exp(g[i].scale.y);
-        avgScaleZ += exp(g[i].scale.z);
-        avgSH0 += g[i].sh[0];   // R DC
-        avgSH4 += g[i].sh[4];   // G DC
-        avgSH8 += g[i].sh[8];   // B DC
+    
+    // Periodic stats every 200 images
+    if (saveCounter % 200 == 0) {
+        Gaussian* g = (Gaussian*)gaussianBuffer->contents();
+        float avgOpacity = 0, avgScale = 0;
+        const int sampleCount = std::min((size_t)100, gaussianCount);
+        for (int i = 0; i < sampleCount; i++) {
+            avgOpacity += 1.0f / (1.0f + exp(-g[i].opacity));
+            avgScale += (exp(g[i].scale.x) + exp(g[i].scale.y) + exp(g[i].scale.z)) / 3.0f;
+        }
+        printf("\n[iter %d] Gaussians: %zu | Avg opacity: %.3f | Avg scale: %.4f\n",
+               saveCounter, gaussianCount, avgOpacity / sampleCount, avgScale / sampleCount);
     }
-    printf("Pos:(%.2f,%.2f,%.2f) Scale:%.4f Op:%.3f SH:(%.2f,%.2f,%.2f)\n",
-           avgX/sampleCount, avgY/sampleCount, avgZ/sampleCount,
-           (avgScaleX + avgScaleY + avgScaleZ) / (3 * sampleCount),
-           avgOpacity/sampleCount,
-           avgSH0/sampleCount, avgSH4/sampleCount, avgSH8/sampleCount);
-
     
     return loss;
 }

@@ -21,6 +21,7 @@ int getParamCount(int modelId) {
     }
 }
 
+
 std::map<uint32_t, ColmapCamera> loadCameras(const std::string& path) {
     std::map<uint32_t, ColmapCamera> cameras;
     

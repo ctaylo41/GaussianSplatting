@@ -49,8 +49,8 @@ constant float SH_C1 = 0.4886025119029199f;
 // Training uses a stricter limit in tiled_shaders.metal
 constant float MAX_SCALE = 8.0f;  // Log scale range -8 to 8 for viewing compatibility
 // Stricter MAX_SCALE for training to prevent Gaussians from growing too large
-// MAX_SCALE = 2.0 gives exp(2) ≈ 7.4 world units max (more conservative)
-constant float MAX_SCALE_TRAIN = 2.0f;
+// MAX_SCALE = 4.0 gives exp(4) ≈ 54.6 world units max, allows initial scales like -2.9
+constant float MAX_SCALE_TRAIN = 4.0f;
 
 float3 evalSH(float sh[12], float3 dir) {
     // Use only DC term to match training (which only trains DC)
@@ -332,19 +332,27 @@ struct GaussianGradients {
     float _pad1;
     float4 rotation;
     float sh[12];
+    
+    // Viewspace (screen-space) gradients for density control
+    // Official 3DGS uses these for densification decisions
+    float viewspace_grad_x;
+    float viewspace_grad_y;
+    float _pad2;
+    float _pad3;
 };
 
 // Adam optimizer with safeguards
+// NOTE: Using float* instead of float3* to avoid Metal z-component corruption bug
 kernel void adamStep(
     device Gaussian* gaussians [[buffer(0)]],
     device const GaussianGradients* gradients [[buffer(1)]],
-    device float3* m_position [[buffer(2)]],
-    device float3* m_scale [[buffer(3)]],
+    device float* m_position [[buffer(2)]],   // float* with manual indexing
+    device float* m_scale [[buffer(3)]],      // float* with manual indexing
     device float4* m_rotation [[buffer(4)]],
     device float* m_opacity [[buffer(5)]],
     device float* m_sh [[buffer(6)]],
-    device float3* v_position [[buffer(7)]],
-    device float3* v_scale [[buffer(8)]],
+    device float* v_position [[buffer(7)]],   // float* with manual indexing
+    device float* v_scale [[buffer(8)]],      // float* with manual indexing
     device float4* v_rotation [[buffer(9)]],
     device float* v_opacity [[buffer(10)]],
     device float* v_sh [[buffer(11)]],
@@ -353,6 +361,7 @@ kernel void adamStep(
     constant float& beta2 [[buffer(14)]],
     constant float& epsilon [[buffer(15)]],
     constant uint2& params [[buffer(16)]],
+    device float* debugOut [[buffer(17)]],  // Debug buffer: 16 floats
     uint tid [[thread_position_in_grid]])
 {
     uint t = params.x;
@@ -380,12 +389,24 @@ kernel void adamStep(
     float clip = 0.5;
     
     // Position update with magnitude limiting
+    // Using manual indexing to avoid float3 z-component corruption
     {
         float3 grad = clamp(float3(g.position_x, g.position_y, g.position_z), -clip, clip);
-        float3 m = beta1 * m_position[tid] + (1.0 - beta1) * grad;
-        float3 v = beta2 * v_position[tid] + (1.0 - beta2) * grad * grad;
-        m_position[tid] = m;
-        v_position[tid] = v;
+        
+        // Read manually from float* buffer
+        float3 m_old = float3(m_position[tid * 3 + 0], m_position[tid * 3 + 1], m_position[tid * 3 + 2]);
+        float3 v_old = float3(v_position[tid * 3 + 0], v_position[tid * 3 + 1], v_position[tid * 3 + 2]);
+        
+        float3 m = beta1 * m_old + (1.0 - beta1) * grad;
+        float3 v = beta2 * v_old + (1.0 - beta2) * grad * grad;
+        
+        // Write manually to float* buffer
+        m_position[tid * 3 + 0] = m.x;
+        m_position[tid * 3 + 1] = m.y;
+        m_position[tid * 3 + 2] = m.z;
+        v_position[tid * 3 + 0] = v.x;
+        v_position[tid * 3 + 1] = v.y;
+        v_position[tid * 3 + 2] = v.z;
         
         float3 m_hat = m / bc1;
         float3 v_hat = v / bc2;
@@ -408,12 +429,25 @@ kernel void adamStep(
     
     // Scale update (stays in log space)
     // Use stricter MAX_SCALE_TRAIN during training to prevent elongation
+    // Using manual indexing to avoid float3 z-component corruption
     {
-        float3 grad = clamp(float3(g.scale_x, g.scale_y, g.scale_z), -clip, clip);
-        float3 m = beta1 * m_scale[tid] + (1.0 - beta1) * grad;
-        float3 v = beta2 * v_scale[tid] + (1.0 - beta2) * grad * grad;
-        m_scale[tid] = m;
-        v_scale[tid] = v;
+        float3 rawGrad = float3(g.scale_x, g.scale_y, g.scale_z);
+        float3 grad = clamp(rawGrad, -clip, clip);
+        
+        // Read manually from float* buffer
+        float3 m_old = float3(m_scale[tid * 3 + 0], m_scale[tid * 3 + 1], m_scale[tid * 3 + 2]);
+        float3 v_old = float3(v_scale[tid * 3 + 0], v_scale[tid * 3 + 1], v_scale[tid * 3 + 2]);
+        
+        float3 m = beta1 * m_old + (1.0 - beta1) * grad;
+        float3 v = beta2 * v_old + (1.0 - beta2) * grad * grad;
+        
+        // Write manually to float* buffer
+        m_scale[tid * 3 + 0] = m.x;
+        m_scale[tid * 3 + 1] = m.y;
+        m_scale[tid * 3 + 2] = m.z;
+        v_scale[tid * 3 + 0] = v.x;
+        v_scale[tid * 3 + 1] = v.y;
+        v_scale[tid * 3 + 2] = v.z;
         
         float3 m_hat = m / bc1;
         float3 v_hat = v / bc2;

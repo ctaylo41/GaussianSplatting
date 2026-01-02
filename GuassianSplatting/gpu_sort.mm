@@ -21,10 +21,11 @@ GPURadixSort::GPURadixSort(MTL::Device* device, size_t maxElements)
     valuesBuffer[0] = device->newBuffer(maxElements * sizeof(uint32_t), MTL::ResourceStorageModePrivate);
     valuesBuffer[1] = device->newBuffer(maxElements * sizeof(uint32_t), MTL::ResourceStorageModePrivate);
 
-    histogramBuffer = device->newBuffer(256 * sizeof(uint32_t), MTL::ResourceStorageModePrivate);
-    prefixSumBuffer = device->newBuffer(256 * sizeof(uint32_t), MTL::ResourceStorageModePrivate);
+    // Use Shared storage for buffers that need atomics - more reliable on some GPUs
+    histogramBuffer = device->newBuffer(256 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    prefixSumBuffer = device->newBuffer(256 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
     // Separate buffer for scatter - atomic ops will modify this, keeping prefixSumBuffer clean
-    scatterOffsetsBuffer = device->newBuffer(256 * sizeof(uint32_t), MTL::ResourceStorageModePrivate);
+    scatterOffsetsBuffer = device->newBuffer(256 * sizeof(uint32_t), MTL::ResourceStorageModeShared);
     
     // CPU sort buffer for fallback
     cpuSortedIndices = device->newBuffer(maxElements * sizeof(uint32_t), MTL::ResourceStorageModeShared);
