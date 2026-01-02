@@ -506,18 +506,43 @@ kernel void tiledBackward(
         float dL_dG = dL_dAlpha * sig;
         
         // ===== Screen position gradient =====
+        // d = pixel - screenPos (offset from Gaussian center to current pixel)
         // power = -0.5 * (conic.x * d.x^2 + 2 * conic.y * d.x * d.y + conic.z * d.y^2)
         // G = exp(power)
-        // dG/d(d) = G * dpower/d(d) = G * (-0.5) * 2 * [conic.x*dx + conic.y*dy, conic.y*dx + conic.z*dy]
-        //         = -G * [conic.x*dx + conic.y*dy, conic.y*dx + conic.z*dy]
-        // Official 3DGS uses: dG_ddelx = -gdx * con_o.x - gdy * con_o.y (note negative sign!)
-        // where gdx = G * d.x, gdy = G * d.y
+        //
+        // dG/d(d) = G * dpower/d(d) = -G * [conic.x*dx + conic.y*dy, conic.y*dx + conic.z*dy]
+        //
+        // But we want dG/d(screenPos), and since d = pixel - screenPos:
+        //   d(d)/d(screenPos) = -1
+        //   dG/d(screenPos) = dG/d(d) * (-1) = G * [conic.x*dx + conic.y*dy, ...]
+        //
+        // This matches official 3DGS where they add dL_dG * dG_ddelx directly to dL_dmean2D
+        // because dG_ddelx already accounts for the chain rule properly
         float gdx = G * d.x;
         float gdy = G * d.y;
+        
+        // Screen position gradient:
+        // Your d = pixel - center, official uses d = center - pixel (opposite signs)
+        //
+        // At a pixel to the RIGHT of gaussian center:
+        //   Your d.x = +positive, their d.x = -negative
+        //   Your gdx = G * (+pos) = +positive, their gdx = G * (-neg) = -negative  
+        //   Your dG_ddelx = -gdx * conic = -(+pos) = -negative
+        //   Their dG_ddelx = -gdx * conic = -(-neg) = +positive
+        //
+        // Chain rule for dG/d(center):
+        //   Your dd/d(center) = -1, their dd/d(center) = +1
+        //   Your dG/d(center) = dG_ddelx * (-1) = (-neg) * (-1) = +positive
+        //   Their dG/d(center) = dG_ddelx * (+1) = (+pos) * (+1) = +positive
+        //
+        // Both are positive (same physics), but computed values differ by sign!
+        // Official code adds: dL_dG * dG_ddelx (their positive value)
+        // Your code should add: dL_dG * (-dG_ddelx) = dL_dG * (positive value)
         float dG_ddelx = -gdx * p.conic.x - gdy * p.conic.y;
         float dG_ddely = -gdy * p.conic.z - gdx * p.conic.y;
         
-        float2 dL_dScreenPos = dL_dG * float2(dG_ddelx, dG_ddely);
+        // Negate because your d convention is opposite of official
+        float2 dL_dScreenPos = dL_dG * float2(-dG_ddelx, -dG_ddely);
         
         // ===== World position gradient =====
         // Chain rule: dL/dViewPos = dL/dScreenPos * dScreenPos/dViewPos
