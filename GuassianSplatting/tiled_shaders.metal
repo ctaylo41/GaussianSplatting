@@ -27,21 +27,25 @@ struct Gaussian {
 };  // Total: 100 bytes, padded to 112 for struct alignment
 
 // Projected Gaussian data for tiled rendering
+// CRITICAL: Use packed_float3 to match C++ memory layout (12 bytes, not 16)
+// float2 has 8-byte alignment, so we need explicit padding after tileMaxY
 struct ProjectedGaussian {
-    float2 screenPos;
-    float3 conic;       // Inverse 2D covariance
-    float depth;
-    float opacity;      // AFTER sigmoid (for rendering efficiency)
-    float3 color;
-    float radius;
-    uint tileMinX;
-    uint tileMinY;
-    uint tileMaxX;
-    uint tileMaxY;
-    float2 viewPos_xy;
+    float2 screenPos;       // 8 bytes, offset 0
+    packed_float3 conic;    // 12 bytes, offset 8 - Inverse 2D covariance
+    float depth;            // 4 bytes, offset 20
+    float opacity;          // 4 bytes, offset 24 - AFTER sigmoid (for rendering efficiency)
+    packed_float3 color;    // 12 bytes, offset 28
+    float radius;           // 4 bytes, offset 40
+    uint tileMinX;          // 4 bytes, offset 44
+    uint tileMinY;          // 4 bytes, offset 48
+    uint tileMaxX;          // 4 bytes, offset 52
+    uint tileMaxY;          // 4 bytes, offset 56
+    float _pad1;            // 4 bytes, offset 60 - explicit padding for float2 alignment
+    float2 viewPos_xy;      // 8 bytes, offset 64
     // Store cov2D for backward pass (needed for correct gradient)
-    float3 cov2D;       // (a, b, c) - the 2D covariance BEFORE inversion
-};
+    packed_float3 cov2D;    // 12 bytes, offset 72 - (a, b, c) - the 2D covariance BEFORE inversion
+    float _pad2;            // 4 bytes, offset 84 - padding to make struct 88 bytes (multiple of 8)
+};  // Total: 88 bytes
 
 struct TileRange {
     uint start;
@@ -257,7 +261,7 @@ kernel void projectGaussians(
     float disc = mid * mid - det;
     float l1 = mid + sqrt(max(0.1f, disc));
     float rawRadius = 3.0 * sqrt(l1);
-    proj.radius = min(ceil(rawRadius), MAX_RADIUS);
+    proj.radius = min(ceil(rawRadius), MAX_RADIUS);  // 2x for safety margin
     
     if (proj.radius <= 0) {
         projected[tid] = proj;

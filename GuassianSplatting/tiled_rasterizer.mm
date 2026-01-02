@@ -8,6 +8,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <cstddef>
 #include <vector>
 
 TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uint32_t maxGaussians)
@@ -21,6 +22,21 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
     , numTilesY(0)
 {
     createPipelines(library);
+    
+    // Verify struct alignment - should be 88 bytes
+    printf("sizeof(ProjectedGaussian) = %zu bytes (expected 88)\n", sizeof(ProjectedGaussian));
+    printf("  offsetof(screenPos) = %zu (expected 0)\n", offsetof(ProjectedGaussian, screenPos));
+    printf("  offsetof(conic) = %zu (expected 8)\n", offsetof(ProjectedGaussian, conic));
+    printf("  offsetof(depth) = %zu (expected 20)\n", offsetof(ProjectedGaussian, depth));
+    printf("  offsetof(opacity) = %zu (expected 24)\n", offsetof(ProjectedGaussian, opacity));
+    printf("  offsetof(color) = %zu (expected 28)\n", offsetof(ProjectedGaussian, color));
+    printf("  offsetof(radius) = %zu (expected 40)\n", offsetof(ProjectedGaussian, radius));
+    printf("  offsetof(tileMinX) = %zu (expected 44)\n", offsetof(ProjectedGaussian, tileMinX));
+    printf("  offsetof(tileMinY) = %zu (expected 48)\n", offsetof(ProjectedGaussian, tileMinY));
+    printf("  offsetof(tileMaxX) = %zu (expected 52)\n", offsetof(ProjectedGaussian, tileMaxX));
+    printf("  offsetof(tileMaxY) = %zu (expected 56)\n", offsetof(ProjectedGaussian, tileMaxY));
+    printf("  offsetof(viewPos_xy) = %zu (expected 64)\n", offsetof(ProjectedGaussian, viewPos_xy));
+    printf("  offsetof(cov2D) = %zu (expected 72)\n", offsetof(ProjectedGaussian, cov2D));
     
     // Allocate projection buffer
     projectedGaussians = device->newBuffer(maxGaussians * sizeof(ProjectedGaussian),
@@ -191,33 +207,61 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     // DEBUG: Print some projected Gaussian info (once)
     static bool debugPrinted = false;
     if (!debugPrinted) {
+        Gaussian* gPtr = (Gaussian*)gaussianBuffer->contents();
         int validCount = 0;
-        float avgConicMag = 0;
+        float avgRadius = 0, minRadius = 1e10, maxRadius = 0;
         float minDepth = 1e10, maxDepth = 0;
+        
+        std::cout << "\n=== Radius & Tile Debug ===" << std::endl;
+        
         for (uint32_t i = 0; i < std::min((uint32_t)100, (uint32_t)gaussianCount); i++) {
             const ProjectedGaussian& p = projPtr[i];
             if (p.radius > 0) {
-                float conicMag = fabs(p.conic.x) + fabs(p.conic.y) + fabs(p.conic.z);
-                avgConicMag += conicMag;
+                avgRadius += p.radius;
+                minRadius = std::min(minRadius, p.radius);
+                maxRadius = std::max(maxRadius, p.radius);
                 if (p.depth > 0) {
                     minDepth = std::min(minDepth, p.depth);
                     maxDepth = std::max(maxDepth, p.depth);
                 }
                 validCount++;
+                
+                // Detailed debug for first 5 valid Gaussians
                 if (validCount <= 5) {
-                    std::cout << "Gaussian " << i << ": screenPos=(" << p.screenPos.x << "," << p.screenPos.y
-                              << ") depth=" << p.depth << " radius=" << p.radius 
-                              << " conic=(" << p.conic.x << "," << p.conic.y << "," << p.conic.z
-                              << ") opacity=" << p.opacity << std::endl;
+                    const Gaussian& g = gPtr[i];
+                    float worldScaleMax = std::max({expf(g.scale.x), expf(g.scale.y), expf(g.scale.z)});
+                    
+                    // Expected tile bounds from radius
+                    int expectedMinTileX = std::max(0, int(p.screenPos.x - p.radius) / 16);
+                    int expectedMaxTileX = std::min(int(numTilesX - 1), int(p.screenPos.x + p.radius) / 16);
+                    int expectedMinTileY = std::max(0, int(p.screenPos.y - p.radius) / 16);
+                    int expectedMaxTileY = std::min(int(numTilesY - 1), int(p.screenPos.y + p.radius) / 16);
+                    uint32_t expectedTiles = (expectedMaxTileX - expectedMinTileX + 1) * (expectedMaxTileY - expectedMinTileY + 1);
+                    uint32_t actualTiles = (p.tileMaxX - p.tileMinX + 1) * (p.tileMaxY - p.tileMinY + 1);
+                    
+                    std::cout << "Gaussian " << i << ":" << std::endl;
+                    std::cout << "  World scale (exp): (" << expf(g.scale.x) << "," << expf(g.scale.y) << "," << expf(g.scale.z) << ") max=" << worldScaleMax << std::endl;
+                    std::cout << "  Screen pos: (" << p.screenPos.x << "," << p.screenPos.y << ") depth=" << p.depth << std::endl;
+                    std::cout << "  Screen radius (pixels): " << p.radius << " (should be ~3*sqrt(eigenvalue) of 2D cov)" << std::endl;
+                    std::cout << "  Cov2D: (" << p.cov2D[0] << "," << p.cov2D[1] << "," << p.cov2D[2] << ")" << std::endl;
+                    std::cout << "  Tile bounds: (" << p.tileMinX << "," << p.tileMinY << ") to (" << p.tileMaxX << "," << p.tileMaxY << ") = " << actualTiles << " tiles" << std::endl;
+                    std::cout << "  Expected tiles: (" << expectedMinTileX << "," << expectedMinTileY << ") to (" << expectedMaxTileX << "," << expectedMaxTileY << ") = " << expectedTiles << " tiles" << std::endl;
+                    
+                    // Sanity check: radius should be related to depth (closer = bigger)
+                    float roughScreenScale = worldScaleMax / p.depth;  // Very rough approximation
+                    std::cout << "  Rough screen scale (worldMax/depth): " << roughScreenScale << std::endl;
                 }
             }
         }
+        
         if (validCount > 0) {
-            std::cout << "Valid Gaussians in first 100: " << validCount 
-                      << ", avg conic magnitude: " << (avgConicMag/validCount) 
-                      << ", depth range: " << minDepth << " to " << maxDepth << std::endl;
+            std::cout << "\nSummary (first 100 Gaussians):" << std::endl;
+            std::cout << "  Valid: " << validCount << std::endl;
+            std::cout << "  Radius range: " << minRadius << " to " << maxRadius << " pixels (avg=" << (avgRadius/validCount) << ")" << std::endl;
+            std::cout << "  Depth range: " << minDepth << " to " << maxDepth << std::endl;
         }
         debugPrinted = true;
+        std::cout << "=== End Radius Debug ===\n" << std::endl;
     }
     
     // First pass: count pairs
@@ -313,6 +357,64 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
                 rangeStart = i;
             }
         }
+    }
+    
+    // DEBUG: Check tile ranges for gaps/overlaps
+    static bool tileRangeDebugPrinted = false;
+    if (!tileRangeDebugPrinted) {
+        std::cout << "\n=== Tile Range Debug ===" << std::endl;
+        std::cout << "Total pairs: " << pairCount << ", Total tiles: " << maxTiles << std::endl;
+        
+        uint32_t totalCoverage = 0;
+        uint32_t tilesWithData = 0;
+        uint32_t maxCount = 0;
+        uint32_t lastEnd = 0;
+        bool foundGap = false;
+        bool foundOverlap = false;
+        
+        for (uint32_t tile = 0; tile < maxTiles && tile < 10000; tile++) {
+            if (ranges[tile].count > 0) {
+                tilesWithData++;
+                totalCoverage += ranges[tile].count;
+                maxCount = std::max(maxCount, ranges[tile].count);
+                
+                // Check for gaps (non-contiguous ranges)
+                if (tilesWithData > 1 && ranges[tile].start != lastEnd) {
+                    if (!foundGap) {
+                        std::cout << "WARNING: Gap/overlap at tile " << tile 
+                                  << " (expected start=" << lastEnd << ", actual start=" << ranges[tile].start << ")" << std::endl;
+                    }
+                    foundGap = true;
+                }
+                lastEnd = ranges[tile].start + ranges[tile].count;
+                
+                // Print first few tiles with data
+                if (tilesWithData <= 5) {
+                    std::cout << "Tile " << tile << ": start=" << ranges[tile].start 
+                              << " count=" << ranges[tile].count << std::endl;
+                }
+            }
+        }
+        
+        // Print some sample pairs to verify sorting
+        std::cout << "\nFirst 10 pairs (tileIdx, gaussianIdx):" << std::endl;
+        for (uint32_t i = 0; i < std::min(10u, pairCount); i++) {
+            uint32_t tileId = (uint32_t)(pairs[i].first >> 32);
+            uint32_t depthBits = (uint32_t)(pairs[i].first & 0xFFFFFFFF);
+            std::cout << "  [" << i << "] tile=" << tileId << " gaussian=" << pairs[i].second 
+                      << " depthKey=0x" << std::hex << depthBits << std::dec << std::endl;
+        }
+        
+        std::cout << "\nSummary:" << std::endl;
+        std::cout << "  Tiles with Gaussians: " << tilesWithData << "/" << maxTiles << std::endl;
+        std::cout << "  Total coverage: " << totalCoverage << " (should equal pairCount=" << pairCount << ")" << std::endl;
+        std::cout << "  Max Gaussians per tile: " << maxCount << std::endl;
+        if (totalCoverage != pairCount) {
+            std::cout << "  ERROR: Coverage mismatch! Lost " << (pairCount - totalCoverage) << " pairs!" << std::endl;
+        }
+        std::cout << "=== End Tile Range Debug ===\n" << std::endl;
+        
+        tileRangeDebugPrinted = true;
     }
     
     // Step 3: GPU forward rendering

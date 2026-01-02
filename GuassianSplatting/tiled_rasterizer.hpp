@@ -18,20 +18,24 @@ struct TileRange {
 };
 
 // Projected Gaussian data for tiled rendering
+// CRITICAL: Use float arrays instead of simd_float3 to match Metal packed_float3 layout
+// simd_float2 has 8-byte alignment, so compiler adds 4 bytes padding after tileMaxY
 struct ProjectedGaussian {
-    simd_float2 screenPos;
-    simd_float3 conic;       // Inverse 2D covariance
-    float depth;
-    float opacity;           // After sigmoid
-    simd_float3 color;
-    float radius;
-    uint32_t tileMinX;
-    uint32_t tileMinY;
-    uint32_t tileMaxX;
-    uint32_t tileMaxY;
-    simd_float2 viewPos_xy;  // For gradient computation
-    simd_float3 cov2D;       // (a, b, c) - 2D covariance BEFORE inversion (for backward pass)
-};
+    simd_float2 screenPos;   // 8 bytes, offset 0
+    float conic[3];          // 12 bytes, offset 8 - Inverse 2D covariance (use array for packed layout)
+    float depth;             // 4 bytes, offset 20
+    float opacity;           // 4 bytes, offset 24 - After sigmoid
+    float color[3];          // 12 bytes, offset 28 (use array for packed layout)
+    float radius;            // 4 bytes, offset 40
+    uint32_t tileMinX;       // 4 bytes, offset 44
+    uint32_t tileMinY;       // 4 bytes, offset 48
+    uint32_t tileMaxX;       // 4 bytes, offset 52
+    uint32_t tileMaxY;       // 4 bytes, offset 56
+    float _pad1;             // 4 bytes, offset 60 - explicit padding for simd_float2 alignment
+    simd_float2 viewPos_xy;  // 8 bytes, offset 64 - For gradient computation
+    float cov2D[3];          // 12 bytes, offset 72 - (a, b, c) - 2D covariance BEFORE inversion (for backward pass)
+    float _pad2;             // 4 bytes, offset 84 - padding to make struct 88 bytes (multiple of 8)
+};  // Total: 88 bytes with predictable layout
 
 struct TiledUniforms {
     simd_float4x4 viewMatrix;
