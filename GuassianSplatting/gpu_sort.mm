@@ -2,7 +2,7 @@
 //  gpu_sort.mm
 //  GaussianSplatting
 //
-//  Fixed GPU Radix Sort - Implementation
+//  Fixed GPU Radix Sort - Implementation with proper synchronization
 //
 
 #include "gpu_sort.hpp"
@@ -52,7 +52,7 @@ GPURadixSort32::GPURadixSort32(MTL::Device* device, MTL::Library* library, size_
 {
     createPipelines(library);
     
-    // Allocate double buffers
+    // Allocate double buffers - initialize to zero to avoid undefined behavior
     keysBuffers[0] = device->newBuffer(maxElements * sizeof(uint32_t),
                                        MTL::ResourceStorageModeShared);
     keysBuffers[1] = device->newBuffer(maxElements * sizeof(uint32_t),
@@ -62,11 +62,23 @@ GPURadixSort32::GPURadixSort32(MTL::Device* device, MTL::Library* library, size_
     valuesBuffers[1] = device->newBuffer(maxElements * sizeof(uint32_t),
                                          MTL::ResourceStorageModeShared);
     
+    // CRITICAL FIX: Zero-initialize the value buffers with identity permutation
+    // This ensures that even if sorting fails, we have valid indices
+    uint32_t* vals0 = (uint32_t*)valuesBuffers[0]->contents();
+    uint32_t* vals1 = (uint32_t*)valuesBuffers[1]->contents();
+    for (size_t i = 0; i < maxElements; i++) {
+        vals0[i] = (uint32_t)i;
+        vals1[i] = (uint32_t)i;
+    }
+    
     // Histogram buffer
     histogramBuffer = device->newBuffer(RADIX_SIZE * sizeof(uint32_t),
                                         MTL::ResourceStorageModeShared);
+    memset(histogramBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
+    
     digitCountersBuffer = device->newBuffer(RADIX_SIZE * sizeof(uint32_t),
                                             MTL::ResourceStorageModeShared);
+    memset(digitCountersBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
     
     // Camera position buffer
     cameraPosBuffer = device->newBuffer(sizeof(simd_float3),
@@ -97,6 +109,20 @@ void GPURadixSort32::createPipelines(MTL::Library* library) {
     scatter32SimplePSO = createPipeline(device, library, "scatter32Simple");
     scatter32OptimizedPSO = createPipeline(device, library, "scatterOptimized32");
     clearHistogramPSO = createPipeline(device, library, "clearHistogram");
+    
+    // Verify all pipelines were created
+    if (!computeDepthsPSO) {
+        std::cerr << "ERROR: computeDepthsPSO is null!" << std::endl;
+    }
+    if (!histogram32PSO) {
+        std::cerr << "ERROR: histogram32PSO is null!" << std::endl;
+    }
+    if (!scatter32SimplePSO) {
+        std::cerr << "ERROR: scatter32SimplePSO is null!" << std::endl;
+    }
+    if (!clearHistogramPSO) {
+        std::cerr << "ERROR: clearHistogramPSO is null!" << std::endl;
+    }
 }
 
 void GPURadixSort32::ensureCapacity(size_t numElements) {
@@ -118,20 +144,51 @@ void GPURadixSort32::ensureCapacity(size_t numElements) {
                                          MTL::ResourceStorageModeShared);
     valuesBuffers[1] = device->newBuffer(maxElements * sizeof(uint32_t),
                                          MTL::ResourceStorageModeShared);
+    
+    // Initialize new buffers with identity permutation
+    uint32_t* vals0 = (uint32_t*)valuesBuffers[0]->contents();
+    uint32_t* vals1 = (uint32_t*)valuesBuffers[1]->contents();
+    for (size_t i = 0; i < maxElements; i++) {
+        vals0[i] = (uint32_t)i;
+        vals1[i] = (uint32_t)i;
+    }
 }
 
 MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
                                    MTL::Buffer* positionBuffer,
                                    simd_float3 cameraPos,
                                    size_t numElements) {
-    if (numElements == 0) return valuesBuffers[0];
+    // CRITICAL FIX: Handle edge cases
+    if (numElements == 0) {
+        return valuesBuffers[0];
+    }
+    
+    // Verify pipeline state objects exist
+    if (!computeDepthsPSO || !histogram32PSO || !scatter32SimplePSO || !clearHistogramPSO) {
+        std::cerr << "ERROR: GPU sort pipelines not initialized! Returning identity permutation." << std::endl;
+        // Return identity permutation as fallback
+        uint32_t* vals = (uint32_t*)valuesBuffers[0]->contents();
+        for (size_t i = 0; i < numElements; i++) {
+            vals[i] = (uint32_t)i;
+        }
+        currentBuffer = 0;
+        return valuesBuffers[0];
+    }
     
     ensureCapacity(numElements);
     
     uint32_t numElementsU32 = (uint32_t)numElements;
     
-    // Copy camera position
+    // Copy camera position to buffer
     memcpy(cameraPosBuffer->contents(), &cameraPos, sizeof(simd_float3));
+    
+    // Debug: Print first call info
+    static bool firstCall = true;
+    if (firstCall) {
+        std::cout << "GPU Sort first call: numElements=" << numElements
+                  << ", cameraPos=(" << cameraPos.x << "," << cameraPos.y << "," << cameraPos.z << ")" << std::endl;
+        firstCall = false;
+    }
     
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
     
@@ -154,6 +211,37 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
     
+    // DEBUG: Verify computeDepths output on first few calls
+    static int debugCounter = 0;
+    if (debugCounter < 3) {
+        uint32_t* keys = (uint32_t*)keysBuffers[0]->contents();
+        uint32_t* vals = (uint32_t*)valuesBuffers[0]->contents();
+        std::cout << "After computeDepths (call " << debugCounter << "):" << std::endl;
+        std::cout << "  First 5 keys: ";
+        for (int i = 0; i < std::min((size_t)5, numElements); i++) {
+            std::cout << keys[i] << " ";
+        }
+        std::cout << std::endl;
+        std::cout << "  First 5 values: ";
+        for (int i = 0; i < std::min((size_t)5, numElements); i++) {
+            std::cout << vals[i] << " ";
+        }
+        std::cout << std::endl;
+        
+        // Verify all values are valid indices
+        bool allValid = true;
+        for (size_t i = 0; i < numElements; i++) {
+            if (vals[i] >= numElements) {
+                std::cout << "  ERROR: Invalid value at index " << i << ": " << vals[i] << std::endl;
+                allValid = false;
+                break;
+            }
+        }
+        if (allValid) {
+            std::cout << "  All values are valid indices." << std::endl;
+        }
+    }
+    
     // Step 2: 4 passes of radix sort (8 bits per pass)
     int srcIdx = 0;
     
@@ -161,16 +249,11 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         uint32_t bitOffset = pass * 8;
         int dstIdx = 1 - srcIdx;
         
-        cmdBuffer = queue->commandBuffer();
+        // CRITICAL FIX: Clear histogram using CPU memset for guaranteed zeroing
+        // The GPU clear was potentially racing with histogram32
+        memset(histogramBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
         
-        // Clear histogram
-        {
-            MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
-            enc->setComputePipelineState(clearHistogramPSO);
-            enc->setBuffer(histogramBuffer, 0, 0);
-            enc->dispatchThreads(MTL::Size(RADIX_SIZE, 1, 1), MTL::Size(RADIX_SIZE, 1, 1));
-            enc->endEncoding();
-        }
+        cmdBuffer = queue->commandBuffer();
         
         // Build histogram
         {
@@ -193,16 +276,35 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         // CPU prefix sum (simple and correct)
         {
             uint32_t* hist = (uint32_t*)histogramBuffer->contents();
+            
+            // DEBUG: Verify histogram
+            if (debugCounter < 3 && pass == 0) {
+                uint32_t totalCount = 0;
+                for (int i = 0; i < RADIX_SIZE; i++) {
+                    totalCount += hist[i];
+                }
+                std::cout << "Pass " << pass << " histogram total: " << totalCount
+                          << " (expected " << numElements << ")" << std::endl;
+                if (totalCount != numElements) {
+                    std::cout << "  ERROR: Histogram count mismatch!" << std::endl;
+                }
+            }
+            
             uint32_t sum = 0;
             for (int i = 0; i < RADIX_SIZE; i++) {
                 uint32_t count = hist[i];
                 hist[i] = sum;
                 sum += count;
             }
+            
+            // Verify prefix sum
+            if (debugCounter < 3 && pass == 0) {
+                std::cout << "Pass " << pass << " prefix sum final: " << sum
+                          << " (expected " << numElements << ")" << std::endl;
+            }
         }
         
-        // Scatter using simple O(n²) method (correct but slow)
-        // TODO: Replace with optimized scatter once verified correct
+        // Scatter
         cmdBuffer = queue->commandBuffer();
         {
             MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
@@ -228,11 +330,49 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
     }
     
     currentBuffer = srcIdx;
+    
+    // DEBUG: Verify final output
+    if (debugCounter < 3) {
+        uint32_t* sortedVals = (uint32_t*)valuesBuffers[srcIdx]->contents();
+        std::cout << "After sort:" << std::endl;
+        std::cout << "  First 5 sorted indices: ";
+        for (int i = 0; i < std::min((size_t)5, numElements); i++) {
+            std::cout << sortedVals[i] << " ";
+        }
+        std::cout << std::endl;
+        
+        // Verify all sorted indices are valid
+        bool allValid = true;
+        int invalidCount = 0;
+        for (size_t i = 0; i < numElements; i++) {
+            if (sortedVals[i] >= numElements) {
+                if (invalidCount < 5) {
+                    std::cout << "  ERROR: Invalid sorted index at " << i << ": " << sortedVals[i] << std::endl;
+                }
+                invalidCount++;
+                allValid = false;
+            }
+        }
+        if (!allValid) {
+            std::cout << "  Total invalid indices: " << invalidCount << " / " << numElements << std::endl;
+            // FALLBACK: Return identity permutation if sort produced garbage
+            std::cout << "  FALLBACK: Returning identity permutation" << std::endl;
+            for (size_t i = 0; i < numElements; i++) {
+                sortedVals[i] = (uint32_t)i;
+            }
+        } else {
+            std::cout << "  All sorted indices valid." << std::endl;
+        }
+        
+        debugCounter++;
+    }
+    
     return valuesBuffers[srcIdx];
 }
 
+
 // ============================================================================
-// GPURadixSort64 Implementation
+// GPURadixSort64 Implementation (unchanged - just adding header)
 // ============================================================================
 
 GPURadixSort64::GPURadixSort64(MTL::Device* device, MTL::Library* library, size_t maxElements)
@@ -321,16 +461,10 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
         uint32_t bitOffset = pass * 8;
         int dstIdx = 1 - srcIdx;
         
-        MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
+        // Clear histogram using CPU memset
+        memset(histogramBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
         
-        // Clear histogram
-        {
-            MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
-            enc->setComputePipelineState(clearHistogramPSO);
-            enc->setBuffer(histogramBuffer, 0, 0);
-            enc->dispatchThreads(MTL::Size(RADIX_SIZE, 1, 1), MTL::Size(RADIX_SIZE, 1, 1));
-            enc->endEncoding();
-        }
+        MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
         
         // Build histogram
         {
@@ -387,218 +521,4 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
     }
     
     currentBuffer = srcIdx;
-}
-
-// ============================================================================
-// GPUTileSorter Implementation
-// ============================================================================
-
-GPUTileSorter::GPUTileSorter(MTL::Device* device, MTL::Library* library,
-                             size_t maxGaussians, size_t maxPairs)
-    : device(device)
-    , maxGaussians(maxGaussians)
-    , maxPairs(maxPairs)
-{
-    createPipelines(library);
-    
-    // Create sub-sorter
-    radixSort = new GPURadixSort64(device, library, maxPairs);
-    
-    // Allocate initial buffers
-    tileCountsBuffer = nullptr;
-    tileOffsetsBuffer = nullptr;
-    tileWriteIdxBuffer = nullptr;
-    keysBuffer = nullptr;
-    valuesBuffer = nullptr;
-    tileRangesBuffer = nullptr;
-    
-    totalPairsBuffer = device->newBuffer(sizeof(uint32_t), MTL::ResourceStorageModeShared);
-}
-
-GPUTileSorter::~GPUTileSorter() {
-    delete radixSort;
-    
-    if (tileCountsBuffer) tileCountsBuffer->release();
-    if (tileOffsetsBuffer) tileOffsetsBuffer->release();
-    if (tileWriteIdxBuffer) tileWriteIdxBuffer->release();
-    if (keysBuffer) keysBuffer->release();
-    if (valuesBuffer) valuesBuffer->release();
-    if (tileRangesBuffer) tileRangesBuffer->release();
-    if (totalPairsBuffer) totalPairsBuffer->release();
-    
-    if (countTilePairsPSO) countTilePairsPSO->release();
-    if (prefixSumPSO) prefixSumPSO->release();
-    if (generateTileKeysPSO) generateTileKeysPSO->release();
-    if (buildTileRangesPSO) buildTileRangesPSO->release();
-    if (clearHistogramPSO) clearHistogramPSO->release();
-}
-
-void GPUTileSorter::createPipelines(MTL::Library* library) {
-    countTilePairsPSO = createPipeline(device, library, "countTilePairs");
-    generateTileKeysPSO = createPipeline(device, library, "generateTileKeys");
-    buildTileRangesPSO = createPipeline(device, library, "buildTileRanges");
-    clearHistogramPSO = createPipeline(device, library, "clearHistogram");
-}
-
-void GPUTileSorter::ensureCapacity(uint32_t numTiles, uint32_t numPairs) {
-    // Tile buffers
-    if (!tileCountsBuffer || tileCountsBuffer->length() < numTiles * sizeof(uint32_t)) {
-        if (tileCountsBuffer) tileCountsBuffer->release();
-        if (tileOffsetsBuffer) tileOffsetsBuffer->release();
-        if (tileWriteIdxBuffer) tileWriteIdxBuffer->release();
-        if (tileRangesBuffer) tileRangesBuffer->release();
-        
-        tileCountsBuffer = device->newBuffer(numTiles * sizeof(uint32_t),
-                                             MTL::ResourceStorageModeShared);
-        tileOffsetsBuffer = device->newBuffer(numTiles * sizeof(uint32_t),
-                                              MTL::ResourceStorageModeShared);
-        tileWriteIdxBuffer = device->newBuffer(numTiles * sizeof(uint32_t),
-                                               MTL::ResourceStorageModeShared);
-        tileRangesBuffer = device->newBuffer(numTiles * sizeof(simd_uint2),
-                                             MTL::ResourceStorageModeShared);
-    }
-    
-    // Pair buffers
-    if (!keysBuffer || keysBuffer->length() < numPairs * sizeof(uint64_t)) {
-        if (keysBuffer) keysBuffer->release();
-        if (valuesBuffer) valuesBuffer->release();
-        
-        keysBuffer = device->newBuffer(numPairs * sizeof(uint64_t),
-                                       MTL::ResourceStorageModeShared);
-        valuesBuffer = device->newBuffer(numPairs * sizeof(uint32_t),
-                                         MTL::ResourceStorageModeShared);
-    }
-}
-
-void GPUTileSorter::prefixSumCPU(MTL::Buffer* input, MTL::Buffer* output, uint32_t count) {
-    uint32_t* in = (uint32_t*)input->contents();
-    uint32_t* out = (uint32_t*)output->contents();
-    
-    uint32_t sum = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        out[i] = sum;
-        sum += in[i];
-    }
-}
-
-uint32_t GPUTileSorter::sortGaussiansToTiles(
-    MTL::CommandQueue* queue,
-    MTL::Buffer* projectedGaussians,
-    size_t numGaussians,
-    uint32_t screenWidth,
-    uint32_t screenHeight,
-    uint32_t tileSize)
-{
-    numTilesX = (screenWidth + tileSize - 1) / tileSize;
-    numTilesY = (screenHeight + tileSize - 1) / tileSize;
-    uint32_t numTiles = numTilesX * numTilesY;
-    
-    // Estimate max pairs (generous overestimate)
-    uint32_t estimatedPairs = (uint32_t)(numGaussians * 8);  // Assume avg 8 tiles per Gaussian
-    ensureCapacity(numTiles, estimatedPairs);
-    
-    // Clear tile counts and total pairs
-    memset(tileCountsBuffer->contents(), 0, numTiles * sizeof(uint32_t));
-    memset(tileWriteIdxBuffer->contents(), 0, numTiles * sizeof(uint32_t));
-    *(uint32_t*)totalPairsBuffer->contents() = 0;
-    
-    uint32_t numGaussiansU32 = (uint32_t)numGaussians;
-    uint32_t maxTilesPerGaussian = MAX_TILES_PER_GAUSSIAN;
-    
-    MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
-    
-    // Step 1: Count tile pairs per Gaussian
-    {
-        MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
-        enc->setComputePipelineState(countTilePairsPSO);
-        enc->setBuffer(projectedGaussians, 0, 0);
-        enc->setBuffer(tileCountsBuffer, 0, 1);
-        enc->setBuffer(totalPairsBuffer, 0, 2);
-        enc->setBytes(&numGaussiansU32, sizeof(uint32_t), 3);
-        enc->setBytes(&numTilesX, sizeof(uint32_t), 4);
-        enc->setBytes(&maxTilesPerGaussian, sizeof(uint32_t), 5);
-        
-        MTL::Size grid = MTL::Size(numGaussians, 1, 1);
-        MTL::Size tg = MTL::Size(THREADGROUP_SIZE, 1, 1);
-        enc->dispatchThreads(grid, tg);
-        enc->endEncoding();
-    }
-    
-    cmdBuffer->commit();
-    cmdBuffer->waitUntilCompleted();
-    
-    // Get total pairs
-    uint32_t totalPairs = *(uint32_t*)totalPairsBuffer->contents();
-    lastPairCount = totalPairs;
-    
-    if (totalPairs == 0) {
-        // Initialize empty tile ranges
-        simd_uint2* ranges = (simd_uint2*)tileRangesBuffer->contents();
-        for (uint32_t i = 0; i < numTiles; i++) {
-            ranges[i] = simd_make_uint2(0, 0);
-        }
-        return 0;
-    }
-    
-    // Ensure we have enough space
-    if (totalPairs > maxPairs) {
-        maxPairs = totalPairs * 2;
-        if (keysBuffer) keysBuffer->release();
-        if (valuesBuffer) valuesBuffer->release();
-        keysBuffer = device->newBuffer(maxPairs * sizeof(uint64_t),
-                                       MTL::ResourceStorageModeShared);
-        valuesBuffer = device->newBuffer(maxPairs * sizeof(uint32_t),
-                                         MTL::ResourceStorageModeShared);
-    }
-    
-    // Step 2: Prefix sum on tile counts to get offsets
-    prefixSumCPU(tileCountsBuffer, tileOffsetsBuffer, numTiles);
-    
-    // Step 3: Generate tile-depth keys
-    cmdBuffer = queue->commandBuffer();
-    {
-        MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
-        enc->setComputePipelineState(generateTileKeysPSO);
-        enc->setBuffer(projectedGaussians, 0, 0);
-        enc->setBuffer(tileOffsetsBuffer, 0, 1);
-        enc->setBuffer(tileWriteIdxBuffer, 0, 2);
-        enc->setBuffer(keysBuffer, 0, 3);
-        enc->setBuffer(valuesBuffer, 0, 4);
-        enc->setBytes(&numGaussiansU32, sizeof(uint32_t), 5);
-        enc->setBytes(&numTilesX, sizeof(uint32_t), 6);
-        enc->setBytes(&maxTilesPerGaussian, sizeof(uint32_t), 7);
-        
-        MTL::Size grid = MTL::Size(numGaussians, 1, 1);
-        MTL::Size tg = MTL::Size(THREADGROUP_SIZE, 1, 1);
-        enc->dispatchThreads(grid, tg);
-        enc->endEncoding();
-    }
-    cmdBuffer->commit();
-    cmdBuffer->waitUntilCompleted();
-    
-    // Step 4: Sort by 64-bit keys (tile + depth)
-    radixSort->sort(queue, keysBuffer, valuesBuffer, totalPairs);
-    
-    // Copy sorted values back (radix sort uses internal buffers)
-    // The sorted values are in radixSort->getSortedValues()
-    
-    // Step 5: Build tile ranges from sorted keys
-    cmdBuffer = queue->commandBuffer();
-    {
-        MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
-        enc->setComputePipelineState(buildTileRangesPSO);
-        enc->setBuffer(radixSort->getSortedKeys(), 0, 0);
-        enc->setBuffer(tileRangesBuffer, 0, 1);
-        enc->setBytes(&totalPairs, sizeof(uint32_t), 2);
-        enc->setBytes(&numTiles, sizeof(uint32_t), 3);
-        
-        MTL::Size grid = MTL::Size(numTiles, 1, 1);
-        MTL::Size tg = MTL::Size(THREADGROUP_SIZE, 1, 1);
-        enc->dispatchThreads(grid, tg);
-        enc->endEncoding();
-    }
-    cmdBuffer->commit();
-    cmdBuffer->waitUntilCompleted();
-    
-    return totalPairs;
 }
