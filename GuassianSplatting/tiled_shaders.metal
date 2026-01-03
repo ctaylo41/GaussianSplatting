@@ -332,10 +332,8 @@ kernel void tiledForward(
     uint lastIdx = 0;
     bool hasContrib = false;
     
-    // Increased from 256 to 2048 to prevent tile boundary artifacts
-    uint maxIter = min(range.count, 2048u);
-    
-    for (uint i = 0; i < maxIter && T > 0.0001; i++) {
+    // Rely purely on T termination instead of artificial cap
+    for (uint i = 0; i < range.count && T > 0.0001; i++) {
         uint sortIdx = range.start + i;
         uint gIdx = sortedIndices[sortIdx];
         
@@ -410,8 +408,8 @@ kernel void tiledBackward(
     
     // We need to traverse BACK-TO-FRONT for correct gradients
     // First, find how many Gaussians contribute and compute T_final
-    // Increased from 256 to 2048 to match forward pass and prevent tile boundary artifacts
-    uint endIdx = min(lastIdx + 1, range.start + min(range.count, 2048u));
+    // Use lastIdx from forward pass (which relied on T termination)
+    uint endIdx = min(lastIdx + 1, range.start + range.count);
     
     // Pre-compute T (transmittance) for the forward pass to get T_final
     float T_final = 1.0;

@@ -193,7 +193,7 @@ int main(int argc, char* argv[]) {
     std::string colmapPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/";
     std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4";
     std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
-    size_t numEpochs = 20;  // Train for 10 epochs
+    size_t numEpochs = 37;  // Train for 10 epochs
     bool viewOnly = false;
     std::string viewPlyPath = "";
     
