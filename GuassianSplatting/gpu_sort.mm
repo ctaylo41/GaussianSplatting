@@ -304,6 +304,8 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
             }
         }
         
+        // Note: For StorageModeShared, CPU writes are immediately visible to GPU
+        
         // Scatter
         cmdBuffer = queue->commandBuffer();
         {

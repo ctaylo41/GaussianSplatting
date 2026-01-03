@@ -816,7 +816,52 @@ float MTLEngine::trainStep(size_t imageIndex,
     R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
     uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
     
-    // DEBUG: Check view-space coordinates for first Gaussian
+    // DEBUG: Check view-space coordinates for first few Gaussians on CPU side
+    static bool projectionDebugPrinted = false;
+    if (!projectionDebugPrinted) {
+        Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
+        printf("\n=== CPU Projection Debug ===\n");
+        printf("uniforms.viewMatrix:\n");
+        for (int r = 0; r < 4; r++) {
+            printf("  [%.4f %.4f %.4f %.4f]\n",
+                   uniforms.viewMatrix.columns[0][r],
+                   uniforms.viewMatrix.columns[1][r],
+                   uniforms.viewMatrix.columns[2][r],
+                   uniforms.viewMatrix.columns[3][r]);
+        }
+        printf("uniforms.projectionMatrix:\n");
+        for (int r = 0; r < 4; r++) {
+            printf("  [%.4f %.4f %.4f %.4f]\n",
+                   uniforms.projectionMatrix.columns[0][r],
+                   uniforms.projectionMatrix.columns[1][r],
+                   uniforms.projectionMatrix.columns[2][r],
+                   uniforms.projectionMatrix.columns[3][r]);
+        }
+        printf("screenSize: (%.0f, %.0f)\n", uniforms.screenSize.x, uniforms.screenSize.y);
+        printf("focalLength: (%.2f, %.2f)\n", uniforms.focalLength.x, uniforms.focalLength.y);
+        
+        printf("\nFirst 5 Gaussians:\n");
+        for (int i = 0; i < 5 && i < (int)gaussianCount; i++) {
+            simd_float3 pos = gaussians[i].position;
+            simd_float4 worldPos = simd_make_float4(pos.x, pos.y, pos.z, 1.0f);
+            simd_float4 viewPos = matrix_multiply(uniforms.viewMatrix, worldPos);
+            simd_float4 clipPos = matrix_multiply(uniforms.viewProjectionMatrix, worldPos);
+            
+            printf("  [%d] world=(%.2f,%.2f,%.2f) view=(%.2f,%.2f,%.2f) clip.w=%.2f\n",
+                   i, pos.x, pos.y, pos.z, viewPos.x, viewPos.y, viewPos.z, clipPos.w);
+            
+            if (clipPos.w > 0.1f && viewPos.z > 0.1f) {
+                simd_float3 ndc = simd_make_float3(clipPos.x/clipPos.w, clipPos.y/clipPos.w, clipPos.z/clipPos.w);
+                printf("       ndc=(%.3f,%.3f) in frustum: %s\n", 
+                       ndc.x, ndc.y, 
+                       (fabs(ndc.x) < 1.2f && fabs(ndc.y) < 1.2f) ? "YES" : "NO");
+            } else {
+                printf("       BEHIND camera or clipped\n");
+            }
+        }
+        projectionDebugPrinted = true;
+    }
+    
     // Forward pass
     tiledRasterizer->forward(commandQueue, gaussianBuffer, gaussianCount, uniforms, renderTarget);
     

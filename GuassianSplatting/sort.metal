@@ -168,8 +168,8 @@ kernel void prefixSum256(
 }
 
 // ============================================================================
-// SCATTER32 SIMPLE - O(n²) but guaranteed correct
-// Each thread counts how many elements before it have the same digit
+// SCATTER32 SIMPLE - O(1) per thread using atomic counters
+// Uses atomic_fetch_add to get unique write positions
 // ============================================================================
 
 kernel void scatter32Simple(
@@ -177,7 +177,7 @@ kernel void scatter32Simple(
     device const uint* valuesIn [[buffer(1)]],
     device uint* keysOut [[buffer(2)]],
     device uint* valuesOut [[buffer(3)]],
-    device const uint* prefixSums [[buffer(4)]],
+    device atomic_uint* prefixSums [[buffer(4)]],  // Now atomic for thread-safe incrementing
     constant uint& bitOffset [[buffer(5)]],
     constant uint& numElements [[buffer(6)]],
     uint id [[thread_position_in_grid]])
@@ -188,18 +188,9 @@ kernel void scatter32Simple(
     uint value = valuesIn[id];
     uint digit = (key >> bitOffset) & 0xFF;
     
-    // Count elements before me with same digit (O(n) per element = O(n²) total)
-    uint localRank = 0;
-    for (uint i = 0; i < id; i++) {
-        uint otherDigit = (keysIn[i] >> bitOffset) & 0xFF;
-        if (otherDigit == digit) {
-            localRank++;
-        }
-    }
-    
-    // Calculate write position
-    uint basePos = prefixSums[digit];
-    uint writePos = basePos + localRank;
+    // Use atomic fetch-add to get unique write position
+    // This is O(1) per thread instead of O(n) per thread
+    uint writePos = atomic_fetch_add_explicit(&prefixSums[digit], 1, memory_order_relaxed);
     
     // Bounds check before writing
     if (writePos < numElements) {
@@ -230,31 +221,14 @@ kernel void histogram64(
     device atomic_uint* globalHistogram [[buffer(1)]],
     constant uint& bitOffset [[buffer(2)]],
     constant uint& numElements [[buffer(3)]],
-    uint id [[thread_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]])
+    uint id [[thread_position_in_grid]])
 {
-    threadgroup uint localHist[RADIX_SIZE];
-    
-    // Initialize local histogram
-    for (uint i = tid; i < RADIX_SIZE; i += THREADGROUP_SIZE) {
-        localHist[i] = 0;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Count digits
+    // Simple version: each thread directly increments global histogram
+    // This avoids any threadgroup-level issues with partial threadgroups
     if (id < numElements) {
         ulong key = keys[id];
         uint digit = (key >> bitOffset) & 0xFF;
-        atomic_fetch_add_explicit((threadgroup atomic_uint*)&localHist[digit], 1, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Add to global histogram
-    for (uint i = tid; i < RADIX_SIZE; i += THREADGROUP_SIZE) {
-        uint count = localHist[i];
-        if (count > 0) {
-            atomic_fetch_add_explicit(&globalHistogram[i], count, memory_order_relaxed);
-        }
+        atomic_fetch_add_explicit(&globalHistogram[digit], 1, memory_order_relaxed);
     }
 }
 
@@ -263,7 +237,7 @@ kernel void scatter64Simple(
     device const uint* valuesIn [[buffer(1)]],
     device ulong* keysOut [[buffer(2)]],
     device uint* valuesOut [[buffer(3)]],
-    device const uint* prefixSums [[buffer(4)]],
+    device atomic_uint* prefixSums [[buffer(4)]],  // Now atomic for thread-safe incrementing
     constant uint& bitOffset [[buffer(5)]],
     constant uint& numElements [[buffer(6)]],
     uint id [[thread_position_in_grid]])
@@ -274,15 +248,10 @@ kernel void scatter64Simple(
     uint value = valuesIn[id];
     uint digit = (key >> bitOffset) & 0xFF;
     
-    uint localRank = 0;
-    for (uint i = 0; i < id; i++) {
-        uint otherDigit = (keysIn[i] >> bitOffset) & 0xFF;
-        if (otherDigit == digit) {
-            localRank++;
-        }
-    }
+    // Use atomic fetch-add to get unique write position
+    // This is O(1) per thread instead of O(n) per thread
+    uint writePos = atomic_fetch_add_explicit(&prefixSums[digit], 1, memory_order_relaxed);
     
-    uint writePos = prefixSums[digit] + localRank;
     if (writePos < numElements) {
         keysOut[writePos] = key;
         valuesOut[writePos] = value;
