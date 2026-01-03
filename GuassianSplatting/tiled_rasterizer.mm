@@ -146,6 +146,7 @@ TiledRasterizer::~TiledRasterizer() {
     if (projectGaussiansPSO) projectGaussiansPSO->release();
     if (tiledForwardPSO) tiledForwardPSO->release();
     if (tiledBackwardPSO) tiledBackwardPSO->release();
+    if (buildTileRangesPSO) buildTileRangesPSO->release();
 }
 
 void TiledRasterizer::createPipelines(MTL::Library* library) {
@@ -169,6 +170,7 @@ void TiledRasterizer::createPipelines(MTL::Library* library) {
     projectGaussiansPSO = makePipeline("projectGaussians");
     tiledForwardPSO = makePipeline("tiledForward");
     tiledBackwardPSO = makePipeline("tiledBackward");
+    buildTileRangesPSO = makePipeline("buildTileRanges");
 }
 
 void TiledRasterizer::ensureBufferCapacity(uint32_t width, uint32_t height, size_t gaussianCount) {
@@ -430,34 +432,39 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     parallelRadixSort(pairs);
     auto t5 = std::chrono::high_resolution_clock::now();
     
-    // Build tile ranges and sorted indices
+    // Copy sorted data to GPU buffers
+    uint64_t* keyPtr = (uint64_t*)gaussianKeys->contents();
     uint32_t* sortedIndices = (uint32_t*)gaussianValues->contents();
-    TileRange* ranges = (TileRange*)tileRanges->contents();
-    memset(ranges, 0, maxTiles * sizeof(TileRange));
-    
     uint32_t pairCount = (uint32_t)pairs.size();
     
     for (uint32_t i = 0; i < pairCount; i++) {
+        keyPtr[i] = pairs[i].first;
         sortedIndices[i] = pairs[i].second;
     }
     
-    // Build tile ranges
-    if (pairCount > 0) {
-        uint32_t currentTile = (uint32_t)(pairs[0].first >> 32);
-        uint32_t rangeStart = 0;
+    // Build tile ranges on GPU using parallel binary search
+    {
+        MTL::CommandBuffer* rangeCmdBuffer = queue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = rangeCmdBuffer->computeCommandEncoder();
+        enc->setComputePipelineState(buildTileRangesPSO);
+        enc->setBuffer(gaussianKeys, 0, 0);
+        enc->setBuffer(tileRanges, 0, 1);
+        enc->setBytes(&pairCount, sizeof(uint32_t), 2);
+        enc->setBytes(&maxTiles, sizeof(uint32_t), 3);
         
-        for (uint32_t i = 1; i <= pairCount; i++) {
-            uint32_t tile = (i < pairCount) ? (uint32_t)(pairs[i].first >> 32) : UINT32_MAX;
-            if (tile != currentTile) {
-                if (currentTile < maxTiles) {
-                    ranges[currentTile].start = rangeStart;
-                    ranges[currentTile].count = i - rangeStart;
-                }
-                currentTile = tile;
-                rangeStart = i;
-            }
-        }
+        NS::UInteger threadGroupSize = buildTileRangesPSO->maxTotalThreadsPerThreadgroup();
+        if (threadGroupSize > 256) threadGroupSize = 256;
+        
+        MTL::Size grid = MTL::Size(maxTiles, 1, 1);
+        MTL::Size threadgroup = MTL::Size(threadGroupSize, 1, 1);
+        enc->dispatchThreads(grid, threadgroup);
+        enc->endEncoding();
+        
+        rangeCmdBuffer->commit();
+        rangeCmdBuffer->waitUntilCompleted();
     }
+    
+    TileRange* ranges = (TileRange*)tileRanges->contents();
     
     auto t6 = std::chrono::high_resolution_clock::now();
     

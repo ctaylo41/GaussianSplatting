@@ -80,6 +80,7 @@ private:
     MTL::ComputePipelineState* projectGaussiansPSO;
     MTL::ComputePipelineState* tiledForwardPSO;
     MTL::ComputePipelineState* tiledBackwardPSO;
+    MTL::ComputePipelineState* buildTileRangesPSO;
     
     // Buffers
     MTL::Buffer* projectedGaussians;

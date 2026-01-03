@@ -762,3 +762,60 @@ kernel void tiledBackward(
             clamp(dL_dq.w, -clampVal, clampVal), memory_order_relaxed);
     }
 }
+
+// =============================================================================
+// GPU Pair Generation
+// Each thread handles one Gaussian and writes all its tile-pairs atomically
+// =============================================================================
+constant float GPU_MIN_OPACITY = 0.005f;
+constant uint GPU_MAX_TILES_PER_GAUSSIAN = 256u;
+
+kernel void generateTilePairs(
+    device const ProjectedGaussian* projected [[buffer(0)]],
+    device ulong* pairKeys [[buffer(1)]],
+    device uint* pairValues [[buffer(2)]],
+    device atomic_uint* writeCounter [[buffer(3)]],
+    constant uint& numGaussians [[buffer(4)]],
+    constant uint& numTilesX [[buffer(5)]],
+    constant uint& maxPairs [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= numGaussians) return;
+    
+    ProjectedGaussian p = projected[tid];
+    
+    // Skip invalid Gaussians
+    if (p.radius <= 0) return;
+    if (p.tileMinX > p.tileMaxX || p.tileMinY > p.tileMaxY) return;
+    if (p.opacity < GPU_MIN_OPACITY) return;
+    if (p.tileMinX > 10000 || p.tileMaxX > 10000 || p.tileMinY > 10000 || p.tileMaxY > 10000) return;
+    
+    uint tilesX = p.tileMaxX - p.tileMinX + 1;
+    uint tilesY = p.tileMaxY - p.tileMinY + 1;
+    uint tileCount = tilesX * tilesY;
+    
+    if (tileCount > GPU_MAX_TILES_PER_GAUSSIAN) return;
+    
+    // Create depth key for sorting (IEEE float to sortable uint)
+    uint depthKey = as_type<uint>(p.depth);
+    depthKey = (depthKey & 0x80000000u) ? ~depthKey : (depthKey | 0x80000000u);
+    
+    // Reserve write positions atomically
+    uint writePos = atomic_fetch_add_explicit(writeCounter, tileCount, memory_order_relaxed);
+    
+    // Check buffer bounds
+    if (writePos + tileCount > maxPairs) return;
+    
+    // Write pairs for all tiles this Gaussian touches
+    uint idx = 0;
+    for (uint ty = p.tileMinY; ty <= p.tileMaxY; ty++) {
+        for (uint tx = p.tileMinX; tx <= p.tileMaxX; tx++) {
+            uint tileIdx = ty * numTilesX + tx;
+            ulong key = (ulong(tileIdx) << 32) | ulong(depthKey);
+            
+            pairKeys[writePos + idx] = key;
+            pairValues[writePos + idx] = tid;
+            idx++;
+        }
+    }
+}
