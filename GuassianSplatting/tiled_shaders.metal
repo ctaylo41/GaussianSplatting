@@ -14,8 +14,8 @@ using namespace metal;
 
 // CRITICAL: Must match C++ simd struct layout EXACTLY
 // C++ simd_float3 is 12 bytes with 16-byte alignment
-// Use packed_float3 in Metal which is exactly 12 bytes
-// Layout: position(0-12), scale(16-28), rotation(32-48), opacity(48-52), sh(52-100), total 112
+// C++ sizeof(Gaussian) = 112 bytes due to struct alignment
+// Metal doesn't auto-pad, so we must add explicit padding
 struct Gaussian {
     packed_float3 position; // offset 0, 12 bytes
     float _pad0;            // offset 12, 4 bytes padding (to align scale to 16)
@@ -23,8 +23,11 @@ struct Gaussian {
     float _pad1;            // offset 28, 4 bytes padding (to align rotation to 32)
     float4 rotation;        // offset 32, (w,x,y,z) as (.x=w, .y=x, .z=y, .w=z)
     float opacity;          // offset 48, RAW pre-sigmoid
-    float sh[12];           // offset 52, 48 bytes
-};  // Total: 100 bytes, padded to 112 for struct alignment
+    float sh[12];           // offset 52, 48 bytes -> ends at 100
+    float _pad2;            // offset 100, 4 bytes
+    float _pad3;            // offset 104, 4 bytes
+    float _pad4;            // offset 108, 4 bytes
+};  // Total: 112 bytes to match C++ sizeof(Gaussian)
 
 // Projected Gaussian data for tiled rendering
 // CRITICAL: Use packed_float3 to match C++ memory layout (12 bytes, not 16)

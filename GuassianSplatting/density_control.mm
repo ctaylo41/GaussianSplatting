@@ -13,6 +13,10 @@
 #include <iostream>
 #include <cmath>
 #include "gradients.hpp"
+#include <dispatch/dispatch.h>  // Apple's GCD for parallel operations
+
+// Number of threads for parallel operations
+static const int NUM_THREADS = 8;
 
 // Paper's recommended thresholds (from official 3DGS)
 static constexpr float GRAD_THRESHOLD = 0.0002f;      // densify_grad_threshold
@@ -83,7 +87,7 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
                                             MTL::Buffer* gradients,
                                             size_t gaussianCount) {
     // Accumulate gradient magnitudes for density control decisions
-    // This runs on CPU for simplicity - could be GPU compute shader
+    // PARALLELIZED with GCD for significant speedup
     
     // Must match gradients.hpp and tiled_shaders.metal
     struct GaussianGradients {
@@ -103,22 +107,29 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
     uint32_t* counts = (uint32_t*)gradientCount->contents();
     simd_float3* posGradAccum = (simd_float3*)positionGradAccum->contents();
     
-    for (size_t i = 0; i < gaussianCount; i++) {
-        // Use VIEWSPACE (screen-space) gradients for density control
-        // This matches official 3DGS which uses viewspace_point_tensor.grad[:, :2]
-        float gradMag = sqrtf(grads[i].viewspace_grad_x * grads[i].viewspace_grad_x +
-                              grads[i].viewspace_grad_y * grads[i].viewspace_grad_y);
+    dispatch_queue_t dispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+    size_t chunkSize = (gaussianCount + NUM_THREADS - 1) / NUM_THREADS;
+    
+    dispatch_apply((size_t)NUM_THREADS, dispatchQueue, ^(size_t t) {
+        size_t start = t * chunkSize;
+        size_t end = std::min(start + chunkSize, gaussianCount);
         
-        if (!std::isnan(gradMag) && !std::isinf(gradMag)) {
-            accumGrad[i] += gradMag;
-            counts[i]++;
+        for (size_t i = start; i < end; i++) {
+            // Use VIEWSPACE (screen-space) gradients for density control
+            float gradMag = sqrtf(grads[i].viewspace_grad_x * grads[i].viewspace_grad_x +
+                                  grads[i].viewspace_grad_y * grads[i].viewspace_grad_y);
             
-            // Accumulate position gradients for gradient-directed cloning
-            posGradAccum[i].x += grads[i].position_x;
-            posGradAccum[i].y += grads[i].position_y;
-            posGradAccum[i].z += grads[i].position_z;
+            if (!std::isnan(gradMag) && !std::isinf(gradMag)) {
+                accumGrad[i] += gradMag;
+                counts[i]++;
+                
+                // Accumulate position gradients for gradient-directed cloning
+                posGradAccum[i].x += grads[i].position_x;
+                posGradAccum[i].y += grads[i].position_y;
+                posGradAccum[i].z += grads[i].position_z;
+            }
         }
-    }
+    });
 }
 
 DensityStats DensityController::apply(MTL::CommandQueue* queue,
@@ -154,55 +165,85 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     // Viewspace pruning threshold (20% of image width is too big)
     const float maxScreenFraction = 0.2f;
     
-    // First pass: decide what to do with each Gaussian
-    for (size_t i = 0; i < gaussianCount; i++) {
-        Gaussian& g = gaussians[i];
+    // Per-thread counters for parallel first pass
+    static uint32_t threadPruned[NUM_THREADS];
+    static uint32_t threadCloned[NUM_THREADS];
+    static uint32_t threadSplit[NUM_THREADS];
+    
+    memset(threadPruned, 0, sizeof(threadPruned));
+    memset(threadCloned, 0, sizeof(threadCloned));
+    memset(threadSplit, 0, sizeof(threadSplit));
+    
+    // Capture locals for block
+    const float splitThreshold = 0.01f * sceneExtent;
+    const float pruneThreshold = 0.1f * sceneExtent;
+    
+    dispatch_queue_t dispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+    size_t chunkSize = (gaussianCount + NUM_THREADS - 1) / NUM_THREADS;
+    
+    // First pass: decide what to do with each Gaussian (PARALLEL)
+    dispatch_apply((size_t)NUM_THREADS, dispatchQueue, ^(size_t t) {
+        size_t start = t * chunkSize;
+        size_t end = std::min(start + chunkSize, gaussianCount);
         
-        // Compute sigmoid opacity
-        float opacity = 1.0f / (1.0f + expf(-g.opacity));
+        uint32_t localPruned = 0, localCloned = 0, localSplit = 0;
         
-        // Get average gradient
-        float avgGrad = (counts[i] > 0) ? (accumGrad[i] / counts[i]) : 0.0f;
-        
-        // Compute max scale in WORLD units (apply exp to log scale)
-        float maxScaleVal = fmaxf(fmaxf(
-            expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
-            expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG))),
-            expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG)));
-        
-        // Official 3DGS thresholds (scene-relative)
-        float splitThreshold = 0.01f * sceneExtent;  // Clone small, split large
-        float pruneThreshold = 0.1f * sceneExtent;           // Prune extremely large Gaussians
-        
-        // Decision logic (matches official 3DGS densify_and_prune)
-        bool shouldPrune = (opacity < OPACITY_PRUNE_THRESHOLD);
-        
-        // Also prune Gaussians that are too large in world space
-        if (maxScaleVal > pruneThreshold) {
-            shouldPrune = true;
-        }
-        
-        // Viewspace-based pruning: prune Gaussians with large screen-space footprints
-        float screenFraction = computeApproxScreenRadius(g, focalLength, avgDepth, imageWidth);
-        if (screenFraction > maxScreenFraction) {
-            shouldPrune = true;
-        }
-        
-        if (shouldPrune) {
-            markers[i] = 1;  // Prune
-            stats.numPruned++;
-        } else if (canDensify && avgGrad > GRAD_THRESHOLD) {
-            // Official logic: clone if small, split if large
-            if (maxScaleVal > splitThreshold) {
-                markers[i] = 3;  // Split large Gaussians
-                stats.numSplit++;
-            } else {
-                markers[i] = 2;  // Clone small Gaussians
-                stats.numCloned++;
+        for (size_t i = start; i < end; i++) {
+            Gaussian& g = gaussians[i];
+            
+            // Compute sigmoid opacity
+            float opacity = 1.0f / (1.0f + expf(-g.opacity));
+            
+            // Get average gradient
+            float avgGrad = (counts[i] > 0) ? (accumGrad[i] / counts[i]) : 0.0f;
+            
+            // Compute max scale in WORLD units (apply exp to log scale)
+            float maxScaleVal = fmaxf(fmaxf(
+                expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
+                expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG))),
+                expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG)));
+            
+            // Decision logic (matches official 3DGS densify_and_prune)
+            bool shouldPrune = (opacity < OPACITY_PRUNE_THRESHOLD);
+            
+            // Also prune Gaussians that are too large in world space
+            if (maxScaleVal > pruneThreshold) {
+                shouldPrune = true;
             }
-        } else {
-            markers[i] = 0;  // Keep
+            
+            // Viewspace-based pruning: prune Gaussians with large screen-space footprints
+            float screenFraction = computeApproxScreenRadius(g, focalLength, avgDepth, imageWidth);
+            if (screenFraction > maxScreenFraction) {
+                shouldPrune = true;
+            }
+            
+            if (shouldPrune) {
+                markers[i] = 1;  // Prune
+                localPruned++;
+            } else if (canDensify && avgGrad > GRAD_THRESHOLD) {
+                // Official logic: clone if small, split if large
+                if (maxScaleVal > splitThreshold) {
+                    markers[i] = 3;  // Split large Gaussians
+                    localSplit++;
+                } else {
+                    markers[i] = 2;  // Clone small Gaussians
+                    localCloned++;
+                }
+            } else {
+                markers[i] = 0;  // Keep
+            }
         }
+        
+        threadPruned[t] = localPruned;
+        threadCloned[t] = localCloned;
+        threadSplit[t] = localSplit;
+    });
+    
+    // Sum up thread-local counters
+    for (int t = 0; t < NUM_THREADS; t++) {
+        stats.numPruned += threadPruned[t];
+        stats.numCloned += threadCloned[t];
+        stats.numSplit += threadSplit[t];
     }
     
     // Check capacity

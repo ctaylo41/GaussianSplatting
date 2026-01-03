@@ -237,9 +237,10 @@ kernel void scatter64Simple(
     device const uint* valuesIn [[buffer(1)]],
     device ulong* keysOut [[buffer(2)]],
     device uint* valuesOut [[buffer(3)]],
-    device atomic_uint* prefixSums [[buffer(4)]],  // Now atomic for thread-safe incrementing
-    constant uint& bitOffset [[buffer(5)]],
-    constant uint& numElements [[buffer(6)]],
+    device const uint* prefixSums [[buffer(4)]],   // Now READ-ONLY (not atomic!)
+    device const uint* localRanks [[buffer(5)]],   // NEW: precomputed ranks
+    constant uint& bitOffset [[buffer(6)]],
+    constant uint& numElements [[buffer(7)]],
     uint id [[thread_position_in_grid]])
 {
     if (id >= numElements) return;
@@ -248,9 +249,10 @@ kernel void scatter64Simple(
     uint value = valuesIn[id];
     uint digit = (key >> bitOffset) & 0xFF;
     
-    // Use atomic fetch-add to get unique write position
-    // This is O(1) per thread instead of O(n) per thread
-    uint writePos = atomic_fetch_add_explicit(&prefixSums[digit], 1, memory_order_relaxed);
+    // FIXED: Deterministic write position
+    // prefixSums[digit] = starting index for this digit in output
+    // localRanks[id] = this element's position among elements with same digit
+    uint writePos = prefixSums[digit] + localRanks[id];
     
     if (writePos < numElements) {
         keysOut[writePos] = key;
