@@ -85,7 +85,7 @@ private:
     Camera* activeCamera = nullptr;
     
     MTL::Buffer* positionBuffer = nullptr;
-    GPURadixSort* gpuSort = nullptr;
+    GPURadixSort32* gpuSort = nullptr;
     
     int windowWidth = 800;
     int windowHeight = 600;

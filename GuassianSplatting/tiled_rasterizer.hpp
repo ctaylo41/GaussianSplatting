@@ -1,15 +1,18 @@
 //
-//  tile_rasterizer.hpp
-//  GuassianSplatting
+//  tiled_rasterizer.hpp
+//  GaussianSplatting
 //
-//  Created by Colin Taylor Taylor on 2025-12-28.
+//  Updated with GPU sorting for fast forward pass
 //
 
 #pragma once
+
 #include <Metal/Metal.hpp>
 #include <simd/simd.h>
-#include "ply_loader.hpp"
-#include "gradients.hpp"
+
+// Forward declaration
+class GPUTileSorter;
+class GPURadixSort64;
 
 // Must match shader definition EXACTLY
 struct TileRange {
@@ -17,25 +20,19 @@ struct TileRange {
     uint32_t count;
 };
 
-// Projected Gaussian data for tiled rendering
-// CRITICAL: Use float arrays instead of simd_float3 to match Metal packed_float3 layout
-// simd_float2 has 8-byte alignment, so compiler adds 4 bytes padding after tileMaxY
+// Projected Gaussian data - must match shader struct
 struct ProjectedGaussian {
-    simd_float2 screenPos;   // 8 bytes, offset 0
-    float conic[3];          // 12 bytes, offset 8 - Inverse 2D covariance (use array for packed layout)
-    float depth;             // 4 bytes, offset 20
-    float opacity;           // 4 bytes, offset 24 - After sigmoid
-    float color[3];          // 12 bytes, offset 28 (use array for packed layout)
-    float radius;            // 4 bytes, offset 40
-    uint32_t tileMinX;       // 4 bytes, offset 44
-    uint32_t tileMinY;       // 4 bytes, offset 48
-    uint32_t tileMaxX;       // 4 bytes, offset 52
-    uint32_t tileMaxY;       // 4 bytes, offset 56
-    float _pad1;             // 4 bytes, offset 60 - explicit padding for simd_float2 alignment
-    simd_float2 viewPos_xy;  // 8 bytes, offset 64 - For gradient computation
-    float cov2D[3];          // 12 bytes, offset 72 - (a, b, c) - 2D covariance BEFORE inversion (for backward pass)
-    float _pad2;             // 4 bytes, offset 84 - padding to make struct 88 bytes (multiple of 8)
-};  // Total: 88 bytes with predictable layout
+    simd_float2 screenPos;
+    simd_float3 conic;       // Inverse 2D covariance (a, b, c)
+    float depth;
+    float opacity;           // After sigmoid
+    simd_float3 color;
+    float radius;
+    uint32_t tileMinX;
+    uint32_t tileMinY;
+    uint32_t tileMaxX;
+    uint32_t tileMaxY;
+};
 
 struct TiledUniforms {
     simd_float4x4 viewMatrix;
@@ -43,7 +40,8 @@ struct TiledUniforms {
     simd_float4x4 viewProjectionMatrix;
     simd_float2 screenSize;
     simd_float2 focalLength;
-    simd_float3 cameraPos;     // 16 bytes (12 data + 4 implicit padding)
+    simd_float3 cameraPos;
+    float _pad1;
     uint32_t numTilesX;
     uint32_t numTilesY;
     uint32_t numGaussians;
@@ -54,6 +52,10 @@ class TiledRasterizer {
 public:
     TiledRasterizer(MTL::Device* device, MTL::Library* library, uint32_t maxGaussians);
     ~TiledRasterizer();
+    
+    // Enable/disable GPU sorting (default: enabled)
+    void setUseGPUSort(bool enable) { useGPUSort = enable; }
+    bool getUseGPUSort() const { return useGPUSort; }
     
     void forward(MTL::CommandQueue* queue,
                  MTL::Buffer* gaussianBuffer,
@@ -69,27 +71,63 @@ public:
                   MTL::Texture* renderedTexture,
                   MTL::Texture* groundTruthTexture);
     
+    // Accessors for debugging
+    MTL::Buffer* getSortedIndices() { return valuesBuffer[0]; }
+    MTL::Buffer* getTileRanges() { return tileRanges; }
+    MTL::Buffer* getProjectedGaussians() { return projectedGaussians; }
+    
+    // Performance stats
+    uint32_t getLastPairCount() const { return lastPairCount; }
+    double getLastSortTimeMs() const { return lastSortTimeMs; }
+    
 private:
     static constexpr uint32_t TILE_SIZE = 16;
-    // Average Gaussians touch ~4-8 tiles, set reasonable max
     static constexpr uint32_t AVG_TILES_PER_GAUSSIAN = 8;
+    static constexpr uint32_t MAX_TILES_PER_GAUSSIAN = 256;
+    static constexpr uint32_t THREADGROUP_SIZE = 256;
     
     MTL::Device* device;
+    bool useGPUSort = true;
     
     // Compute pipelines
     MTL::ComputePipelineState* projectGaussiansPSO;
     MTL::ComputePipelineState* tiledForwardPSO;
     MTL::ComputePipelineState* tiledBackwardPSO;
     
-    // Buffers
+    // GPU sorting pipelines (from gpu_sort.metal)
+    MTL::ComputePipelineState* countTilePairsPSO;
+    MTL::ComputePipelineState* generateTileKeysPSO;
+    MTL::ComputePipelineState* histogram64PSO;
+    MTL::ComputePipelineState* prefixSum256PSO;
+    MTL::ComputePipelineState* scatter64SimplePSO;
+    MTL::ComputePipelineState* buildTileRangesPSO;
+    MTL::ComputePipelineState* clearHistogramPSO;
+    
+    // Projection buffer
     MTL::Buffer* projectedGaussians;
-    MTL::Buffer* gaussianKeys;
-    MTL::Buffer* gaussianValues;
-    MTL::Buffer* tileRanges;
+    
+    // Tile sorting buffers
+    MTL::Buffer* tileCountsBuffer;
+    MTL::Buffer* tileOffsetsBuffer;
+    MTL::Buffer* tileWriteIdxBuffer;
     MTL::Buffer* totalPairsBuffer;
+    
+    // 64-bit radix sort buffers (double-buffered)
+    MTL::Buffer* keysBuffer[2];
+    MTL::Buffer* valuesBuffer[2];
+    MTL::Buffer* histogramBuffer;
+    
+    // Output buffers
+    MTL::Buffer* tileRanges;
+    
+    // Per-pixel state for backward pass
+    MTL::Buffer* perPixelTransmittance;
     MTL::Buffer* perPixelLastIdx;
+    
+    // Uniforms
     MTL::Buffer* uniformBuffer;
     
+    // Capacities
     uint32_t maxGaussians;
     uint32_t maxTiles;
     uint32_t maxPairs;
@@ -98,7 +136,17 @@ private:
     uint32_t numTilesX;
     uint32_t numTilesY;
     
+    // Stats
+    uint32_t lastPairCount;
+    double lastSortTimeMs;
+    
     void createPipelines(MTL::Library* library);
-    void ensureBufferCapacity(uint32_t width, uint32_t height, size_t gaussianCount);
+    void ensureBufferCapacity(uint32_t width, uint32_t height);
     void ensurePairsCapacity(uint32_t requiredPairs);
+    
+    // GPU sorting implementation
+    void gpuSort(MTL::CommandQueue* queue, size_t gaussianCount);
+    
+    // CPU fallback (for debugging)
+    void cpuSort(size_t gaussianCount);
 };

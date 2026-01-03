@@ -252,7 +252,7 @@ void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians, float scen
     std::cout << "Density control using scene extent: " << sceneExtent << std::endl;
     DensityController::setSceneExtent(sceneExtent);
     
-    gpuSort = new GPURadixSort(metalDevice, 2000000);
+    gpuSort = new GPURadixSort32(metalDevice, shaderLibrary, 2000000);
     optimizer = new AdamOptimizer(metalDevice, shaderLibrary, 2000000);
     densityController = new DensityController(metalDevice, shaderLibrary);
     densityController->resetAccumulator(gaussianCount);
@@ -322,8 +322,8 @@ void MTLEngine::createDepthTexture() {
 }
 
 void MTLEngine::render(Camera& camera) {
-    // Use CPU sort for now (debugging GPU sort issues)
-    MTL::Buffer* sortedIndices = gpuSort->sortCPU(positionBuffer, camera.get_position(), gaussianCount);
+    // GPU radix sort for depth ordering
+    MTL::Buffer* sortedIndices = gpuSort->sort(commandQueue, positionBuffer, camera.get_position(), gaussianCount);
     
     Uniforms uniforms;
     
@@ -937,7 +937,7 @@ void MTLEngine::train(size_t numEpochs) {
             // OPACITY RESET (Critical for preventing floaters)
             // Official 3DGS resets opacity every 3000 iterations
             // ============================================================
-            if (totalIterations % OPACITY_RESET_INTERVAL == 0) {
+            if (totalIterations == OPACITY_RESET_INTERVAL) {
                 std::cout << std::endl << "Resetting opacity at iteration " << totalIterations << std::endl;
                 
                 Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
