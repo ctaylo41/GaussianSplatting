@@ -38,6 +38,7 @@ public:
     void loadTrainingData(const ColmapData& colmap, const std::string& imagePath);
     void train(size_t numEpochs);
     void initHeadless();
+    void exportTrainingViews(const std::string& outputFolder);
     const Gaussian* getGaussians() const {
             return gaussianBuffer ? (const Gaussian*)gaussianBuffer->contents() : nullptr;
     };
@@ -140,6 +141,5 @@ private:
     size_t currentImageIdx = 0;
     float epochLoss = 0.0f;
     size_t epochIterations = 0;
-    
 
 };

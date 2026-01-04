@@ -257,9 +257,17 @@ int main(int argc, char* argv[]) {
         std::cout << "Scene center: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
         std::cout << "Scene diagonal: " << diagonal << std::endl;
         
-        Camera camera = Camera(center, 0, 0.3f, 1.5f * diagonal,
+        // Start closer for better initial view, with slight downward angle
+        float viewDistance = std::max(0.5f * diagonal, 1.0f);  // At least 1 unit away
+        float nearPlane = std::max(0.01f, diagonal * 0.001f);  // Closer near plane for small scenes
+        float farPlane = std::max(100.0f, diagonal * 10.0f);   // Far enough to see everything
+        
+        std::cout << "Initial view distance: " << viewDistance << std::endl;
+        std::cout << "Near/Far planes: " << nearPlane << " / " << farPlane << std::endl;
+        
+        Camera camera = Camera(center, 0, 0.4f, viewDistance,
                                45.0f * M_PI / 180.0f, 800.0f / 600.0f,
-                               0.1f, 10.0f * diagonal);
+                               nearPlane, farPlane);
         
         MTLEngine engine;
         engine.init();
@@ -269,6 +277,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  Left mouse drag: Orbit camera" << std::endl;
         std::cout << "  Right mouse drag: Pan camera" << std::endl;
         std::cout << "  Scroll: Zoom in/out" << std::endl;
+        std::cout << "  Note: Training view (T key) not available without COLMAP data" << std::endl;
         std::cout << "  ESC: Exit" << std::endl;
         
         engine.run(camera);
@@ -365,6 +374,17 @@ int main(int argc, char* argv[]) {
     printf("\n=== Starting Training ===\n");
     engine.train(numEpochs);
     
+    // Export rendered views from each training camera
+    // Get output folder from PLY path (same directory, "renders" subfolder)
+    std::string rendersFolder = outputPath;
+    size_t lastSlash = rendersFolder.rfind('/');
+    if (lastSlash != std::string::npos) {
+        rendersFolder = rendersFolder.substr(0, lastSlash) + "/renders";
+    } else {
+        rendersFolder = "renders";
+    }
+    engine.exportTrainingViews(rendersFolder);
+    
     // Export trained Gaussians to PLY
     printf("\n=== Exporting PLY ===\n");
     const Gaussian* trainedGaussians = engine.getGaussians();
@@ -386,6 +406,8 @@ int main(int argc, char* argv[]) {
     printf("  Left mouse drag: Orbit camera\n");
     printf("  Right mouse drag: Pan camera\n");
     printf("  Scroll: Zoom in/out\n");
+    printf("  T: Toggle training view (snap to training camera positions)\n");
+    printf("  Left/Right arrows: Navigate training images (when in training view)\n");
     printf("  ESC: Exit\n\n");
     
     // Load the exported PLY
@@ -420,20 +442,25 @@ int main(int argc, char* argv[]) {
     std::cout << "Viewer scene center: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
     std::cout << "Viewer scene diagonal: " << diagonal << std::endl;
     
-    // Use distance based on scene size - position camera to see the whole scene
-    float viewDistance = 1.5f * diagonal;
+    // Use distance based on scene size - position camera closer to see details
+    float viewDistance = std::max(0.5f * diagonal, 1.0f);
+    float nearPlane = std::max(0.01f, diagonal * 0.001f);
+    float farPlane = std::max(100.0f, diagonal * 10.0f);
     std::cout << "Viewer distance: " << viewDistance << std::endl;
+    std::cout << "Near/Far planes: " << nearPlane << " / " << farPlane << std::endl;
     
     // Position camera to look at the actual scene center
     simd_float3 viewTarget = center;
     
-    Camera viewerCamera = Camera(viewTarget, 0, 0.3f, viewDistance,
+    Camera viewerCamera = Camera(viewTarget, 0, 0.4f, viewDistance,
                                   45.0f * M_PI / 180.0f, 800.0f / 600.0f,
-                                  0.1f, 10.0f * diagonal);
+                                  nearPlane, farPlane);
     
     MTLEngine viewerEngine;
     viewerEngine.init();
-    viewerEngine.loadGaussians(loadedGaussians);
+    // Load training data so T key and arrow keys work for navigating training views
+    viewerEngine.loadTrainingData(colmap, imagePath);
+    viewerEngine.loadGaussians(loadedGaussians, sceneExtent);
     viewerEngine.run(viewerCamera);
     viewerEngine.cleanup();
     

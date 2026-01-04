@@ -81,6 +81,7 @@ private:
     MTL::ComputePipelineState* tiledForwardPSO;
     MTL::ComputePipelineState* tiledBackwardPSO;
     MTL::ComputePipelineState* buildTileRangesPSO;
+    MTL::ComputePipelineState* generatePairsPSO;
     
     // Buffers
     MTL::Buffer* projectedGaussians;
@@ -90,6 +91,7 @@ private:
     MTL::Buffer* totalPairsBuffer;
     MTL::Buffer* perPixelLastIdx;
     MTL::Buffer* uniformBuffer;
+    MTL::Buffer* pairCounterBuffer;  // Atomic counter for GPU pair generation
     
     uint32_t maxGaussians;
     uint32_t maxTiles;

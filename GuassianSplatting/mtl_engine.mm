@@ -10,6 +10,7 @@
 #include "gradients.hpp"
 #include <chrono>
 #include <fstream>
+#include <Foundation/NSAutoreleasePool.hpp>
 
 // Debug: Save a Metal texture to a PPM file
 void saveTextureToPPM(MTL::Texture* texture, MTL::Device* device, MTL::CommandQueue* queue, const char* filename) {
@@ -964,6 +965,9 @@ void MTLEngine::train(size_t numEpochs) {
         auto epochStart = std::chrono::high_resolution_clock::now();
         
         for (size_t imgIdx = 0; imgIdx < trainingImages.size(); imgIdx++) {
+            // Autorelease pool to prevent memory buildup from temporary Metal objects
+            NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+            
             // Compute decayed learning rates
             float currentPositionLR = exponentialLRDecay(POSITION_LR_INIT, POSITION_LR_FINAL, 
                                                           totalIterations, totalExpectedIters);
@@ -1020,6 +1024,8 @@ void MTLEngine::train(size_t numEpochs) {
                     optimizer->resizeIfNeeded(gaussianCount);
                 }
             }
+            
+            pool->release();
         }
         
         updatePositionBuffer();
@@ -1042,4 +1048,83 @@ void MTLEngine::train(size_t numEpochs) {
     auto totalDuration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
     
     std::cout << "Training complete! Total time: " << totalDuration << "s" << std::endl;
+}
+
+void MTLEngine::exportTrainingViews(const std::string& outputFolder) {
+    if (trainingImages.empty()) {
+        std::cerr << "No training images to export views for!" << std::endl;
+        return;
+    }
+    
+    // Create output folder if it doesn't exist
+    std::string mkdirCmd = "mkdir -p \"" + outputFolder + "\"";
+    system(mkdirCmd.c_str());
+    
+    std::cout << "\n=== Exporting " << trainingImages.size() << " training views to " << outputFolder << " ===" << std::endl;
+    
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
+    for (size_t imgIdx = 0; imgIdx < trainingImages.size(); imgIdx++) {
+        const TrainingImage& img = trainingImages[imgIdx];
+        const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
+        
+        // Create render target matching the original image size
+        if (!renderTarget || renderTarget->width() != cam.width || renderTarget->height() != cam.height) {
+            createRenderTarget(cam.width, cam.height);
+        }
+        
+        // Set up uniforms for this view (TiledUniforms for tiled rasterizer)
+        TiledUniforms uniforms;
+        uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
+        
+        float near = 0.1f;
+        float far = 1000.0f;
+        
+        // Projection matching training
+        simd_float4x4 proj = {0};
+        proj.columns[0][0] = 2.0f * cam.fx / cam.width;
+        proj.columns[1][1] = 2.0f * cam.fy / cam.height;
+        proj.columns[2][0] = 2.0f * cam.cx / cam.width - 1.0f;
+        proj.columns[2][1] = 2.0f * cam.cy / cam.height - 1.0f;
+        proj.columns[2][2] = far / (far - near);
+        proj.columns[2][3] = 1.0f;
+        proj.columns[3][2] = -(far * near) / (far - near);
+        uniforms.projectionMatrix = proj;
+        
+        uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
+        uniforms.screenSize = simd_make_float2((float)cam.width, (float)cam.height);
+        uniforms.focalLength = simd_make_float2(cam.fx, cam.fy);
+        
+        simd_float3x3 R;
+        R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
+        R.columns[1] = uniforms.viewMatrix.columns[1].xyz;
+        R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
+        uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
+        
+        // Set tile info
+        uniforms.numTilesX = (cam.width + 15) / 16;
+        uniforms.numTilesY = (cam.height + 15) / 16;
+        uniforms.numGaussians = (uint32_t)gaussianCount;
+        
+        // Render
+        tiledRasterizer->forward(commandQueue, gaussianBuffer, gaussianCount, uniforms, renderTarget);
+        
+        // Generate filename from image ID
+        char filename[64];
+        snprintf(filename, sizeof(filename), "image_%04u_render.ppm", img.imageId);
+        
+        std::string outputPath = outputFolder + "/" + filename;
+        saveTextureToPPM(renderTarget, metalDevice, commandQueue, outputPath.c_str());
+        
+        // Progress
+        if (imgIdx % 10 == 0 || imgIdx == trainingImages.size() - 1) {
+            std::cout << "\rExporting views: " << (imgIdx + 1) << "/" << trainingImages.size() << std::flush;
+        }
+    }
+    
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
+    
+    std::cout << std::endl << "Exported " << trainingImages.size() << " views in " << duration << "s" << std::endl;
+    std::cout << "Output folder: " << outputFolder << std::endl;
 }

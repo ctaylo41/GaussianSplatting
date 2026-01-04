@@ -328,15 +328,16 @@ kernel void tiledForward(
     uint tileIdx = tileY * uniforms.numTilesX + tileX;
     TileRange range = tileRanges[tileIdx];
     
-    float3 color = float3(0);
-    float T = 1.0;
+    // Use half precision for color accumulation (2x throughput on Apple Silicon)
+    half3 color = half3(0);
+    half T = 1.0h;
     float2 pixelPos = float2(gid) + 0.5;
     
     uint lastIdx = 0;
     bool hasContrib = false;
     
     // Rely purely on T termination instead of artificial cap
-    for (uint i = 0; i < range.count && T > 0.0001; i++) {
+    for (uint i = 0; i < range.count && T > 0.0001h; i++) {
         uint sortIdx = range.start + i;
         uint gIdx = sortedIndices[sortIdx];
         
@@ -352,19 +353,20 @@ kernel void tiledForward(
         float conicMag = abs(p.conic.x) + abs(p.conic.y) + abs(p.conic.z);
         if (conicMag < 0.0001) continue;  // Skip if conic is essentially zero
         
-        float power = -0.5 * (p.conic.x * d.x * d.x +
-                              2.0 * p.conic.y * d.x * d.y +
-                              p.conic.z * d.y * d.y);
+        // Gaussian evaluation in half precision
+        half power = half(-0.5 * (p.conic.x * d.x * d.x +
+                                   2.0 * p.conic.y * d.x * d.y +
+                                   p.conic.z * d.y * d.y));
         
-        if (power > 0.0 || power < -4.5) continue;
+        if (power > 0.0h || power < -4.5h) continue;
         
-        float G = exp(power);
-        float alpha = min(p.opacity * G, 0.99f);
+        half G = exp(power);
+        half alpha = min(half(p.opacity) * G, 0.99h);
         
-        if (alpha < 1.0 / 255.0) continue;
+        if (alpha < half(1.0 / 255.0)) continue;
         
-        color += p.color * alpha * T;
-        T *= (1.0 - alpha);
+        color += half3(p.color) * alpha * T;
+        T *= (1.0h - alpha);
         
         lastIdx = sortIdx;
         hasContrib = true;
@@ -373,7 +375,7 @@ kernel void tiledForward(
     uint pixelIdx = gid.y * uint(uniforms.screenSize.x) + gid.x;
     lastContribIdx[pixelIdx] = hasContrib ? lastIdx : UINT_MAX;
     
-    output.write(float4(color, 1.0 - T), gid);
+    output.write(float4(float3(color), 1.0 - float(T)), gid);
 }
 
 kernel void tiledBackward(
