@@ -21,8 +21,6 @@ Camera::Camera(simd_float3 target, float azimuth, float elevation, float distanc
     
     up = simd_make_float3(0.0f,1.0f,0.0f);
     updateMatrices();
-    
-    
 }
 
 void Camera::updateMatrices() {
@@ -32,10 +30,7 @@ void Camera::updateMatrices() {
     
     position = simd_make_float3(target.x + x, target.y + y, target.z + z);
     
-    // Use left-hand coordinate system to match COLMAP convention
-    // In left-hand: +Z forward, so objects in front have POSITIVE z in view space
-    // This matches what the training shader expects
-    
+    // Use left-hand coordinate system to match COLMAP convention positive Z
     
     view_matrix = matrix_look_at_left_hand(position.x, position.y, position.z, target.x, target.y, target.z, up.x, up.y, up.z);
     

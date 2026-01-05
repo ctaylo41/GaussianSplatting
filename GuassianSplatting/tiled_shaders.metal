@@ -372,10 +372,14 @@ kernel void tiledForward(
         hasContrib = true;
     }
     
+    // Blend with white background using remaining transmittance
+    half3 bgColor = half3(1.0h, 1.0h, 1.0h);  // White background
+    color = color + bgColor * T;
+    
     uint pixelIdx = gid.y * uint(uniforms.screenSize.x) + gid.x;
     lastContribIdx[pixelIdx] = hasContrib ? lastIdx : UINT_MAX;
     
-    output.write(float4(float3(color), 1.0 - float(T)), gid);
+    output.write(float4(float3(color), 1.0), gid);
 }
 
 kernel void tiledBackward(
@@ -445,7 +449,12 @@ kernel void tiledBackward(
     // Now traverse BACK-TO-FRONT for gradients
     // T starts at T_final and we "undo" by dividing by (1-alpha)
     float T = T_final;
-    float3 accum_rec = float3(0.0);  // Accumulated color from Gaussians BEHIND current (already processed)
+    
+    // IMPORTANT: Initialize accum_rec to the background color!
+    // accum_rec tracks what's "behind" the current Gaussian.
+    // At the back of the scene, what's behind is the background.
+    float3 bgColor = float3(1.0);  // White background - must match forward pass
+    float3 accum_rec = bgColor;  // Accumulated color from Gaussians BEHIND current (starts with background)
     
     // Iterate in reverse order (back to front)
     for (int sortIdx = int(endIdx) - 1; sortIdx >= int(range.start); sortIdx--) {

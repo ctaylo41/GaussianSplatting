@@ -491,7 +491,7 @@ void MTLEngine::render(Camera& camera) {
     renderPassDesc->colorAttachments()->object(0)->setTexture(drawable->texture());
     renderPassDesc->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
     renderPassDesc->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
-    renderPassDesc->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 1.0));
+    renderPassDesc->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(1.0, 1.0, 1.0, 1.0));
     
     MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
     MTL::RenderCommandEncoder* encoder = commandBuffer->renderCommandEncoder(renderPassDesc);
@@ -996,17 +996,21 @@ void MTLEngine::train(size_t numEpochs) {
                     gaussians[i].opacity = OPACITY_RESET_VALUE;
                 }
                 
-                // Also reset optimizer momentum for opacity to allow fresh learning
-                // (Optional but recommended - need to expose reset method in optimizer)
+                // Reset optimizer momentum for opacity to allow fresh learning
+                optimizer->resetOpacityMomentum();
             }
             
             // ============================================================
             // DENSITY CONTROL
             // Only run between iterations 500 and 15000
+            // Skip 500 iterations after opacity reset to let Gaussians recover
             // ============================================================
+            bool inOpacityRecoveryPeriod = (totalIterations > OPACITY_RESET_INTERVAL &&
+                                            totalIterations <= OPACITY_RESET_INTERVAL + 500);
             bool shouldDensify = (totalIterations >= DENSIFY_FROM_ITER &&
                                   totalIterations < DENSIFY_UNTIL_ITER &&
-                                  totalIterations % densityControlInterval == 0);
+                                  totalIterations % densityControlInterval == 0 &&
+                                  !inOpacityRecoveryPeriod);
             
             if (shouldDensify) {
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
