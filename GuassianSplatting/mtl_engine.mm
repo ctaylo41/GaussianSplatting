@@ -946,7 +946,7 @@ void MTLEngine::train(size_t numEpochs) {
     // Position LR decays exponentially from init to final
     const float POSITION_LR_INIT = 0.00016f;
     const float POSITION_LR_FINAL = 0.0000016f;  // 100x smaller at end
-    const float SCALE_LR = 0.005f;
+    const float SCALE_LR = 0.001f;  // Reduced from 0.005 to prevent scale bloating
     const float ROTATION_LR = 0.001f;
     const float OPACITY_LR = 0.05f;
     const float SH_LR = 0.0025f;
@@ -1005,7 +1005,7 @@ void MTLEngine::train(size_t numEpochs) {
             // Only run between iterations 500 and 15000
             // Skip 500 iterations after opacity reset to let Gaussians recover
             // ============================================================
-            bool inOpacityRecoveryPeriod = (totalIterations > OPACITY_RESET_INTERVAL &&
+            bool inOpacityRecoveryPeriod = (totalIterations >= OPACITY_RESET_INTERVAL &&
                                             totalIterations <= OPACITY_RESET_INTERVAL + 500);
             bool shouldDensify = (totalIterations >= DENSIFY_FROM_ITER &&
                                   totalIterations < DENSIFY_UNTIL_ITER &&
