@@ -111,9 +111,14 @@ private:
     
     // Loss computation
     MTL::ComputePipelineState* lossComputePSO = nullptr;
+    MTL::ComputePipelineState* ssimComputePSO = nullptr;
+    MTL::ComputePipelineState* combinedLossPSO = nullptr;
     MTL::ComputePipelineState* reductionPSO = nullptr;
     MTL::Buffer* lossBuffer = nullptr;
+    MTL::Buffer* ssimBuffer = nullptr;
+    MTL::Buffer* combinedLossBuffer = nullptr;
     MTL::Buffer* totalLossBuffer = nullptr;
+    float lambdaDSSIM = 0.2f;  // Paper: 0.2 weight for D-SSIM
     void createLossPipeline();
     float computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth);
     

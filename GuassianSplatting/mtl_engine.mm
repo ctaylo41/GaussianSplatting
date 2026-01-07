@@ -692,19 +692,39 @@ void MTLEngine::createRenderTarget(uint32_t width, uint32_t height) {
 void MTLEngine::createLossPipeline() {
     NS::Error* error = nullptr;
     
+    // L1 loss pipeline
     MTL::Function* lossFunc = shaderLibrary->newFunction(NS::String::string("computeL1Loss", NS::ASCIIStringEncoding));
     lossComputePSO = metalDevice->newComputePipelineState(lossFunc, &error);
     if (!lossComputePSO) {
-        std::cerr << "Failed to create loss pipeline: " << error->localizedDescription()->utf8String() << std::endl;
+        std::cerr << "Failed to create L1 loss pipeline: " << error->localizedDescription()->utf8String() << std::endl;
     }
     lossFunc->release();
     
+    // SSIM loss pipeline
+    MTL::Function* ssimFunc = shaderLibrary->newFunction(NS::String::string("computeSSIM", NS::ASCIIStringEncoding));
+    ssimComputePSO = metalDevice->newComputePipelineState(ssimFunc, &error);
+    if (!ssimComputePSO) {
+        std::cerr << "Failed to create SSIM pipeline: " << error->localizedDescription()->utf8String() << std::endl;
+    }
+    ssimFunc->release();
+    
+    // Combined loss pipeline  
+    MTL::Function* combinedFunc = shaderLibrary->newFunction(NS::String::string("computeCombinedLoss", NS::ASCIIStringEncoding));
+    combinedLossPSO = metalDevice->newComputePipelineState(combinedFunc, &error);
+    if (!combinedLossPSO) {
+        std::cerr << "Failed to create combined loss pipeline: " << error->localizedDescription()->utf8String() << std::endl;
+    }
+    combinedFunc->release();
+    
+    // Reduction pipeline
     MTL::Function* reduceFunc = shaderLibrary->newFunction(NS::String::string("reduceLoss", NS::ASCIIStringEncoding));
     reductionPSO = metalDevice->newComputePipelineState(reduceFunc, &error);
     if (!reductionPSO) {
         std::cerr << "Failed to create reduction pipeline: " << error->localizedDescription()->utf8String() << std::endl;
     }
     reduceFunc->release();
+    
+    std::cout << "Loss pipelines created (L1 + D-SSIM with lambda=" << lambdaDSSIM << ")" << std::endl;
 }
 
 float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) {
@@ -712,9 +732,20 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
     uint32_t height = rendered->height();
     uint32_t pixelCount = width * height;
     
+    // Allocate buffers for L1, SSIM, and combined losses
     if (!lossBuffer || lossBuffer->length() < pixelCount * sizeof(float)) {
         if (lossBuffer) lossBuffer->release();
         lossBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+    
+    if (!ssimBuffer || ssimBuffer->length() < pixelCount * sizeof(float)) {
+        if (ssimBuffer) ssimBuffer->release();
+        ssimBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+    
+    if (!combinedLossBuffer || combinedLossBuffer->length() < pixelCount * sizeof(float)) {
+        if (combinedLossBuffer) combinedLossBuffer->release();
+        combinedLossBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
     }
     
     if (!totalLossBuffer) {
@@ -727,17 +758,36 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
     MTL::CommandBuffer* cmdBuffer = commandQueue->commandBuffer();
     MTL::ComputeCommandEncoder* encoder = cmdBuffer->computeCommandEncoder();
     
+    MTL::Size gridSize = MTL::Size(width, height, 1);
+    MTL::Size threadGroupSize = MTL::Size(16, 16, 1);
+    
+    // Step 1: Compute L1 loss per pixel
     encoder->setComputePipelineState(lossComputePSO);
     encoder->setTexture(rendered, 0);
     encoder->setTexture(groundTruth, 1);
     encoder->setBuffer(lossBuffer, 0, 0);
-    
-    MTL::Size gridSize = MTL::Size(width, height, 1);
-    MTL::Size threadGroupSize = MTL::Size(16, 16, 1);
     encoder->dispatchThreads(gridSize, threadGroupSize);
     
+    // Step 2: Compute SSIM (D-SSIM) per pixel
+    encoder->setComputePipelineState(ssimComputePSO);
+    encoder->setTexture(rendered, 0);
+    encoder->setTexture(groundTruth, 1);
+    encoder->setBuffer(ssimBuffer, 0, 0);
+    encoder->dispatchThreads(gridSize, threadGroupSize);
+    
+    // Step 3: Combine losses: (1-lambda)*L1 + lambda*D-SSIM
+    encoder->setComputePipelineState(combinedLossPSO);
+    encoder->setTexture(rendered, 0);
+    encoder->setTexture(groundTruth, 1);
+    encoder->setBuffer(lossBuffer, 0, 0);           // L1 losses
+    encoder->setBuffer(ssimBuffer, 0, 1);           // SSIM losses  
+    encoder->setBuffer(combinedLossBuffer, 0, 2);   // Output combined
+    encoder->setBytes(&lambdaDSSIM, sizeof(float), 3);
+    encoder->dispatchThreads(gridSize, threadGroupSize);
+    
+    // Step 4: Reduce combined loss to single value
     encoder->setComputePipelineState(reductionPSO);
-    encoder->setBuffer(lossBuffer, 0, 0);
+    encoder->setBuffer(combinedLossBuffer, 0, 0);
     encoder->setBuffer(totalLossBuffer, 0, 1);
     encoder->setBytes(&pixelCount, sizeof(uint32_t), 2);
     
@@ -1008,14 +1058,17 @@ void MTLEngine::train(size_t numEpochs) {
             // ============================================================
             // DENSITY CONTROL
             // Only run between iterations 500 and 15000
-            // Skip 500 iterations after opacity reset to let Gaussians recover
+            // Skip 500 iterations after EACH opacity reset to let Gaussians recover
             // ============================================================
-            bool inOpacityRecoveryPeriod = (totalIterations >= OPACITY_RESET_INTERVAL &&
-                                            totalIterations <= OPACITY_RESET_INTERVAL + 500);
+            // Check if we're within 500 iterations after ANY opacity reset (3000, 6000, 9000, 12000)
+            size_t itersSinceLastReset = totalIterations % OPACITY_RESET_INTERVAL;
+            bool justAfterReset = (totalIterations >= OPACITY_RESET_INTERVAL && 
+                                   itersSinceLastReset > 0 && 
+                                   itersSinceLastReset <= 500);
             bool shouldDensify = (totalIterations >= DENSIFY_FROM_ITER &&
                                   totalIterations < DENSIFY_UNTIL_ITER &&
                                   totalIterations % densityControlInterval == 0 &&
-                                  !inOpacityRecoveryPeriod);
+                                  !justAfterReset);
             
             if (shouldDensify) {
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,

@@ -323,6 +323,146 @@ kernel void reduceLoss(
     atomic_fetch_add_explicit(totalLoss, sum, memory_order_relaxed);
 }
 
+// ============ SSIM Loss Computation ============
+// Computes local SSIM over 11x11 windows with Gaussian weighting
+// SSIM = (2*mu_x*mu_y + C1)(2*sigma_xy + C2) / ((mu_x^2 + mu_y^2 + C1)(sigma_x^2 + sigma_y^2 + C2))
+// D-SSIM = (1 - SSIM) / 2
+
+constant float SSIM_C1 = 0.01f * 0.01f;  // (0.01 * L)^2 where L=1 for normalized images
+constant float SSIM_C2 = 0.03f * 0.03f;  // (0.03 * L)^2
+constant int SSIM_WINDOW_SIZE = 11;
+constant int SSIM_WINDOW_RADIUS = 5;
+
+// Precomputed Gaussian weights for 11x11 window (sigma=1.5)
+// These are separable: weight[x][y] = gauss1d[x] * gauss1d[y]
+constant float SSIM_GAUSS_1D[11] = {
+    0.0113437f, 0.0838195f, 0.0838195f, 0.000335463f, 0.0f,  // Actually use proper Gaussian
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f  // Placeholder - we compute inline
+};
+
+kernel void computeSSIM(
+    texture2d<float, access::read> rendered [[texture(0)]],
+    texture2d<float, access::read> groundTruth [[texture(1)]],
+    device float* ssimMap [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint width = rendered.get_width();
+    uint height = rendered.get_height();
+    
+    if (gid.x >= width || gid.y >= height) return;
+    
+    // Compute Gaussian-weighted local statistics
+    float mu_x = 0.0f, mu_y = 0.0f;
+    float sigma_x_sq = 0.0f, sigma_y_sq = 0.0f, sigma_xy = 0.0f;
+    float weight_sum = 0.0f;
+    
+    // Gaussian kernel with sigma = 1.5
+    float sigma = 1.5f;
+    float two_sigma_sq = 2.0f * sigma * sigma;
+    
+    for (int dy = -SSIM_WINDOW_RADIUS; dy <= SSIM_WINDOW_RADIUS; dy++) {
+        for (int dx = -SSIM_WINDOW_RADIUS; dx <= SSIM_WINDOW_RADIUS; dx++) {
+            int px = int(gid.x) + dx;
+            int py = int(gid.y) + dy;
+            
+            // Clamp to image boundaries
+            px = clamp(px, 0, int(width) - 1);
+            py = clamp(py, 0, int(height) - 1);
+            
+            // Gaussian weight
+            float dist_sq = float(dx * dx + dy * dy);
+            float w = exp(-dist_sq / two_sigma_sq);
+            weight_sum += w;
+            
+            // Read pixels (convert to grayscale luminance for SSIM)
+            float4 r = rendered.read(uint2(px, py));
+            float4 gt = groundTruth.read(uint2(px, py));
+            
+            // Use luminance or average RGB
+            float x_val = (r.r + r.g + r.b) / 3.0f;
+            float y_val = (gt.r + gt.g + gt.b) / 3.0f;
+            
+            mu_x += w * x_val;
+            mu_y += w * y_val;
+        }
+    }
+    
+    // Normalize means
+    mu_x /= weight_sum;
+    mu_y /= weight_sum;
+    
+    // Second pass for variance and covariance
+    weight_sum = 0.0f;
+    for (int dy = -SSIM_WINDOW_RADIUS; dy <= SSIM_WINDOW_RADIUS; dy++) {
+        for (int dx = -SSIM_WINDOW_RADIUS; dx <= SSIM_WINDOW_RADIUS; dx++) {
+            int px = int(gid.x) + dx;
+            int py = int(gid.y) + dy;
+            
+            px = clamp(px, 0, int(width) - 1);
+            py = clamp(py, 0, int(height) - 1);
+            
+            float dist_sq = float(dx * dx + dy * dy);
+            float w = exp(-dist_sq / two_sigma_sq);
+            weight_sum += w;
+            
+            float4 r = rendered.read(uint2(px, py));
+            float4 gt = groundTruth.read(uint2(px, py));
+            
+            float x_val = (r.r + r.g + r.b) / 3.0f;
+            float y_val = (gt.r + gt.g + gt.b) / 3.0f;
+            
+            float dx_val = x_val - mu_x;
+            float dy_val = y_val - mu_y;
+            
+            sigma_x_sq += w * dx_val * dx_val;
+            sigma_y_sq += w * dy_val * dy_val;
+            sigma_xy += w * dx_val * dy_val;
+        }
+    }
+    
+    // Normalize variances
+    sigma_x_sq /= weight_sum;
+    sigma_y_sq /= weight_sum;
+    sigma_xy /= weight_sum;
+    
+    // Compute SSIM
+    float numerator = (2.0f * mu_x * mu_y + SSIM_C1) * (2.0f * sigma_xy + SSIM_C2);
+    float denominator = (mu_x * mu_x + mu_y * mu_y + SSIM_C1) * (sigma_x_sq + sigma_y_sq + SSIM_C2);
+    float ssim = numerator / denominator;
+    
+    // D-SSIM = (1 - SSIM) / 2, clamped to [0, 1]
+    float dssim = clamp((1.0f - ssim) / 2.0f, 0.0f, 1.0f);
+    
+    uint idx = gid.y * width + gid.x;
+    ssimMap[idx] = dssim;
+}
+
+// Combined loss: 0.8 * L1 + 0.2 * D-SSIM
+kernel void computeCombinedLoss(
+    texture2d<float, access::read> rendered [[texture(0)]],
+    texture2d<float, access::read> groundTruth [[texture(1)]],
+    device float* l1Losses [[buffer(0)]],
+    device float* ssimLosses [[buffer(1)]],
+    device float* combinedLosses [[buffer(2)]],
+    constant float& lambda_dssim [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint width = rendered.get_width();
+    uint height = rendered.get_height();
+    
+    if (gid.x >= width || gid.y >= height) return;
+    
+    uint idx = gid.y * width + gid.x;
+    
+    // Read pre-computed losses
+    float l1 = l1Losses[idx];
+    float dssim = ssimLosses[idx];
+    
+    // Combined: (1 - lambda) * L1 + lambda * D-SSIM
+    // Default lambda = 0.2 to match official 3DGS
+    combinedLosses[idx] = (1.0f - lambda_dssim) * l1 + lambda_dssim * dssim;
+}
+
 struct GaussianGradients {
     float position_x;
     float position_y;
