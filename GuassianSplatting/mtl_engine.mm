@@ -984,16 +984,21 @@ void MTLEngine::train(size_t numEpochs) {
             
             // ============================================================
             // OPACITY RESET (Critical for preventing floaters)
-            // Official 3DGS resets opacity every 3000 iterations
+            // Official 3DGS resets opacity every 3000 iterations until iter 15000
+            // Uses clamping: min(current_opacity, 0.01) - keeps low opacities unchanged
             // ============================================================
-            if (totalIterations == OPACITY_RESET_INTERVAL) {
+            if (totalIterations % OPACITY_RESET_INTERVAL == 0 && 
+                totalIterations > 0 && 
+                totalIterations < DENSIFY_UNTIL_ITER) {
                 std::cout << std::endl << "Resetting opacity at iteration " << totalIterations << std::endl;
                 
                 Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
                 for (size_t i = 0; i < gaussianCount; i++) {
-                    // Reset to low opacity (sigmoid(−4.6) ≈ 0.01)
-                    // This allows pruning to remove floaters on next density control
-                    gaussians[i].opacity = OPACITY_RESET_VALUE;
+                    // Clamp opacity to max 0.01: min(current, sigmoid^-1(0.01))
+                    // This keeps already-low opacities unchanged but caps high ones
+                    if (gaussians[i].opacity > OPACITY_RESET_VALUE) {
+                        gaussians[i].opacity = OPACITY_RESET_VALUE;
+                    }
                 }
                 
                 // Reset optimizer momentum for opacity to allow fresh learning
