@@ -1,8 +1,8 @@
 //
 //  gpu_sort.hpp
-//  GaussianSplatting
+//  GuassianSplatting
 //
-//  Fixed GPU Radix Sort - Header
+//  Created by Colin Taylor Taylor on 2025-12-31.
 //
 
 #pragma once
@@ -10,9 +10,6 @@
 #include <Metal/Metal.hpp>
 #include <simd/simd.h>
 
-// ============================================================================
-// 32-bit GPU Radix Sort (for viewer depth sorting)
-// ============================================================================
 
 class GPURadixSort32 {
 public:
@@ -22,16 +19,17 @@ public:
     // Sort Gaussians by depth, returns buffer of sorted indices
     // Uses 4 passes of 8-bit radix sort
     MTL::Buffer* sort(MTL::CommandQueue* queue,
-                      MTL::Buffer* positionBuffer,  // float3 positions
+                      MTL::Buffer* positionBuffer,
                       simd_float3 cameraPos,
                       size_t numElements);
+    
     
     MTL::Buffer* getSortedIndices() { return valuesBuffers[currentBuffer]; }
     
 private:
     static constexpr size_t RADIX_SIZE = 256;
     static constexpr size_t THREADGROUP_SIZE = 256;
-    static constexpr size_t NUM_PASSES = 4;  // 32 bits / 8 bits per pass
+    static constexpr size_t NUM_PASSES = 4;  
     
     MTL::Device* device;
     size_t maxElements;
@@ -56,13 +54,12 @@ private:
     // Uniform buffers
     MTL::Buffer* cameraPosBuffer;
     
+    // Helper methods
     void createPipelines(MTL::Library* library);
     void ensureCapacity(size_t numElements);
 };
 
-// ============================================================================
-// 64-bit GPU Radix Sort (for tile + depth compound keys)
-// ============================================================================
+// 64-bit GPU Radix Sort for tile + depth compound keys
 
 class GPURadixSort64 {
 public:
@@ -82,7 +79,7 @@ public:
 private:
     static constexpr size_t RADIX_SIZE = 256;
     static constexpr size_t THREADGROUP_SIZE = 256;
-    static constexpr size_t NUM_PASSES = 8;  // 64 bits / 8 bits per pass
+    static constexpr size_t NUM_PASSES = 8;
     
     MTL::Device* device;
     size_t maxElements;
@@ -107,9 +104,7 @@ private:
     void ensureCapacity(size_t numElements);
 };
 
-// ============================================================================
-// GPU Tile Sorter (combines projection counting, key generation, and sorting)
-// ============================================================================
+// GPU Tile Sorter combines projection counting, key generation, and sorting
 
 class GPUTileSorter {
 public:
@@ -117,11 +112,11 @@ public:
                   size_t maxGaussians, size_t maxPairs);
     ~GPUTileSorter();
     
-    // Main entry point: sort Gaussians into tiles
+    // Sort Gaussians into tiles
     // Returns number of tile-Gaussian pairs generated
     uint32_t sortGaussiansToTiles(
         MTL::CommandQueue* queue,
-        MTL::Buffer* projectedGaussians,  // ProjectedGaussian array from projection pass
+        MTL::Buffer* projectedGaussians, 
         size_t numGaussians,
         uint32_t screenWidth,
         uint32_t screenHeight,
@@ -141,6 +136,7 @@ private:
     static constexpr uint32_t MAX_TILES_PER_GAUSSIAN = 256;
     static constexpr uint32_t THREADGROUP_SIZE = 256;
     
+    // Members
     MTL::Device* device;
     size_t maxGaussians;
     size_t maxPairs;
@@ -167,6 +163,7 @@ private:
     MTL::Buffer* valuesBuffer;
     MTL::Buffer* tileRangesBuffer;
     
+    // Helper methods
     void createPipelines(MTL::Library* library);
     void ensureCapacity(uint32_t numTiles, uint32_t numPairs);
     void prefixSumCPU(MTL::Buffer* input, MTL::Buffer* output, uint32_t count);

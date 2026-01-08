@@ -1,8 +1,8 @@
 //
 //  gpu_sort.mm
-//  GaussianSplatting
+//  GuassianSplatting
 //
-//  Fixed GPU Radix Sort - Implementation with proper synchronization
+//  Created by Colin Taylor Taylor on 2025-12-31.
 //
 
 #include "gpu_sort.hpp"
@@ -10,15 +10,13 @@
 #include <algorithm>
 #include <cstring>
 
-// ============================================================================
 // Helper to create compute pipeline
-// ============================================================================
-
 static MTL::ComputePipelineState* createPipeline(MTL::Device* device,
                                                   MTL::Library* library,
                                                   const char* functionName) {
     NS::Error* error = nullptr;
     
+    // Create function from library
     auto funcName = NS::String::string(functionName, NS::ASCIIStringEncoding);
     MTL::Function* func = library->newFunction(funcName);
     
@@ -27,6 +25,7 @@ static MTL::ComputePipelineState* createPipeline(MTL::Device* device,
         return nullptr;
     }
     
+    // Create compute pipeline state
     MTL::ComputePipelineState* pso = device->newComputePipelineState(func, &error);
     func->release();
     
@@ -42,10 +41,7 @@ static MTL::ComputePipelineState* createPipeline(MTL::Device* device,
     return pso;
 }
 
-// ============================================================================
 // GPURadixSort32 Implementation
-// ============================================================================
-
 GPURadixSort32::GPURadixSort32(MTL::Device* device, MTL::Library* library, size_t maxElements)
     : device(device)
     , maxElements(maxElements)
@@ -62,7 +58,7 @@ GPURadixSort32::GPURadixSort32(MTL::Device* device, MTL::Library* library, size_
     valuesBuffers[1] = device->newBuffer(maxElements * sizeof(uint32_t),
                                          MTL::ResourceStorageModeShared);
     
-    // CRITICAL FIX: Zero-initialize the value buffers with identity permutation
+    // Zero-initialize the value buffers with identity permutation
     // This ensures that even if sorting fails, we have valid indices
     uint32_t* vals0 = (uint32_t*)valuesBuffers[0]->contents();
     uint32_t* vals1 = (uint32_t*)valuesBuffers[1]->contents();
@@ -85,6 +81,7 @@ GPURadixSort32::GPURadixSort32(MTL::Device* device, MTL::Library* library, size_
                                         MTL::ResourceStorageModeShared);
 }
 
+// Destructor
 GPURadixSort32::~GPURadixSort32() {
     if (keysBuffers[0]) keysBuffers[0]->release();
     if (keysBuffers[1]) keysBuffers[1]->release();
@@ -102,6 +99,7 @@ GPURadixSort32::~GPURadixSort32() {
     if (clearHistogramPSO) clearHistogramPSO->release();
 }
 
+// Create compute pipelines
 void GPURadixSort32::createPipelines(MTL::Library* library) {
     computeDepthsPSO = createPipeline(device, library, "computeDepths");
     histogram32PSO = createPipeline(device, library, "histogram32");
@@ -125,6 +123,7 @@ void GPURadixSort32::createPipelines(MTL::Library* library) {
     }
 }
 
+// Ensure capacity of buffers
 void GPURadixSort32::ensureCapacity(size_t numElements) {
     if (numElements <= maxElements) return;
     
@@ -154,11 +153,12 @@ void GPURadixSort32::ensureCapacity(size_t numElements) {
     }
 }
 
+// Main sort function
 MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
                                    MTL::Buffer* positionBuffer,
                                    simd_float3 cameraPos,
                                    size_t numElements) {
-    // CRITICAL FIX: Handle edge cases
+    // Handle edge cases
     if (numElements == 0) {
         return valuesBuffers[0];
     }
@@ -175,6 +175,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         return valuesBuffers[0];
     }
     
+    // Ensure capacity
     ensureCapacity(numElements);
     
     uint32_t numElementsU32 = (uint32_t)numElements;
@@ -182,7 +183,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
     // Copy camera position to buffer
     memcpy(cameraPosBuffer->contents(), &cameraPos, sizeof(simd_float3));
     
-    // Debug: Print first call info
+    // Print first call info
     static bool firstCall = true;
     if (firstCall) {
         std::cout << "GPU Sort first call: numElements=" << numElements
@@ -211,7 +212,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
     
-    // DEBUG: Verify computeDepths output on first few calls
+    // Verify computeDepths output on first few calls
     static int debugCounter = 0;
     if (debugCounter < 3) {
         uint32_t* keys = (uint32_t*)keysBuffers[0]->contents();
@@ -242,14 +243,14 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         }
     }
     
-    // Step 2: 4 passes of radix sort (8 bits per pass)
+    // 4 passes of radix sort (8 bits per pass)
     int srcIdx = 0;
     
     for (uint32_t pass = 0; pass < NUM_PASSES; pass++) {
         uint32_t bitOffset = pass * 8;
         int dstIdx = 1 - srcIdx;
         
-        // CRITICAL FIX: Clear histogram using CPU memset for guaranteed zeroing
+        // Clear histogram using CPU memset for guaranteed zeroing
         // The GPU clear was potentially racing with histogram32
         memset(histogramBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
         
@@ -277,7 +278,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         {
             uint32_t* hist = (uint32_t*)histogramBuffer->contents();
             
-            // DEBUG: Verify histogram
+            // Verify histogram
             if (debugCounter < 3 && pass == 0) {
                 uint32_t totalCount = 0;
                 for (int i = 0; i < RADIX_SIZE; i++) {
@@ -304,7 +305,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
             }
         }
         
-        // Note: For StorageModeShared, CPU writes are immediately visible to GPU
+        // For StorageModeShared, CPU writes are immediately visible to GPU
         
         // Scatter
         cmdBuffer = queue->commandBuffer();
@@ -325,6 +326,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
             enc->endEncoding();
         }
         
+        // Finalize command buffer
         cmdBuffer->commit();
         cmdBuffer->waitUntilCompleted();
         
@@ -333,7 +335,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
     
     currentBuffer = srcIdx;
     
-    // DEBUG: Verify final output
+    // Verify final output
     if (debugCounter < 3) {
         uint32_t* sortedVals = (uint32_t*)valuesBuffers[srcIdx]->contents();
         std::cout << "After sort:" << std::endl;
@@ -357,7 +359,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         }
         if (!allValid) {
             std::cout << "  Total invalid indices: " << invalidCount << " / " << numElements << std::endl;
-            // FALLBACK: Return identity permutation if sort produced garbage
+            // Return identity permutation if sort produced garbage
             std::cout << "  FALLBACK: Returning identity permutation" << std::endl;
             for (size_t i = 0; i < numElements; i++) {
                 sortedVals[i] = (uint32_t)i;
@@ -373,10 +375,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
 }
 
 
-// ============================================================================
-// GPURadixSort64 Implementation (unchanged - just adding header)
-// ============================================================================
-
+// GPURadixSort64 Implementation
 GPURadixSort64::GPURadixSort64(MTL::Device* device, MTL::Library* library, size_t maxElements)
     : device(device)
     , maxElements(maxElements)
@@ -399,6 +398,7 @@ GPURadixSort64::GPURadixSort64(MTL::Device* device, MTL::Library* library, size_
                                             MTL::ResourceStorageModeShared);
 }
 
+// Destructor
 GPURadixSort64::~GPURadixSort64() {
     if (keysBuffers[0]) keysBuffers[0]->release();
     if (keysBuffers[1]) keysBuffers[1]->release();
@@ -414,6 +414,7 @@ GPURadixSort64::~GPURadixSort64() {
     if (clearHistogramPSO) clearHistogramPSO->release();
 }
 
+// Create compute pipelines
 void GPURadixSort64::createPipelines(MTL::Library* library) {
     histogram64PSO = createPipeline(device, library, "histogram64");
     prefixSum256PSO = createPipeline(device, library, "prefixSum256");
@@ -422,6 +423,7 @@ void GPURadixSort64::createPipelines(MTL::Library* library) {
     clearHistogramPSO = createPipeline(device, library, "clearHistogram");
 }
 
+// Ensure capacity of buffers
 void GPURadixSort64::ensureCapacity(size_t numElements) {
     if (numElements <= maxElements) return;
     
@@ -442,6 +444,7 @@ void GPURadixSort64::ensureCapacity(size_t numElements) {
                                          MTL::ResourceStorageModeShared);
 }
 
+// Main sort function
 void GPURadixSort64::sort(MTL::CommandQueue* queue,
                            MTL::Buffer* keysIn,
                            MTL::Buffer* valuesIn,

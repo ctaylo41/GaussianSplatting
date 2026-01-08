@@ -469,7 +469,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         pairs[i] = {gpuKeys[i], gpuValues[i]};
     }
     
-    // Sort by key (tile + depth) use fast CPU radix sort
+    // Sort by key tile + depth use fast CPU radix sort
     parallelRadixSort(pairs);
     
     // Copy sorted data back to GPU buffers
@@ -599,11 +599,11 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     static double totalProjectPairGenTime = 0, totalSortTime = 0;
     static double totalRangeRenderTime = 0, totalForwardTime = 0;
     
-    // Project + PairGen batched
+    // Project and PairGen batched
     double projectPairGenMs = std::chrono::duration<double, std::milli>(t2 - t1).count(); 
-    // Sort + copy
+    // Sort and copy
     double sortMs = std::chrono::duration<double, std::milli>(t6 - t3).count();  
-    // Range + Render batched
+    // Range and Render batched
     double rangeRenderMs = std::chrono::duration<double, std::milli>(t7 - t6).count();  
     // Total forward
     double forwardMs = std::chrono::duration<double, std::milli>(t7 - forwardStart).count();

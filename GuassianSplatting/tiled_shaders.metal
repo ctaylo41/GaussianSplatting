@@ -19,47 +19,49 @@ struct Gaussian {
     float _pad2;            // offset 100, 4 bytes
     float _pad3;            // offset 104, 4 bytes
     float _pad4;            // offset 108, 4 bytes
-};  // Total: 112 bytes to match C++ sizeof(Gaussian)
+};
 
 // Projected Gaussian data for tiled rendering
-// CRITICAL: Use packed_float3 to match C++ memory layout (12 bytes, not 16)
-// float2 has 8-byte alignment, so we need explicit padding after tileMaxY
+// Use packed_float3 to match C++ memory layout 12 bytes, not 16
+// Total 88 bytes
 struct ProjectedGaussian {
-    float2 screenPos;       // 8 bytes, offset 0
-    packed_float3 conic;    // 12 bytes, offset 8 - Inverse 2D covariance
-    float depth;            // 4 bytes, offset 20
-    float opacity;          // 4 bytes, offset 24 - AFTER sigmoid (for rendering efficiency)
-    packed_float3 color;    // 12 bytes, offset 28
-    float radius;           // 4 bytes, offset 40
-    uint tileMinX;          // 4 bytes, offset 44
-    uint tileMinY;          // 4 bytes, offset 48
-    uint tileMaxX;          // 4 bytes, offset 52
-    uint tileMaxY;          // 4 bytes, offset 56
-    float _pad1;            // 4 bytes, offset 60 - explicit padding for float2 alignment
-    float2 viewPos_xy;      // 8 bytes, offset 64
-    // Store cov2D for backward pass (needed for correct gradient)
-    packed_float3 cov2D;    // 12 bytes, offset 72 - (a, b, c) - the 2D covariance BEFORE inversion
-    float _pad2;            // 4 bytes, offset 84 - padding to make struct 88 bytes (multiple of 8)
-};  // Total: 88 bytes
+    float2 screenPos;       
+    packed_float3 conic;    
+    float depth;            
+    float opacity;          
+    packed_float3 color;    
+    float radius;           
+    uint tileMinX;          
+    uint tileMinY;          
+    uint tileMaxX;          
+    uint tileMaxY;          
+    float _pad1;            
+    float2 viewPos_xy;      
+    packed_float3 cov2D;    
+    float _pad2;            
+};  
 
+// Tile range structure
 struct TileRange {
     uint start;
     uint count;
 };
 
+// Uniforms for tiled rendering
 struct TiledUniforms {
     float4x4 viewMatrix;
     float4x4 projectionMatrix;
     float4x4 viewProjectionMatrix;
     float2 screenSize;
     float2 focalLength;
-    float3 cameraPos;        // 16 bytes (includes implicit 4-byte padding)
+    float3 cameraPos;        
     uint numTilesX;
     uint numTilesY;
     uint numGaussians;
     uint _pad2;
 };
 
+// Gradients for Gaussians
 struct GaussianGradients {
     float position_x;
     float position_y;
@@ -70,33 +72,33 @@ struct GaussianGradients {
     float scale_z;
     float _pad1;
     float4 rotation;
-    float sh[12];
-    
-    // Viewspace (screen-space) gradients for density control
-    // Official 3DGS uses these for densification decisions
+    float sh[12];    
     float viewspace_grad_x;
     float viewspace_grad_y;
     float _pad2;
     float _pad3;
 };
 
+// Constants
 constant float SH_C0 = 0.28209479177387814f;
 constant uint TILE_SIZE = 16;
 constant float MAX_RADIUS = 512.0f;
-constant float MAX_SCALE = 5.0f;  // exp(5) ≈ 148 - more reasonable max scale
+// exp(5) ≈ 148 reasonable max scale
+constant float MAX_SCALE = 5.0f;  
 
 // Quaternion to rotation matrix
 // q.x=w, q.y=x, q.z=y, q.w=z
 float3x3 quatToMat(float4 q) {
     float w = q.x, x = q.y, y = q.z, z = q.w;
-    // Metal float3x3 constructor takes COLUMNS
+    // Metal float3x3 constructor takes columns
     return float3x3(
-        float3(1.0 - 2.0*(y*y + z*z), 2.0*(x*y + w*z), 2.0*(x*z - w*y)), // Column 0
-        float3(2.0*(x*y - w*z), 1.0 - 2.0*(x*x + z*z), 2.0*(y*z + w*x)), // Column 1
-        float3(2.0*(x*z + w*y), 2.0*(y*z - w*x), 1.0 - 2.0*(x*x + y*y))  // Column 2
+        float3(1.0 - 2.0*(y*y + z*z), 2.0*(x*y + w*z), 2.0*(x*z - w*y)),
+        float3(2.0*(x*y - w*z), 1.0 - 2.0*(x*x + z*z), 2.0*(y*z + w*x)),
+        float3(2.0*(x*z + w*y), 2.0*(y*z - w*x), 1.0 - 2.0*(x*x + y*y))
     );
 }
 
+// Project Gaussians to screen space and compute projected parameters
 kernel void projectGaussians(
     device const Gaussian* gaussians [[buffer(0)]],
     device ProjectedGaussian* projected [[buffer(1)]],
@@ -105,6 +107,7 @@ kernel void projectGaussians(
 {
     if (tid >= uniforms.numGaussians) return;
     
+    // Fetch Gaussian
     Gaussian g = gaussians[tid];
     ProjectedGaussian proj = {};
     proj.radius = 0;
@@ -120,19 +123,21 @@ kernel void projectGaussians(
         projected[tid] = proj;
         return;
     }
-    
+
+    // Transform to clip space
     float4 worldPos = float4(g.position, 1.0);
     float4 viewPos = uniforms.viewMatrix * worldPos;
     float4 clipPos = uniforms.viewProjectionMatrix * worldPos;
     
-    // COLMAP uses OpenCV convention: camera looks down +Z axis
-    // Objects in FRONT of camera have POSITIVE viewZ
-    // clipPos.w = viewZ (with our projection), so should be positive for visible objects
+    // COLMAP uses opencv convention camera looks down +z axis
+    // Objects in front of camera have positive view z
+    // clipPos.w = viewZ with our projection, so should be positive for visible objects
     if (clipPos.w <= 0.1 || viewPos.z <= 0.1) {
         projected[tid] = proj;
         return;
     }
     
+    // Normalized Device Coordinates
     float3 ndc = clipPos.xyz / clipPos.w;
     
     // Outside frustum
@@ -142,20 +147,16 @@ kernel void projectGaussians(
     }
     
     // Screen position from NDC
-    // COLMAP Y-down + our projection Y-flip means: 
-    //   Top of COLMAP image (small pixel y) -> NDC y negative
-    //   Bottom of COLMAP image (large pixel y) -> NDC y positive
-    // Metal texture origin is top-left (row 0 = top)
-    // Standard conversion: screenY = (ndc.y + 1) / 2 * height  
-    // But we need to invert because of Y-flip: screenY = (1 - ndc.y) / 2 * height
     proj.screenPos = float2(
         (ndc.x * 0.5 + 0.5) * uniforms.screenSize.x,
-        (ndc.y * 0.5 + 0.5) * uniforms.screenSize.y  // Standard NDC to screen (projection already flipped Y)
+        (ndc.y * 0.5 + 0.5) * uniforms.screenSize.y 
     );
-    proj.depth = viewPos.z;  // Store positive depth (COLMAP: +Z is forward)
+
+    // Store positive depth
+    proj.depth = viewPos.z;  
     proj.viewPos_xy = viewPos.xy;
     
-    // ===== SCALE: Apply exp() to log scale =====
+    // scale is stored in LOG space
     float3 logScale = clamp(g.scale, -MAX_SCALE, MAX_SCALE);
     float3 scale = exp(logScale);
     
@@ -178,15 +179,16 @@ kernel void projectGaussians(
     float3x3 R = quatToMat(q);
     // Diagonal scale matrix - Metal column constructor
     float3x3 S = float3x3(
-        float3(scale.x, 0, 0),  // Column 0
-        float3(0, scale.y, 0),  // Column 1
-        float3(0, 0, scale.z)   // Column 2
+        float3(scale.x, 0, 0),
+        float3(0, scale.y, 0),
+        float3(0, 0, scale.z)
     );
-    float3x3 M = S * R;  // Official convention: S * R (not R * S)
-    float3x3 Sigma3D = transpose(M) * M;  // M^T * M (not M * M^T)
+    // Official convention: S * R
+    float3x3 M = S * R;  
+    // M^T * M
+    float3x3 Sigma3D = transpose(M) * M;  
     
     // View space projection using same approach as official 3DGS
-    // COLMAP convention: objects in front have positive viewZ
     float z_cam = viewPos.z;
     float fx = uniforms.focalLength.x;
     float fy = uniforms.focalLength.y;
@@ -197,57 +199,52 @@ kernel void projectGaussians(
     float txtz = clamp(viewPos.x / z_cam, -limx, limx);
     float tytz = clamp(viewPos.y / z_cam, -limy, limy);
     
-    // Jacobian of projection (perspective projection derivative)
-    // Maps 3D view space -> 2D screen space
-    // Official 3DGS does NOT include Y flip in Jacobian for covariance
-    // (covariance is a shape - ellipse looks same either way)
+    // Jacobian of projection perspective projection derivative
+    // Maps 3D view space to 2D screen space
     float J00 = fx / z_cam;
     float J02 = -fx * txtz / z_cam;
     float J11 = fy / z_cam;
     float J12 = -fy * tytz / z_cam;
     
-    // Metal float3x3 constructor takes COLUMNS
-    // J = | J00  0    J02 |
-    //     | 0    J11  J12 |
-    //     | 0    0    0   |
+    // Jacobian matrix
     float3x3 J = float3x3(
-        float3(J00, 0, 0),    // Column 0
-        float3(0, J11, 0),    // Column 1
-        float3(J02, J12, 0)   // Column 2
+        float3(J00, 0, 0), 
+        float3(0, J11, 0),
+        float3(J02, J12, 0)
     );
     
-    // View matrix rotation (world-to-view)
-    // matrix[i] in Metal gives COLUMN i
+    // View matrix rotation world-to-view
     float3x3 W = float3x3(uniforms.viewMatrix[0].xyz,
                           uniforms.viewMatrix[1].xyz,
                           uniforms.viewMatrix[2].xyz);
     
-    // Combined transform: T = W * J (official convention: view first, then Jacobian)
+    // Combined transform T = W * J
     float3x3 T = W * J;
     
-    // Project 3D covariance to 2D: cov2D = T^T * Sigma3D * T (official formula)
+    // Project 3D covariance to 2D
+    // cov2D = T^T * Sigma3D * T
     float3x3 cov2D_mat = transpose(T) * Sigma3D * T;
     
-    // Metal matrix indexing: matrix[col][row]
-    // For symmetric matrix: [0][0]=top-left, [1][1]=bottom-right, [0][1]=[1][0]=off-diagonal
-    float a = cov2D_mat[0][0];  // Column 0, Row 0 = (0,0)
-    float b = cov2D_mat[1][0];  // Column 1, Row 0 = (0,1) - the off-diagonal term
-    float c = cov2D_mat[1][1];  // Column 1, Row 1 = (1,1)
+    // Extract 2D covariance components
+    float a = cov2D_mat[0][0];  
+    float b = cov2D_mat[1][0];
+    float c = cov2D_mat[1][1];
     
-    // Low-pass filter (add before storing for backward pass)
+    // Low-pass filter add before storing for backward pass
     a += 0.3;
     c += 0.3;
     
-    // Store cov2D for backward pass AFTER low-pass filter
+    // Store cov2D for backward pass after low-pass filter
     proj.cov2D = float3(a, b, c);
     
+    // Compute determinant
     float det = a * c - b * b;
     if (det < 0.0001) {
         projected[tid] = proj;
         return;
     }
     
-    // Conic (inverse covariance)
+    // Conic
     float inv_det = 1.0 / det;
     proj.conic = float3(c * inv_det, -b * inv_det, a * inv_det);
     
@@ -256,8 +253,9 @@ kernel void projectGaussians(
     float disc = mid * mid - det;
     float l1 = mid + sqrt(max(0.1f, disc));
     float rawRadius = 3.0 * sqrt(l1);
-    proj.radius = min(ceil(rawRadius), MAX_RADIUS);  // 2x for safety margin
+    proj.radius = min(ceil(rawRadius), MAX_RADIUS);
     
+    // Projected radius zero means skip
     if (proj.radius <= 0) {
         projected[tid] = proj;
         return;
@@ -270,18 +268,20 @@ kernel void projectGaussians(
     int maxX = min(int(uniforms.screenSize.x) - 1, int(proj.screenPos.x + r));
     int maxY = min(int(uniforms.screenSize.y) - 1, int(proj.screenPos.y + r));
     
+    // No tile coverage
     if (minX > maxX || minY > maxY) {
         proj.radius = 0;
         projected[tid] = proj;
         return;
     }
     
+    // Tile bounds
     proj.tileMinX = uint(minX) / TILE_SIZE;
     proj.tileMinY = uint(minY) / TILE_SIZE;
     proj.tileMaxX = min(uint(maxX) / TILE_SIZE, uniforms.numTilesX - 1);
     proj.tileMaxY = min(uint(maxY) / TILE_SIZE, uniforms.numTilesY - 1);
     
-    // Limit tile coverage (increased from 64 to allow larger Gaussians)
+    // Limit tile coverage increased from 64 to allow larger Gaussians
     uint tilesX = proj.tileMaxX - proj.tileMinX + 1;
     uint tilesY = proj.tileMaxY - proj.tileMinY + 1;
     if (tilesX * tilesY > 256) {
@@ -290,7 +290,7 @@ kernel void projectGaussians(
         return;
     }
     
-    // ===== OPACITY: Apply sigmoid to raw opacity =====
+    // Apply sigmoid to opacity
     float rawOpacity = clamp(g.opacity, -8.0f, 8.0f);
     proj.opacity = 1.0 / (1.0 + exp(-rawOpacity));
     
@@ -304,6 +304,7 @@ kernel void projectGaussians(
     projected[tid] = proj;
 }
 
+// Tiled forward rendering kernel
 kernel void tiledForward(
     device const Gaussian* gaussians [[buffer(0)]],
     device const ProjectedGaussian* projected [[buffer(1)]],
@@ -315,13 +316,14 @@ kernel void tiledForward(
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= uint(uniforms.screenSize.x) || gid.y >= uint(uniforms.screenSize.y)) return;
-    
+
+    // Determine tile index   
     uint tileX = gid.x / TILE_SIZE;
     uint tileY = gid.y / TILE_SIZE;
     uint tileIdx = tileY * uniforms.numTilesX + tileX;
     TileRange range = tileRanges[tileIdx];
     
-    // Use half precision for color accumulation (2x throughput on Apple Silicon)
+    // Use half precision for color accumulation to increase throughput
     half3 color = half3(0);
     half T = 1.0h;
     float2 pixelPos = float2(gid) + 0.5;
@@ -336,28 +338,35 @@ kernel void tiledForward(
         
         if (gIdx >= uniforms.numGaussians) continue;
         
+        // Fetch projected Gaussian
         ProjectedGaussian p = projected[gIdx];
         
+        // Skip invalid Gaussians
         if (p.radius <= 0) continue;
         
+        // Compute offset from Gaussian center
         float2 d = pixelPos - p.screenPos;
         
-        // Debug: check if conic is valid
+        // Check if conic is valid
         float conicMag = abs(p.conic.x) + abs(p.conic.y) + abs(p.conic.z);
-        if (conicMag < 0.0001) continue;  // Skip if conic is essentially zero
+        if (conicMag < 0.0001) continue;
         
         // Gaussian evaluation in half precision
         half power = half(-0.5 * (p.conic.x * d.x * d.x +
                                    2.0 * p.conic.y * d.x * d.y +
                                    p.conic.z * d.y * d.y));
         
+        // Early skip for negligible contribution
         if (power > 0.0h || power < -4.5h) continue;
         
+        // Compute Gaussian weight and alpha
         half G = exp(power);
         half alpha = min(half(p.opacity) * G, 0.99h);
         
+        // Skip negligible alpha
         if (alpha < half(1.0 / 255.0)) continue;
         
+        // Accumulate color using alpha blending
         color += half3(p.color) * alpha * T;
         T *= (1.0h - alpha);
         
@@ -366,15 +375,17 @@ kernel void tiledForward(
     }
     
     // Blend with white background using remaining transmittance
-    half3 bgColor = half3(1.0h, 1.0h, 1.0h);  // White background
+    half3 bgColor = half3(1.0h, 1.0h, 1.0h);
     color = color + bgColor * T;
     
+    // Store last contributing index for backward pass
     uint pixelIdx = gid.y * uint(uniforms.screenSize.x) + gid.x;
     lastContribIdx[pixelIdx] = hasContrib ? lastIdx : UINT_MAX;
     
     output.write(float4(float3(color), 1.0), gid);
 }
 
+// Tiled backward rendering kernel
 kernel void tiledBackward(
     device const Gaussian* gaussians [[buffer(0)]],
     device GaussianGradients* gradients [[buffer(1)]],
@@ -387,18 +398,22 @@ kernel void tiledBackward(
     texture2d<float, access::read> groundTruth [[texture(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
+    // Bounds check
     if (gid.x >= uint(uniforms.screenSize.x) || gid.y >= uint(uniforms.screenSize.y)) return;
     
+    // Find last contributing Gaussian index for this pixel
     uint pixelIdx = gid.y * uint(uniforms.screenSize.x) + gid.x;
     uint lastIdx = lastContribIdx[pixelIdx];
     
     if (lastIdx == UINT_MAX) return;
     
+    // Determine tile index
     uint tileX = gid.x / TILE_SIZE;
     uint tileY = gid.y / TILE_SIZE;
     uint tileIdx = tileY * uniforms.numTilesX + tileX;
     TileRange range = tileRanges[tileIdx];
     
+    // Pixel position
     float2 pixelPos = float2(gid) + 0.5;
     
     float4 r_pix = rendered.read(gid);
@@ -408,48 +423,54 @@ kernel void tiledBackward(
     float3 diff = r_pix.rgb - gt_pix.rgb;
     float3 dL_dPixel = sign(diff) / 3.0;
     
-    // We need to traverse BACK-TO-FRONT for correct gradients
-    // First, find how many Gaussians contribute and compute T_final
-    // Use lastIdx from forward pass (which relied on T termination)
+    // Traverse back to front for correct gradients
+    // Find how many Gaussians contribute and compute T_final
     uint endIdx = min(lastIdx + 1, range.start + range.count);
     
-    // Pre-compute T (transmittance) for the forward pass to get T_final
+    // Pre-compute T transmittance for the forward pass to get T_final
     float T_final = 1.0;
+    // Traverse front to back to compute T_final
     for (uint sortIdx = range.start; sortIdx < endIdx; sortIdx++) {
+        // Fetch Gaussian index
         uint gIdx = sortedIndices[sortIdx];
         if (gIdx >= uniforms.numGaussians) continue;
         
         ProjectedGaussian p = projected[gIdx];
         if (p.radius <= 0) continue;
         
+        // Compute offset from Gaussian center
         float2 d = pixelPos - p.screenPos;
         float power = -0.5 * (p.conic.x * d.x * d.x +
                               2.0 * p.conic.y * d.x * d.y +
                               p.conic.z * d.y * d.y);
         
+        // Early skip for negligible contribution
         if (power > 0.0 || power < -4.5) continue;
         
+        // Compute Gaussian weight and alpha
         float G = exp(power);
         float alpha = min(p.opacity * G, 0.99f);
         
+        // Skip negligible alpha
         if (alpha < 1.0 / 255.0) continue;
         
+        // Update T
         float test_T = T_final * (1.0 - alpha);
         if (test_T < 0.0001) break;
         T_final = test_T;
     }
     
-    // Now traverse BACK-TO-FRONT for gradients
-    // T starts at T_final and we "undo" by dividing by (1-alpha)
+    // Traverse back to front for gradients
+    // T starts at T_final and we go backwards by dividing by (1-alpha)
     float T = T_final;
     
-    // IMPORTANT: Initialize accum_rec to the background color!
-    // accum_rec tracks what's "behind" the current Gaussian.
-    // At the back of the scene, what's behind is the background.
-    float3 bgColor = float3(1.0);  // White background - must match forward pass
-    float3 accum_rec = bgColor;  // Accumulated color from Gaussians BEHIND current (starts with background)
+    // Initialize accum_rec to the background color
+    // White background
+    float3 bgColor = float3(1.0);  
+     // Accumulated color from Gaussians behind current starts with background
+    float3 accum_rec = bgColor; 
     
-    // Iterate in reverse order (back to front)
+    // Iterate in reverse order back to front
     for (int sortIdx = int(endIdx) - 1; sortIdx >= int(range.start); sortIdx--) {
         uint gIdx = sortedIndices[uint(sortIdx)];
         
@@ -459,161 +480,112 @@ kernel void tiledBackward(
         
         if (p.radius <= 0) continue;
         
+        // Compute offset from Gaussian center
         float2 d = pixelPos - p.screenPos;
         float power = -0.5 * (p.conic.x * d.x * d.x +
                               2.0 * p.conic.y * d.x * d.y +
                               p.conic.z * d.y * d.y);
         
+        // Early skip for negligible contribution
         if (power > 0.0 || power < -4.5) continue;
         
+        // Compute Gaussian weight and alpha
         float G = exp(power);
         float alpha = min(p.opacity * G, 0.99f);
         
         if (alpha < 1.0 / 255.0) continue;
         
-        // Recover T at this position by "undoing" the alpha blend
-        // In forward: T_next = T * (1 - alpha)
-        // So: T = T_next / (1 - alpha)
+        // Recover T at this position by undoing the alpha blend
         T = T / max(1.0 - alpha, 0.0001);
         
         float weight = alpha * T;
         
-        // ===== Color/SH gradients =====
-        // IMPORTANT: Account for clamping in forward pass
-        // If color was clamped at 0 or 1, gradient should be 0
+        // Color gradient
         float3 dL_dColor = dL_dPixel * weight;
-        // If p.color is at 0 or 1 limit, zero the gradient to prevent SH explosion
+        // if color is near 0 or 1 zero out gradient to prevent pushing out of bounds
         if (p.color.r <= 0.01 || p.color.r >= 0.99) dL_dColor.r = 0;
         if (p.color.g <= 0.01 || p.color.g >= 0.99) dL_dColor.g = 0;
         if (p.color.b <= 0.01 || p.color.b >= 0.99) dL_dColor.b = 0;
         
-        // ===== Alpha gradient (CORRECT FORMULA from 3DGS paper) =====
-        // The key insight: changing alpha affects:
-        // 1. This Gaussian's own contribution: color * alpha * T
-        // 2. All subsequent Gaussians' contributions via transmittance
-        //
-        // accum_rec tracks the accumulated color from Gaussians BEHIND this one
-        // (already processed in back-to-front order)
-        // dL/dalpha = T * dot(dL_dPixel, color - accum_rec)
-        //
-        // IMPORTANT: Use accum_rec BEFORE updating it (it represents what's behind current Gaussian)
+        // Accumulate color gradient
         float dL_dAlpha = T * dot(dL_dPixel, p.color - accum_rec);
         
-        // NOW update accum_rec to include current Gaussian for the next (closer) Gaussian
-        // accum_rec_new = alpha * color + (1-alpha) * accum_rec_old
-        // This represents: contribution from current Gaussian + attenuated contribution from behind
+        // Update accum_rec to include current Gaussian for the next Gaussian
+        // The contribution from current Gaussian + attenuated contribution from behind
         accum_rec = alpha * p.color + (1.0 - alpha) * accum_rec;
         
-        // ===== Opacity gradient =====
-        // alpha = sigmoid(raw_opacity) * G
-        // dalpha/d_raw_opacity = sigmoid * (1-sigmoid) * G
-        float sig = p.opacity;  // This is ALREADY sigmoid (from projection)
+        // Opacity gradient
+        float sig = p.opacity;
         float dAlpha_dRawOp = sig * (1.0 - sig) * G;
         float dL_dRawOpacity = dL_dAlpha * dAlpha_dRawOp;
         
-        // ===== Gaussian gradient =====
+        // Gaussian gradient
         // For position/scale gradients, we need dL/dG
         float dL_dG = dL_dAlpha * sig;
         
-        // ===== Screen position gradient =====
-        // d = pixel - screenPos (offset from Gaussian center to current pixel)
-        // power = -0.5 * (conic.x * d.x^2 + 2 * conic.y * d.x * d.y + conic.z * d.y^2)
-        // G = exp(power)
-        //
-        // dG/d(d) = G * dpower/d(d) = -G * [conic.x*dx + conic.y*dy, conic.y*dx + conic.z*dy]
-        //
-        // But we want dG/d(screenPos), and since d = pixel - screenPos:
-        //   d(d)/d(screenPos) = -1
-        //   dG/d(screenPos) = dG/d(d) * (-1) = G * [conic.x*dx + conic.y*dy, ...]
-        //
-        // This matches official 3DGS where they add dL_dG * dG_ddelx directly to dL_dmean2D
-        // because dG_ddelx already accounts for the chain rule properly
+        // Screen position gradient
+       
+        // Precompute gdx, gdy
         float gdx = G * d.x;
         float gdy = G * d.y;
         
         // Screen position gradient:
-        // Your d = pixel - center, official uses d = center - pixel (opposite signs)
-        //
-        // At a pixel to the RIGHT of gaussian center:
-        //   Your d.x = +positive, their d.x = -negative
-        //   Your gdx = G * (+pos) = +positive, their gdx = G * (-neg) = -negative  
-        //   Your dG_ddelx = -gdx * conic = -(+pos) = -negative
-        //   Their dG_ddelx = -gdx * conic = -(-neg) = +positive
-        //
-        // Chain rule for dG/d(center):
-        //   Your dd/d(center) = -1, their dd/d(center) = +1
-        //   Your dG/d(center) = dG_ddelx * (-1) = (-neg) * (-1) = +positive
-        //   Their dG/d(center) = dG_ddelx * (+1) = (+pos) * (+1) = +positive
-        //
-        // Both are positive (same physics), but computed values differ by sign!
-        // Official code adds: dL_dG * dG_ddelx (their positive value)
-        // Your code should add: dL_dG * (-dG_ddelx) = dL_dG * (positive value)
         float dG_ddelx = -gdx * p.conic.x - gdy * p.conic.y;
         float dG_ddely = -gdy * p.conic.z - gdx * p.conic.y;
         
-        // Negate because your d convention is opposite of official
+        // Negate because the d convention is opposite of official
         float2 dL_dScreenPos = dL_dG * float2(-dG_ddelx, -dG_ddely);
         
-        // ===== World position gradient =====
-        // Chain rule: dL/dViewPos = dL/dScreenPos * dScreenPos/dViewPos
-        // 
-        // Forward pass (perspective projection):
-        //   screenX ∝ fx * viewX / viewZ
-        //   screenY ∝ fy * viewY / viewZ
-        //
-        // Derivatives (dScreenPos in pixels, dViewPos in world units):
-        //   dScreenX/dViewX = fx / z
-        //   dScreenY/dViewY = fy / z  
-        //   dScreenX/dViewZ = -fx * (viewX/z) / z = -fx * txtz / z
-        //   dScreenY/dViewZ = -fy * (viewY/z) / z = -fy * tytz / z
+        // World position gradient
+        // Chain rule dL/dViewPos = dL/dScreenPos * dScreenPos/dViewPos
         float z = p.depth;
         float fx = uniforms.focalLength.x;
         float fy = uniforms.focalLength.y;
         
-        // Compute normalized view ratios (same as forward pass Jacobian)
+        // Compute normalized view ratios
+        // Same as forward pass Jacobian
         float txtz = p.viewPos_xy.x / z;
         float tytz = p.viewPos_xy.y / z;
         
+        // dL/dViewPos
         float3 dL_dViewPos;
         dL_dViewPos.x = dL_dScreenPos.x * fx / z;
         dL_dViewPos.y = dL_dScreenPos.y * fy / z;
         dL_dViewPos.z = -dL_dScreenPos.x * fx * txtz / z
                         -dL_dScreenPos.y * fy * tytz / z;
         
-        // Extract view rotation (columns = rotation matrix)
+        // Extract view rotation
         // viewMatrix is world-to-view, so transpose gives view-to-world
         float3x3 viewRot = float3x3(
             uniforms.viewMatrix[0].xyz,
             uniforms.viewMatrix[1].xyz,
             uniforms.viewMatrix[2].xyz
         );
+
         // viewRot already contains columns of rotation, transpose gives view-to-world
         float3 dL_dWorldPos = transpose(viewRot) * dL_dViewPos;
         
-        // ===== Conic gradient =====
+        // Conic gradient
         // power = -0.5 * (conic.x * dx^2 + 2 * conic.y * dx*dy + conic.z * dy^2)
-        // dL/dconic = dL/dG * dG/dpower * dpower/dconic
-        //           = dL_dG * G * (-0.5) * (dx^2, 2*dx*dy, dy^2)
-        // Note: official 3DGS uses -0.5f factor for off-diagonal
+        // dL/dconic = dL/dG * dG/dpower * dpower/dconic = dL_dG * G * (-0.5) * (dx^2, 2*dx*dy, dy^2)
         float3 dL_dConic;
         dL_dConic.x = -0.5f * dL_dG * G * d.x * d.x;
-        dL_dConic.y = -0.5f * dL_dG * G * 2.0f * d.x * d.y;  // Factor of 2 because conic.y appears with 2* in power
+        dL_dConic.y = -0.5f * dL_dG * G * 2.0f * d.x * d.y;
         dL_dConic.z = -0.5f * dL_dG * G * d.y * d.y;
         
-        // ===== Cov2D gradient (CORRECT formula from official backward.cu) =====
-        // conic = inverse(cov2D), so dL/dCov2D requires derivative of matrix inverse
-        // For 2x2 symmetric matrix [[a,b],[b,c]] with det = a*c - b*b:
-        // inv = [[c, -b], [-b, a]] / det
-        // The derivative is complex - use formula from backward.cu
+        // Cov2D gradient
+        // conic = inverse(cov2D), dL/dCov2D requires derivative of matrix inverse
         float cov_a = p.cov2D.x;
         float cov_b = p.cov2D.y;
         float cov_c = p.cov2D.z;
         
+        // Denominator and its inverse squared
         float denom = cov_a * cov_c - cov_b * cov_b;
         float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
         
         float3 dL_dCov2D;
-        // From backward.cu: these formulas come from differentiating conic = inv(cov2D)
+        
+        // Using formula for derivative of inverse of 2x2 matrix
         dL_dCov2D.x = denom2inv * (-cov_c * cov_c * dL_dConic.x
                                    + 2.0f * cov_b * cov_c * dL_dConic.y
                                    + (denom - cov_a * cov_c) * dL_dConic.z);
@@ -624,33 +596,30 @@ kernel void tiledBackward(
                                           - (denom + 2.0f * cov_b * cov_b) * dL_dConic.y
                                           + cov_a * cov_b * dL_dConic.z);
         
-        // ===== Cov3D gradient =====
-        // Forward: cov2D = T^T * Sigma3D * T where T = W * J
-        // Gradient: dL/dSigma3D = T * dL/dCov2D * T^T
+        // Cov3D gradient
+        // Forward cov2D = T^T * Sigma3D * T where T = W * J
+        // Gradient dL/dSigma3D = T * dL/dCov2D * T^T
         float3 t_cam = float3(p.viewPos_xy, p.depth);
         txtz = t_cam.x / t_cam.z;
         tytz = t_cam.y / t_cam.z;
         
-        // Jacobian (must match forward pass - NO Y flip for covariance)
+        // Jacobian of projection
         float J00 = fx / t_cam.z;
         float J02 = -fx * txtz / t_cam.z;
         float J11 = fy / t_cam.z;
         float J12 = -fy * tytz / t_cam.z;
         
-        // J matrix:
-        // | J00  0   J02 |
-        // |  0  J11  J12 |
-        // |  0   0    0  |
+        // Jacobian matrix
         float3x3 J = float3x3(
             float3(J00, 0, 0),
             float3(0, J11, 0),
             float3(J02, J12, 0)
         );
         
-        // T = W * J (official convention)
+        // T = W * J
         float3x3 T_mat = viewRot * J;
         
-        // dL/dCov2D as 2x2 matrix (stored as [a, b, c] = [[a,b],[b,c]])
+        // dL/dCov2D as 2x2 matrix
         // Extend to 3x3 with zeros for the third row/col
         float3x3 dL_dCov2D_mat = float3x3(
             float3(dL_dCov2D.x, dL_dCov2D.y, 0),
@@ -661,9 +630,9 @@ kernel void tiledBackward(
         // dL/dSigma3D = T * dL/dCov2D * T^T
         float3x3 dL_dCov3D = T_mat * dL_dCov2D_mat * transpose(T_mat);
         
-        // ===== Scale and Rotation gradients =====
-        // Sigma3D = M^T * M where M = S * R (official 3DGS convention)
-        // dL/dM = 2 * M * dL/dSigma3D (note: M on left for M^T*M formulation)
+        // Scale and Rotation gradients
+        // Sigma3D = M^T * M, M = S * R 
+        // dL/dM = 2 * M * dL/dSigma3D
         Gaussian g_orig = gaussians[gIdx];
         float3 scale = exp(clamp(g_orig.scale, -MAX_SCALE, MAX_SCALE));
         float3x3 R = quatToMat(g_orig.rotation);
@@ -672,23 +641,26 @@ kernel void tiledBackward(
             float3(0, scale.y, 0),
             float3(0, 0, scale.z)
         );
-        float3x3 M = S * R;  // Official convention: S * R
+        // S * R
+        float3x3 M = S * R;  
         
-        // dL_dM = 2 * M * dL_dCov3D (official formula for Sigma = M^T * M)
+        // dL_dM = 2 * M * dL_dCov3D
         float3x3 dL_dM = 2.0f * M * dL_dCov3D;
         
-        // Scale gradient: dL/dS = dL/dM * R^T
-        // For M = S * R: dM/dS[i] = e_i * R[i,:], so dL/dS[i,i] = dL/dM[i,:] dot R[i,:]
-        // This is equivalent to diagonal of dL_dM * R^T
+        // dL/dS = dL/dM * R^T
+        // Equivalent to diagonal of dL_dM * R^T
         float3x3 Rt = transpose(R);
         float3x3 dLdM_Rt = dL_dM * Rt;
         float3 dL_dScale_val = float3(dLdM_Rt[0][0], dLdM_Rt[1][1], dLdM_Rt[2][2]);
         
-        // Convert to log scale gradient: dL/d(log_s) = dL/ds * s
+        // Convert to log scale gradient
+        // dL/d(log_s) = dL/ds * s
         float3 dL_dLogScale = dL_dScale_val * scale;
         
-        // Rotation gradient: dL/dR = S * dL/dM
-        // For M = S * R: dL/dR = S^T * dL/dM = S * dL/dM (S is diagonal)
+        // Rotation gradient
+        // dL/dR = S * dL/dM
+        // M = S * R
+        // dL/dR = S^T * dL/dM = S * dL/dM
         float3x3 dL_dR = float3x3(
             scale.x * dL_dM[0],
             scale.y * dL_dM[1],
@@ -703,7 +675,7 @@ kernel void tiledBackward(
         float y = g_orig.rotation.z;
         float z_rot = g_orig.rotation.w;
         
-        // Derivatives of R w.r.t. quaternion components (from standard formulas)
+        // Derivatives of R w.r.t. quaternion components
         dL_dq.x = 2.0f * (
             dot(dL_dR[0], float3(0, z_rot, -y)) +
             dot(dL_dR[1], float3(-z_rot, 0, x)) +
@@ -725,7 +697,7 @@ kernel void tiledBackward(
             dot(dL_dR[2], float3(x, y, 0))
         );
         
-        // Per-pixel gradient clamp - CRITICAL to prevent explosion
+        // Per-pixel gradient clamp critical to prevent explosion
         // A Gaussian may receive gradients from 1000s of pixels, so this must be small
         float clampVal = 0.01f;
         
@@ -747,8 +719,8 @@ kernel void tiledBackward(
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_z,
             clamp(dL_dWorldPos.z, -clampVal, clampVal), memory_order_relaxed);
         
-        // Viewspace (screen-space) gradients for density control
-        // Official 3DGS uses norm of these 2D gradients for densification
+        // Viewspace screen-space gradients for density control
+        // Official implementations uses norm of these 2D gradients for densification
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_x,
             clamp(dL_dScreenPos.x, -clampVal, clampVal), memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_y,
@@ -772,10 +744,8 @@ kernel void tiledBackward(
     }
 }
 
-// =============================================================================
 // GPU Pair Generation
 // Each thread handles one Gaussian and writes all its tile-pairs atomically
-// =============================================================================
 constant float GPU_MIN_OPACITY = 0.005f;
 constant uint GPU_MAX_TILES_PER_GAUSSIAN = 256u;
 
@@ -799,6 +769,7 @@ kernel void generateTilePairs(
     if (p.opacity < GPU_MIN_OPACITY) return;
     if (p.tileMinX > 10000 || p.tileMaxX > 10000 || p.tileMinY > 10000 || p.tileMaxY > 10000) return;
     
+    // Compute number of tiles covered
     uint tilesX = p.tileMaxX - p.tileMinX + 1;
     uint tilesY = p.tileMaxY - p.tileMinY + 1;
     uint tileCount = tilesX * tilesY;

@@ -532,7 +532,7 @@ struct GaussianGradients {
 };
 
 // Adam optimizer with safeguards
-// NOTE: Using float* instead of float3* to avoid Metal z-component corruption bug
+// Using float* instead of float3* to avoid Metal z-component corruption bug
 kernel void adamStep(
     device Gaussian* gaussians [[buffer(0)]],
     device const GaussianGradients* gradients [[buffer(1)]],
@@ -624,8 +624,8 @@ kernel void adamStep(
         }
     }
     
-    // Scale update (stays in log space)
-    // Use stricter MAX_SCALE_TRAIN during training to prevent elongation
+    // Scale update stays in log space
+    // Use stricter max_scale_train during training to prevent elongation
     // Using manual indexing to avoid float3 z-component corruption
     {
         // Clamp gradients
@@ -674,7 +674,7 @@ kernel void adamStep(
         gaussians[tid].rotation = (rotLen > 0.001) ? (newRot / rotLen) : float4(1, 0, 0, 0);
     }
     
-    // Opacity update (stays in raw space)
+    // Opacity update stays in raw space
     {
         // Clamp gradient
         float grad = clamp(g.opacity, -clip, clip);

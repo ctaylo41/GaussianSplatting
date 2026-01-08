@@ -1,5 +1,5 @@
 //
-//  mtl_engine.hpp
+//  ply_loader.cpp
 //  GuassianSplatting
 //
 //  Created by Colin Taylor Taylor on 2025-12-24.

@@ -1,15 +1,9 @@
 //
 //  ply_exporter.hpp
-//  GaussianSplatting
+//  GuassianSplatting
 //
-//  Export trained Gaussians to PLY format compatible with standard 3DGS viewers
+//  Created by Colin Taylor Taylor on 2025-12-24.
 //
-//  IMPORTANT: Export format must match what loader expects:
-//  - Scale: LOG space (stored as-is from internal representation)
-//  - Opacity: RAW pre-sigmoid (stored as-is)
-//  - Rotation: (rot_0=w, rot_1=x, rot_2=y, rot_3=z)
-//
-
 #pragma once
 #include <string>
 #include <fstream>
