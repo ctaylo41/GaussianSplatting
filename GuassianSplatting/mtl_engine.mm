@@ -1,7 +1,10 @@
 //
-//  mtl_engine.mm
+//  mtl_engine.hpp
 //  GuassianSplatting
 //
+//  Created by Colin Taylor Taylor on 2025-12-24.
+//
+
 
 #include "mtl_engine.hpp"
 #include "gpu_sort.hpp"
@@ -12,17 +15,19 @@
 #include <fstream>
 #include <Foundation/NSAutoreleasePool.hpp>
 
-// Debug: Save a Metal texture to a PPM file
+// For debugging save a texture to PPM file
 void saveTextureToPPM(MTL::Texture* texture, MTL::Device* device, MTL::CommandQueue* queue, const char* filename) {
     uint32_t width = texture->width();
     uint32_t height = texture->height();
-    size_t bytesPerPixel = 4;  // RGBA
+    // RGBA
+    size_t bytesPerPixel = 4;  
     size_t bytesPerRow = width * bytesPerPixel;
     size_t totalBytes = bytesPerRow * height;
     
     // Create a shared buffer to read back the texture
     MTL::Buffer* readbackBuffer = device->newBuffer(totalBytes, MTL::ResourceStorageModeShared);
     
+    // Copy texture to buffer
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
     MTL::BlitCommandEncoder* blit = cmdBuffer->blitCommandEncoder();
     blit->copyFromTexture(texture, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(width, height, 1),
@@ -31,9 +36,10 @@ void saveTextureToPPM(MTL::Texture* texture, MTL::Device* device, MTL::CommandQu
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
     
+    // Access buffer data
     uint8_t* data = (uint8_t*)readbackBuffer->contents();
     
-    // Write PPM file (simple format)
+    // Write PPM file
     std::ofstream file(filename, std::ios::binary);
     file << "P6\n" << width << " " << height << "\n255\n";
     
@@ -41,19 +47,22 @@ void saveTextureToPPM(MTL::Texture* texture, MTL::Device* device, MTL::CommandQu
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             size_t offset = y * bytesPerRow + x * bytesPerPixel;
-            // Assuming texture format is RGBA8Unorm or similar
-            // If float, we need different handling
-            file.put(data[offset]);     // R
-            file.put(data[offset + 1]); // G
-            file.put(data[offset + 2]); // B
+            // R
+            file.put(data[offset]);    
+            // G
+            file.put(data[offset + 1]); 
+            // B
+            file.put(data[offset + 2]); 
         }
     }
     
+    // Cleanup
     file.close();
     readbackBuffer->release();
     printf("Saved render to %s (%dx%d)\n", filename, width, height);
 }
 
+// Initialize the Metal engine
 void MTLEngine::init() {
     initDevice();
     initCommandQueue();
@@ -66,6 +75,7 @@ void MTLEngine::init() {
     uniformBuffer = metalDevice->newBuffer(sizeof(Uniforms), MTL::ResourceStorageModeShared);
 }
 
+// Initialize the Metal engine in headless mode for training
 void MTLEngine::initHeadless() {
     initDevice();
     initCommandQueue();
@@ -75,29 +85,35 @@ void MTLEngine::initHeadless() {
     uniformBuffer = metalDevice->newBuffer(sizeof(Uniforms), MTL::ResourceStorageModeShared);
 }
 
+// Main loop to run the engine
 void MTLEngine::run(Camera& camera) {
     activeCamera = &camera;
     size_t totalIterations = 0;
     
+    // Window loop
     while (!glfwWindowShouldClose(glfwWindow)) {
         glfwPollEvents();
         
+        // Training step
         if (isTraining && !trainingImages.empty()) {
             float loss = trainStep(currentImageIdx);
             epochLoss += loss;
             epochIterations++;
             totalIterations++;
             
+            // Display progress every 10 iterations
             if (epochIterations % 10 == 0) {
                 std::cout << "\rEpoch " << currentEpoch
                           << " | Image " << currentImageIdx << "/" << trainingImages.size()
                           << " | Loss: " << (epochLoss / epochIterations) << std::flush;
             }
             
+            // Density control application
             if (totalIterations % densityControlInterval == 0 && totalIterations > 500) {
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
                                          nullptr, gaussianCount, totalIterations);
                 
+                // Reallocate gradients buffer if needed
                 if (gaussianGradients->length() < gaussianCount * sizeof(GaussianGradients)) {
                     gaussianGradients->release();
                     gaussianGradients = metalDevice->newBuffer(gaussianCount * sizeof(GaussianGradients),
@@ -105,7 +121,9 @@ void MTLEngine::run(Camera& camera) {
                 }
             }
             
+            // Advance to next image
             currentImageIdx++;
+            // New epoch
             if (currentImageIdx >= trainingImages.size()) {
                 std::cout << std::endl << "=== Epoch " << currentEpoch << " complete | Avg Loss: "
                           << (epochLoss / epochIterations) << " ===" << std::endl;
@@ -116,12 +134,13 @@ void MTLEngine::run(Camera& camera) {
                 updatePositionBuffer();
             }
         }
-        
+        // Render current view
         render(camera);
     }
     activeCamera = nullptr;
 }
 
+// Cleanup resources
 void MTLEngine::cleanup() {
     glfwTerminate();
     if (gaussianBuffer) gaussianBuffer->release();
@@ -133,7 +152,9 @@ void MTLEngine::cleanup() {
     if (gaussianGradients) gaussianGradients->release();
 }
 
+// Initialize Metal device
 void MTLEngine::initDevice() {
+    // Get the default Metal device
     metalDevice = MTL::CreateSystemDefaultDevice();
     if (!metalDevice) {
         std::cerr << "Failed to create Metal device" << std::endl;
@@ -142,7 +163,9 @@ void MTLEngine::initDevice() {
     std::cout << "Using Metal device: " << metalDevice->name()->utf8String() << std::endl;
 }
 
+// Initialize GLFW window with Metal layer
 void MTLEngine::initWindow() {
+    // Initialize GLFW
     glfwInit();
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindow = glfwCreateWindow(800, 600, "Gaussian Splatting", NULL, NULL);
@@ -150,9 +173,11 @@ void MTLEngine::initWindow() {
         glfwTerminate();
         exit(EXIT_FAILURE);
     }
-    
+    // Create Metal layer
     metalWindow = glfwGetCocoaWindow(glfwWindow);
+    // Set up Metal layer for rendering
     metalLayer = [CAMetalLayer layer];
+    // Configure Metal layer properties
     metalLayer.device = (__bridge id<MTLDevice>)metalDevice;
     metalLayer.pixelFormat = MTLPixelFormatRGBA8Unorm;
     metalWindow.contentView.layer = metalLayer;
@@ -161,6 +186,7 @@ void MTLEngine::initWindow() {
     metalLayer.drawableSize = CGSizeMake(800, 600);
 }
 
+// Setup GLFW callbacks for input handling
 void MTLEngine::setupCallbacks() {
     glfwSetWindowUserPointer(glfwWindow, this);
     glfwSetFramebufferSizeCallback(glfwWindow, framebufferSizeCallback);
@@ -170,9 +196,11 @@ void MTLEngine::setupCallbacks() {
     glfwSetKeyCallback(glfwWindow, keyCallback);
 }
 
+// GLFW callback implementations
 void MTLEngine::mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     MTLEngine* engine = static_cast<MTLEngine*>(glfwGetWindowUserPointer(window));
     
+    // Left button for orbiting
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         if (action == GLFW_PRESS) {
             engine->isDragging = true;
@@ -182,6 +210,7 @@ void MTLEngine::mouseButtonCallback(GLFWwindow* window, int button, int action, 
         }
     }
     
+    // Right or middle button for panning
     if (button == GLFW_MOUSE_BUTTON_RIGHT || button == GLFW_MOUSE_BUTTON_MIDDLE) {
         if (action == GLFW_PRESS) {
             engine->isPanning = true;
@@ -192,13 +221,16 @@ void MTLEngine::mouseButtonCallback(GLFWwindow* window, int button, int action, 
     }
 }
 
+// GLFW cursor position callback
 void MTLEngine::cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     MTLEngine* engine = static_cast<MTLEngine*>(glfwGetWindowUserPointer(window));
     if (!engine->activeCamera) return;
     
+    // Calculate mouse movement delta
     double deltaX = xpos - engine->lastMouseX;
     double deltaY = ypos - engine->lastMouseY;
     
+    // Orbit or pan based on mouse state
     if (engine->isDragging) {
         float orbitSpeed = 0.005f;
         engine->activeCamera->orbit(-deltaX * orbitSpeed, -deltaY * orbitSpeed);
@@ -208,11 +240,14 @@ void MTLEngine::cursorPosCallback(GLFWwindow* window, double xpos, double ypos) 
         engine->activeCamera->pan(deltaX, deltaY);
     }
     
+    // Update last mouse position
     engine->lastMouseX = xpos;
     engine->lastMouseY = ypos;
 }
 
+// GLFW scroll callback for zooming
 void MTLEngine::scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
+    // Zoom the active camera based on scroll input
     MTLEngine* engine = static_cast<MTLEngine*>(glfwGetWindowUserPointer(window));
     if (!engine->activeCamera) return;
     
@@ -220,7 +255,9 @@ void MTLEngine::scrollCallback(GLFWwindow* window, double xoffset, double yoffse
     engine->activeCamera->zoom(-yoffset * zoomSpeed);
 }
 
+// Load Gaussians into GPU buffers
 void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians, float sceneExtent) {
+    // Create Gaussian buffer
     gaussianCount = gaussians.size();
     gaussianBuffer = metalDevice->newBuffer(gaussians.data(), gaussianCount * sizeof(Gaussian),
                                             MTL::ResourceStorageModeShared);
@@ -228,6 +265,7 @@ void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians, float scen
     // Create position buffer for sorting
     positionBuffer = metalDevice->newBuffer(gaussianCount * sizeof(simd_float3),
                                             MTL::ResourceStorageModeShared);
+    // Populate position buffer
     simd_float3* positions = (simd_float3*)positionBuffer->contents();
     for (size_t i = 0; i < gaussianCount; i++) {
         positions[i] = gaussians[i].position;
@@ -235,10 +273,11 @@ void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians, float scen
     
     // Use the camera-based scene extent for density control
     if (sceneExtent <= 0.0f) {
-        // Fallback: compute from point cloud (not ideal)
+        // Compute extent from point cloud as fallback
         float min_x = FLT_MAX, max_x = -FLT_MAX;
         float min_y = FLT_MAX, max_y = -FLT_MAX;
         float min_z = FLT_MAX, max_z = -FLT_MAX;
+        // Find bounding box of Gaussians
         for (const auto& g : gaussians) {
             min_x = std::min(min_x, g.position.x); max_x = std::max(max_x, g.position.x);
             min_y = std::min(min_y, g.position.y); max_y = std::max(max_y, g.position.y);
@@ -250,36 +289,46 @@ void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians, float scen
         std::cout << "WARNING: Using point cloud extent (fallback): " << sceneExtent << std::endl;
     }
     
+    // Set scene extent in density controller
     std::cout << "Density control using scene extent: " << sceneExtent << std::endl;
     DensityController::setSceneExtent(sceneExtent);
     
+    // Initialize GPU radix sort, optimizer, density controller, and rasterizer
     gpuSort = new GPURadixSort32(metalDevice, shaderLibrary, 2000000);
     optimizer = new AdamOptimizer(metalDevice, shaderLibrary, 2000000);
     densityController = new DensityController(metalDevice, shaderLibrary);
     densityController->resetAccumulator(gaussianCount);
     
+    // Create gradients buffer
     gaussianGradients = metalDevice->newBuffer(gaussianCount * sizeof(GaussianGradients),
                                                MTL::ResourceStorageModeShared);
     
+    // Initialize tiled rasterizer
     tiledRasterizer = new TiledRasterizer(metalDevice, shaderLibrary, 2000000);
     
     std::cout << "Loaded " << gaussianCount << " Gaussians" << std::endl;
 }
 
+// Initialize Metal command queue
 void MTLEngine::initCommandQueue() {
     commandQueue = metalDevice->newCommandQueue();
 }
 
+// Create Metal render pipeline
 void MTLEngine::createPipeline() {
+    // Create vertex and fragment functions
     MTL::Function* vertexShader = shaderLibrary->newFunction(NS::String::string("vertexShader", NS::ASCIIStringEncoding));
     assert(vertexShader);
     MTL::Function* fragmentShader = shaderLibrary->newFunction(NS::String::string("fragmentShader", NS::ASCIIStringEncoding));
     assert(fragmentShader);
     
+    // Create render pipeline descriptor    
     MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+    // Set shaders
     desc->setVertexFunction(vertexShader);
     desc->setFragmentFunction(fragmentShader);
     
+    // Set color attachment properties
     auto colorAttachment = desc->colorAttachments()->object(0);
     colorAttachment->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
     colorAttachment->setBlendingEnabled(true);
@@ -290,6 +339,7 @@ void MTLEngine::createPipeline() {
     colorAttachment->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
     colorAttachment->setAlphaBlendOperation(MTL::BlendOperationAdd);
     
+    // Create render pipeline state
     NS::Error* error;
     metalRenderPSO = metalDevice->newRenderPipelineState(desc, &error);
     
@@ -298,11 +348,13 @@ void MTLEngine::createPipeline() {
         std::exit(0);
     }
     
+    // Cleanup
     desc->release();
     vertexShader->release();
     fragmentShader->release();
 }
 
+// Load Metal shaders
 void MTLEngine::loadShaders() {
     shaderLibrary = metalDevice->newDefaultLibrary();
     if (!shaderLibrary) {
@@ -311,13 +363,17 @@ void MTLEngine::loadShaders() {
     }
 }
 
+// Create depth texture for rendering
 void MTLEngine::createDepthTexture() {
+    // Create depth texture descriptor
     MTL::TextureDescriptor* depthDesc = MTL::TextureDescriptor::alloc()->init();
+    // Set texture properties
     depthDesc->setWidth(800);
     depthDesc->setHeight(600);
     depthDesc->setPixelFormat(MTL::PixelFormatDepth32Float);
     depthDesc->setStorageMode(MTL::StorageModePrivate);
     depthDesc->setUsage(MTL::TextureUsageRenderTarget);
+    // Create depth texture
     depthTexture = metalDevice->newTexture(depthDesc);
     depthDesc->release();
 }
@@ -326,19 +382,22 @@ void MTLEngine::render(Camera& camera) {
     // GPU radix sort for depth ordering
     MTL::Buffer* sortedIndices = gpuSort->sort(commandQueue, positionBuffer, camera.get_position(), gaussianCount);
     
+    // Prepare uniform data
     Uniforms uniforms;
     
+    // Debug printing flag
     static bool renderDebugPrinted = false;
     
+    // Set camera matrices based on mode
     if (useTrainingView && !trainingImages.empty()) {
         const TrainingImage& img = trainingImages[currentTrainingIndex];
         const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
         
-        // Set view matrix from COLMAP pose (must be done BEFORE any transformations)
+        // Set view matrix from COLMAP pose must be done before any transforms
         uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
 
         
-        // For display, we render to the window, not the training image size
+        // For display render to window size
         // Scale focal length proportionally to window size
         float scaleX = (float)windowWidth / (float)cam.width;
         float scaleY = (float)windowHeight / (float)cam.height;
@@ -352,29 +411,34 @@ void MTLEngine::render(Camera& camera) {
         float cy = cam.cy * scaleY;
         
         // COLMAP uses OpenCV convention: +Z forward, Y-down
-        // Build projection matrix in column-major format directly (like projectionFromColmap)
+        // Build projection matrix in column-major format directly 
         // Projection matrix matching projectionFromColmap() for consistency
         // COLMAP Y-down + Metal texture top-left origin = NO Y flip needed
         simd_float4x4 proj = {0};
         proj.columns[0][0] = 2.0f * scaledFx / windowWidth;
-        proj.columns[1][1] = 2.0f * scaledFy / windowHeight;  // POSITIVE: matches projectionFromColmap()
-        proj.columns[2][0] = 2.0f * cx / windowWidth - 1.0f;  // Consistent offset formula
-        proj.columns[2][1] = 2.0f * cy / windowHeight - 1.0f; // Consistent offset formula
+        proj.columns[1][1] = 2.0f * scaledFy / windowHeight; 
+        proj.columns[2][0] = 2.0f * cx / windowWidth - 1.0f;  
+        proj.columns[2][1] = 2.0f * cy / windowHeight - 1.0f;
         proj.columns[2][2] = far / (far - near);
-        proj.columns[2][3] = 1.0f;  // clipW = viewZ (COLMAP +Z forward)
+        proj.columns[2][3] = 1.0f; 
         proj.columns[3][2] = -(far * near) / (far - near);
+        // Set projection matrix
         uniforms.projectionMatrix = proj;
         
+        // Compute view-projection matrix
         uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
         uniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
         uniforms.focalLength = simd_make_float2(scaledFx, scaledFy);
         
+        // compute camera position from view matrix
         simd_float3x3 R;
         R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
         R.columns[1] = uniforms.viewMatrix.columns[1].xyz;
         R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
+        // -C^T * R^T
         uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
         
+        // Debug printing
         if (!renderDebugPrinted) {
             printf("\n=== RENDER DEBUG (Training View) ===\n");
             printf("Window: %dx%d, COLMAP: %dx%d\n", windowWidth, windowHeight, cam.width, cam.height);
@@ -405,8 +469,10 @@ void MTLEngine::render(Camera& camera) {
             // Test transform a sample point
             Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
             simd_float3 testPos = gaussians[0].position;
+            // Multiply to get view and clip positions
             simd_float4 viewPos = matrix_multiply(uniforms.viewMatrix, simd_make_float4(testPos, 1.0f));
             simd_float4 clipPos = matrix_multiply(uniforms.viewProjectionMatrix, simd_make_float4(testPos, 1.0f));
+            // Debug print
             printf("Sample Gaussian 0:\n");
             printf("  world pos: (%.3f, %.3f, %.3f)\n", testPos.x, testPos.y, testPos.z);
             printf("  view pos: (%.3f, %.3f, %.3f, %.3f)\n", viewPos.x, viewPos.y, viewPos.z, viewPos.w);
@@ -428,10 +494,12 @@ void MTLEngine::render(Camera& camera) {
             renderDebugPrinted = true;
         }
     } else {
+        // Free camera view
         float fovY = 45.0f * M_PI / 180.0f;
         float fy = windowHeight / (2.0f * tan(fovY / 2.0f));
         float fx = fy;
         
+        // Set camera matrices
         uniforms.viewMatrix = camera.get_view_matrix();
         uniforms.projectionMatrix = camera.get_projection_matrix();
         uniforms.viewProjectionMatrix = matrix_multiply(camera.get_projection_matrix(), camera.get_view_matrix());
@@ -439,6 +507,7 @@ void MTLEngine::render(Camera& camera) {
         uniforms.focalLength = simd_make_float2(fx, fy);
         uniforms.cameraPos = camera.get_position();
         
+        // Debug printing
         if (!renderDebugPrinted && gaussianBuffer) {
             printf("\n=== RENDER DEBUG (Free Camera) ===\n");
             printf("Window: %dx%d\n", windowWidth, windowHeight);
@@ -457,6 +526,7 @@ void MTLEngine::render(Camera& camera) {
             // Test transform a sample point
             Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
             simd_float3 testPos = gaussians[0].position;
+            // Multiply to get view and clip positions
             simd_float4 viewPos = matrix_multiply(uniforms.viewMatrix, simd_make_float4(testPos, 1.0f));
             simd_float4 clipPos = matrix_multiply(uniforms.viewProjectionMatrix, simd_make_float4(testPos, 1.0f));
             printf("Sample Gaussian 0:\n");
@@ -482,82 +552,73 @@ void MTLEngine::render(Camera& camera) {
             renderDebugPrinted = true;
         }
     }
+    // Upload uniforms to GPU
     memcpy(uniformBuffer->contents(), &uniforms, sizeof(Uniforms));
     
+    // Get next drawable from Metal layer
     CA::MetalDrawable* drawable = (__bridge CA::MetalDrawable*)[metalLayer nextDrawable];
     if (!drawable) return;
-    
+    // Set up render pass descriptor
     MTL::RenderPassDescriptor* renderPassDesc = MTL::RenderPassDescriptor::alloc()->init();
     renderPassDesc->colorAttachments()->object(0)->setTexture(drawable->texture());
     renderPassDesc->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
     renderPassDesc->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
     renderPassDesc->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(1.0, 1.0, 1.0, 1.0));
     
+    // Create command buffer and render encoder
     MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
     MTL::RenderCommandEncoder* encoder = commandBuffer->renderCommandEncoder(renderPassDesc);
     
+    // Set pipeline and draw
     encoder->setRenderPipelineState(metalRenderPSO);
+    // Set buffers
     encoder->setVertexBuffer(gaussianBuffer, 0, 0);
     encoder->setVertexBuffer(uniformBuffer, 0, 1);
     encoder->setVertexBuffer(sortedIndices, 0, 2);
+    // Draw Gaussians as triangle strips
     encoder->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4), gaussianCount);
     
+    // Finalize encoding and present
     encoder->endEncoding();
     commandBuffer->presentDrawable(drawable);
     commandBuffer->commit();
     commandBuffer->waitUntilCompleted();
     
+    // Cleanup
     renderPassDesc->release();
 }
 
+// GLFW framebuffer size callback
 void MTLEngine::framebufferSizeCallback(GLFWwindow* window, int width, int height) {
     if (width == 0 || height == 0) return;
     
+    // Update engine state
     MTLEngine* engine = static_cast<MTLEngine*>(glfwGetWindowUserPointer(window));
     engine->windowWidth = width;
     engine->windowHeight = height;
     
+    // Update Metal layer size
     engine->metalLayer.drawableSize = CGSizeMake(width, height);
     
+    // Recreate depth texture
     if (engine->activeCamera) {
         engine->activeCamera->setAspectRatio((float)width / (float)height);
     }
 }
 
+// Load training images from COLMAP data
 void MTLEngine::loadTrainingData(const ColmapData& colmap, const std::string& imagePath) {
     colmapData = colmap;
     trainingImages = loadTrainingImages(metalDevice, colmap, imagePath);
     std::cout << "Loaded " << trainingImages.size() << " training images" << std::endl;
 }
 
+// Convert COLMAP quaternion and translation to view matrix
 simd_float4x4 MTLEngine::viewMatrixFromColmap(simd_float4 quat, simd_float3 translation) {
     // Quaternion convention: float4(.x=w, .y=x, .z=y, .w=z)
-    // This matches the Gaussian rotation convention used throughout the codebase
     float w = quat.x, x = quat.y, y = quat.z, z = quat.w;
     
-    // COLMAP stores world-to-camera rotation R and camera-space translation t
-    // Transform: p_cam = R * p_world + t
-    //
-    // Standard quaternion to rotation matrix (R):
-    // R = | 1-2(y²+z²)   2(xy-wz)    2(xz+wy)  |
-    //     | 2(xy+wz)    1-2(x²+z²)   2(yz-wx)  |
-    //     | 2(xz-wy)     2(yz+wx)   1-2(x²+y²) |
-    //
-    // Metal uses column-major matrices and (matrix * vector) computes:
-    //   result[i] = dot(row i of matrix, vector)
-    // where row i of matrix = (col0[i], col1[i], col2[i], col3[i])
-    //
-    // For viewPos = viewMatrix * worldPos to compute R * worldPos + t:
-    // We need row 0 of viewMatrix to be row 0 of [R|t] = (R[0][0], R[0][1], R[0][2], t.x)
-    // In column-major storage: col0[0]=R[0][0], col1[0]=R[0][1], col2[0]=R[0][2], col3[0]=t.x
-    //
-    // So column j of viewMatrix should contain R[*][j] (j-th column of R) in its first 3 elements
-    // Wait no - we want row i of viewMatrix = row i of [R|t]
-    // Metal column major: row i is (col0[i], col1[i], col2[i], col3[i])
-    // So we need: col0[i] = R[i][0], col1[i] = R[i][1], col2[i] = R[i][2], col3[i] = t[i]
-    // This means: col j = (R[0][j], R[1][j], R[2][j], 0 or 1) = column j of R
-    //
-    // Build R (column-major, so R.columns[j] = j-th column of rotation matrix):
+    // Convert quaternion to rotation matrix R
     matrix_float3x3 R;
     // Column 0 of R: (R[0][0], R[1][0], R[2][0])
     R.columns[0] = simd_make_float3(1 - 2*(y*y + z*z), 2*(x*y + w*z), 2*(x*z - w*y));
@@ -566,43 +627,8 @@ simd_float4x4 MTLEngine::viewMatrixFromColmap(simd_float4 quat, simd_float3 tran
     // Column 2 of R: (R[0][2], R[1][2], R[2][2])
     R.columns[2] = simd_make_float3(2*(x*z + w*y), 2*(y*z - w*x), 1 - 2*(x*x + y*y));
     
-    // Build 4x4 view matrix [R | t]
-    // For (matrix * vec4(pos, 1)) = R*pos + t:
-    // We need the 4x4 matrix such that row i = (R[i][0], R[i][1], R[i][2], t[i])
-    // In column major: col0 = (R[0][0], R[1][0], R[2][0], 0) = (R.columns[0], 0)... NO!
-    //
-    // Let me think again. In column-major:
-    //   viewMatrix.columns[j][i] = element at row i, col j
-    //
-    // We want: viewMatrix * vec4(p, 1) = vec4(R*p + t, 1)
-    //   result[0] = row0 · input = col0[0]*p.x + col1[0]*p.y + col2[0]*p.z + col3[0]*1
-    //             = R[0][0]*p.x + R[0][1]*p.y + R[0][2]*p.z + t.x  ✓
-    //
-    // So we need: col0[0] = R[0][0], col1[0] = R[0][1], col2[0] = R[0][2], col3[0] = t.x
-    //             col0[1] = R[1][0], col1[1] = R[1][1], col2[1] = R[1][2], col3[1] = t.y
-    //             etc.
-    //
-    // This means: columns[j] = (R[0][j], R[1][j], R[2][j], 0) for j=0,1,2
-    //             columns[3] = (t.x, t.y, t.z, 1)
-    //
-    // And R.columns[j] = (R[0][j], R[1][j], R[2][j]) which IS the j-th column of R matrix!
-    // So the original code was correct! Let me verify the quaternion formula...
-    //
-    // Standard quaternion to matrix (row-major R[row][col]):
-    //   R[0][0] = 1 - 2*(y*y + z*z)
-    //   R[0][1] = 2*(x*y - w*z)
-    //   R[0][2] = 2*(x*z + w*y)
-    //   R[1][0] = 2*(x*y + w*z)
-    //   R[1][1] = 1 - 2*(x*x + z*z)
-    //   R[1][2] = 2*(y*z - w*x)
-    //   R[2][0] = 2*(x*z - w*y)
-    //   R[2][1] = 2*(y*z + w*x)
-    //   R[2][2] = 1 - 2*(x*x + y*y)
-    //
-    // Column 0 should be (R[0][0], R[1][0], R[2][0]) = (1-2(y²+z²), 2(xy+wz), 2(xz-wy)) ✓
-    //
-    // OK the rotation matrix is correct. The issue must be elsewhere!
     
+    // Build view matrix: [ R | t ] in column-major order
     simd_float4x4 view;
     view.columns[0] = simd_make_float4(R.columns[0], 0);
     view.columns[1] = simd_make_float4(R.columns[1], 0);
@@ -612,7 +638,9 @@ simd_float4x4 MTLEngine::viewMatrixFromColmap(simd_float4 quat, simd_float3 tran
     return view;
 }
 
+// Create projection matrix from COLMAP camera parameters
 simd_float4x4 MTLEngine::projectionFromColmap(const ColmapCamera& cam, float nearZ, float farZ) {
+    // Extract parameters
     float fx = cam.fx;
     float fy = cam.fy;
     float cx = cam.cx;
@@ -620,50 +648,37 @@ simd_float4x4 MTLEngine::projectionFromColmap(const ColmapCamera& cam, float nea
     float w = (float)cam.width;
     float h = (float)cam.height;
     
-    // COLMAP projection: pixel_x = fx * X/Z + cx, pixel_y = fy * Y/Z + cy
-    // We want: screen_pos = (ndc * 0.5 + 0.5) * size  to equal COLMAP pixel coordinates
-    // 
-    // For X: ndc_x * 0.5 + 0.5 = (fx * X/Z + cx) / w
-    //        ndc_x = 2 * fx * X / (w * Z) + (2*cx/w - 1)
-    //
-    // For Y: ndc_y * 0.5 + 0.5 = (fy * Y/Z + cy) / h
-    //        ndc_y = 2 * fy * Y / (h * Z) + (2*cy/h - 1)
-    //
-    // Matrix form: clip = P * view, ndc = clip.xyz / clip.w
-    // With clip.w = Z (for COLMAP's +Z forward convention):
-    //   ndc_x = clip.x / Z = (P[0][0] * X + P[2][0] * Z) / Z = P[0][0] * X/Z + P[2][0]
-    //   ndc_y = clip.y / Z = (P[1][1] * Y + P[2][1] * Z) / Z = P[1][1] * Y/Z + P[2][1]
-    //
-    // Therefore: P[0][0] = 2*fx/w, P[2][0] = 2*cx/w - 1
-    //            P[1][1] = 2*fy/h, P[2][1] = 2*cy/h - 1
-    //            (NO NEGATIVE on fy - COLMAP Y-down matches Metal texture top-left origin)
-    
+    // Build projection matrix in column-major format directly
     simd_float4x4 proj = {0};
     proj.columns[0][0] = 2.0f * fx / w;
-    proj.columns[1][1] = 2.0f * fy / h;  // POSITIVE: COLMAP Y-down, Metal texture origin top-left
+    proj.columns[1][1] = 2.0f * fy / h; 
     proj.columns[2][0] = 2.0f * cx / w - 1.0f;
     proj.columns[2][1] = 2.0f * cy / h - 1.0f;
     proj.columns[2][2] = farZ / (farZ - nearZ);
-    proj.columns[2][3] = 1.0f;  // clip.w = view.z (COLMAP +Z forward)
+    proj.columns[2][3] = 1.0f;
     proj.columns[3][2] = -(farZ * nearZ) / (farZ - nearZ);
     
     return proj;
 }
 
+// GLFW key callback for input handling
 void MTLEngine::keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     MTLEngine* engine = static_cast<MTLEngine*>(glfwGetWindowUserPointer(window));
     
+    // Toggle training view with T
     if (action == GLFW_PRESS) {
         if (key == GLFW_KEY_T) {
             engine->useTrainingView = !engine->useTrainingView;
             std::cout << "Training view: " << (engine->useTrainingView ? "ON" : "OFF") << std::endl;
         }
         
+        // Toggle training with Space
         if (key == GLFW_KEY_SPACE) {
             engine->isTraining = !engine->isTraining;
             std::cout << "Training: " << (engine->isTraining ? "STARTED" : "PAUSED") << std::endl;
         }
         
+        // Navigate training images with Left/Right arrows
         if (key == GLFW_KEY_LEFT && engine->useTrainingView) {
             if (engine->currentTrainingIndex > 0) engine->currentTrainingIndex--;
             std::cout << "Training image: " << engine->currentTrainingIndex << std::endl;
@@ -676,9 +691,11 @@ void MTLEngine::keyCallback(GLFWwindow* window, int key, int scancode, int actio
     }
 }
 
+// Create render target texture
 void MTLEngine::createRenderTarget(uint32_t width, uint32_t height) {
     if (renderTarget) renderTarget->release();
     
+    // Create texture descriptor
     MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
     desc->setWidth(width);
     desc->setHeight(height);
@@ -689,6 +706,7 @@ void MTLEngine::createRenderTarget(uint32_t width, uint32_t height) {
     desc->release();
 }
 
+// Create loss computation pipelines
 void MTLEngine::createLossPipeline() {
     NS::Error* error = nullptr;
     
@@ -727,6 +745,7 @@ void MTLEngine::createLossPipeline() {
     std::cout << "Loss pipelines created (L1 + D-SSIM with lambda=" << lambdaDSSIM << ")" << std::endl;
 }
 
+// Compute combined loss (L1 + D-SSIM) between rendered and ground truth textures
 float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) {
     uint32_t width = rendered->width();
     uint32_t height = rendered->height();
@@ -738,11 +757,13 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
         lossBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
     }
     
+    // SSIM buffer
     if (!ssimBuffer || ssimBuffer->length() < pixelCount * sizeof(float)) {
         if (ssimBuffer) ssimBuffer->release();
         ssimBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
     }
     
+    // Combined loss buffer
     if (!combinedLossBuffer || combinedLossBuffer->length() < pixelCount * sizeof(float)) {
         if (combinedLossBuffer) combinedLossBuffer->release();
         combinedLossBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
@@ -752,12 +773,15 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
         totalLossBuffer = metalDevice->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
     }
     
+    // Initialize total loss to zero
     float zero = 0.0f;
     memcpy(totalLossBuffer->contents(), &zero, sizeof(float));
     
+    // Create command buffer and encoder
     MTL::CommandBuffer* cmdBuffer = commandQueue->commandBuffer();
     MTL::ComputeCommandEncoder* encoder = cmdBuffer->computeCommandEncoder();
     
+    // Define threadgroups
     MTL::Size gridSize = MTL::Size(width, height, 1);
     MTL::Size threadGroupSize = MTL::Size(16, 16, 1);
     
@@ -779,9 +803,12 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
     encoder->setComputePipelineState(combinedLossPSO);
     encoder->setTexture(rendered, 0);
     encoder->setTexture(groundTruth, 1);
-    encoder->setBuffer(lossBuffer, 0, 0);           // L1 losses
-    encoder->setBuffer(ssimBuffer, 0, 1);           // SSIM losses  
-    encoder->setBuffer(combinedLossBuffer, 0, 2);   // Output combined
+    // L1 losses
+    encoder->setBuffer(lossBuffer, 0, 0);      
+    // SSIM losses       
+    encoder->setBuffer(ssimBuffer, 0, 1);      
+    // Output combined     
+    encoder->setBuffer(combinedLossBuffer, 0, 2);   
     encoder->setBytes(&lambdaDSSIM, sizeof(float), 3);
     encoder->dispatchThreads(gridSize, threadGroupSize);
     
@@ -791,29 +818,35 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
     encoder->setBuffer(totalLossBuffer, 0, 1);
     encoder->setBytes(&pixelCount, sizeof(uint32_t), 2);
     
+    // Launch reduction with fixed number of threads
     uint32_t reductionThreads = 1024;
     encoder->dispatchThreads(MTL::Size(reductionThreads, 1, 1), MTL::Size(64, 1, 1));
     
+    // Finalize encoding
     encoder->endEncoding();
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
     
+    // Retrieve total loss
     float totalLoss = *(float*)totalLossBuffer->contents();
     return totalLoss / pixelCount;
 }
 
+// Perform a single training step on a specified training image
 float MTLEngine::trainStep(size_t imageIndex, 
                            float lr_position,
                            float lr_scale,
                            float lr_rotation,
                            float lr_opacity,
                            float lr_sh) {
+    // Validate image index
     if (imageIndex >= trainingImages.size()) return 0.0f;
     
+    // Prepare uniforms for the specified training image
     const TrainingImage& img = trainingImages[imageIndex];
     const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
     
-    // Get ACTUAL image dimensions from the loaded texture (may differ from COLMAP camera)
+    // Get image texture size
     uint32_t actualWidth = img.texture->width();
     uint32_t actualHeight = img.texture->height();
     
@@ -841,6 +874,7 @@ float MTLEngine::trainStep(size_t imageIndex,
         uniformsDebugPrinted = true;
     }
     
+    // Ensure render target matches image size
     if (!renderTarget || renderTarget->width() != actualWidth || renderTarget->height() != actualHeight) {
         createRenderTarget(actualWidth, actualHeight);
     }
@@ -854,6 +888,7 @@ float MTLEngine::trainStep(size_t imageIndex,
     scaledCam.cx = scaledCx;
     scaledCam.cy = scaledCy;
     
+    // Set up uniforms
     TiledUniforms uniforms;
     uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
     uniforms.projectionMatrix = projectionFromColmap(scaledCam, 0.1f, 1000.0f);
@@ -861,13 +896,14 @@ float MTLEngine::trainStep(size_t imageIndex,
     uniforms.screenSize = simd_make_float2((float)actualWidth, (float)actualHeight);
     uniforms.focalLength = simd_make_float2(scaledFx, scaledFy);
     
+    // Compute camera position from view matrix
     simd_float3x3 R;
     R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
     R.columns[1] = uniforms.viewMatrix.columns[1].xyz;
     R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
     uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
     
-    // DEBUG: Check view-space coordinates for first few Gaussians on CPU side
+    // DEBUG Check view-space coordinates for first few Gaussians on CPU side
     static bool projectionDebugPrinted = false;
     if (!projectionDebugPrinted) {
         Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
@@ -916,9 +952,10 @@ float MTLEngine::trainStep(size_t imageIndex,
     // Forward pass
     tiledRasterizer->forward(commandQueue, gaussianBuffer, gaussianCount, uniforms, renderTarget);
     
-    // DEBUG: Save training render less frequently
+    // Save training render less frequently
     static int saveCounter = 0;
     if (saveCounter % 500 == 0) {
+        // Save rendered image
         char filename[64];
         snprintf(filename, sizeof(filename), "/tmp/train_render_%04d.ppm", saveCounter);
         saveTextureToPPM(renderTarget, metalDevice, commandQueue, filename);
@@ -950,8 +987,11 @@ float MTLEngine::trainStep(size_t imageIndex,
     
     // Periodic stats every 200 images
     if (saveCounter % 200 == 0) {
+        // Print average opacity and scale
         Gaussian* g = (Gaussian*)gaussianBuffer->contents();
+        // Calculate average opacity and scale for a sample of Gaussians
         float avgOpacity = 0, avgScale = 0;
+        // Sample up to 100 Gaussians for stats
         const int sampleCount = std::min((size_t)100, gaussianCount);
         for (int i = 0; i < sampleCount; i++) {
             avgOpacity += 1.0f / (1.0f + exp(-g[i].opacity));
@@ -964,7 +1004,9 @@ float MTLEngine::trainStep(size_t imageIndex,
     return loss;
 }
 
+// Update position buffer from Gaussian buffer for external use
 void MTLEngine::updatePositionBuffer() {
+    // Copy positions from Gaussian buffer to position buffer
     Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
     simd_float3* positions = (simd_float3*)positionBuffer->contents();
     
@@ -973,30 +1015,32 @@ void MTLEngine::updatePositionBuffer() {
     }
 }
 
-// Exponential learning rate decay (matches official 3DGS)
+// Exponential learning rate decay with matches 3DGS official schedule
 static float exponentialLRDecay(float lr_init, float lr_final, size_t currentIter, size_t maxIter) {
+    // Clamp to final learning rate
     if (currentIter >= maxIter) return lr_final;
+    // Compute exponential decay
     float t = static_cast<float>(currentIter) / static_cast<float>(maxIter);
     return lr_init * std::pow(lr_final / lr_init, t);
 }
 
 void MTLEngine::train(size_t numEpochs) {
+    // Training loop
     std::cout << "Starting training for " << numEpochs << " epochs..." << std::endl;
     std::cout << "Gaussians: " << gaussianCount << " | Images: " << trainingImages.size() << std::endl;
     
-    // Training configuration (matching official 3DGS)
+    // Training configuration which matches 3DGS official settings
     const size_t OPACITY_RESET_INTERVAL = 3000;
     const size_t DENSIFY_FROM_ITER = 500;
     const size_t DENSIFY_UNTIL_ITER = 15000;
     const float OPACITY_RESET_VALUE = -4.6f;  // sigmoid^-1(0.01) ≈ -4.6
     
-    // ============================================================
-    // LEARNING RATE CONFIGURATION (matching official 3DGS)
-    // ============================================================
     // Position LR decays exponentially from init to final
     const float POSITION_LR_INIT = 0.00016f;
-    const float POSITION_LR_FINAL = 0.0000016f;  // 100x smaller at end
-    const float SCALE_LR = 0.001f;  // Reduced from 0.005 to prevent scale bloating
+    // 100x smaller at end
+    const float POSITION_LR_FINAL = 0.0000016f;  
+    // Back to official value - need Gaussians to shrink for sharpness
+    const float SCALE_LR = 0.005f;  
     const float ROTATION_LR = 0.001f;
     const float OPACITY_LR = 0.05f;
     const float SH_LR = 0.0025f;
@@ -1007,9 +1051,11 @@ void MTLEngine::train(size_t numEpochs) {
     std::cout << "Learning rate decay: position " << POSITION_LR_INIT 
               << " -> " << POSITION_LR_FINAL << " over " << totalExpectedIters << " iterations" << std::endl;
     
+    // Start training timer
     auto startTime = std::chrono::high_resolution_clock::now();
     size_t totalIterations = 0;
     
+    // Training loop
     for (size_t epoch = 0; epoch < numEpochs; epoch++) {
         float epochLoss = 0.0f;
         auto epochStart = std::chrono::high_resolution_clock::now();
@@ -1032,16 +1078,13 @@ void MTLEngine::train(size_t numEpochs) {
                           << "] Loss: " << (epochLoss / (imgIdx + 1)) << std::flush;
             }
             
-            // ============================================================
-            // OPACITY RESET (Critical for preventing floaters)
-            // Official 3DGS resets opacity every 3000 iterations until iter 15000
-            // Uses clamping: min(current_opacity, 0.01) - keeps low opacities unchanged
-            // ============================================================
+            // Opacity reset every OPACITY_RESET_INTERVAL iterations before DENSIFY_UNTIL_ITER 
             if (totalIterations % OPACITY_RESET_INTERVAL == 0 && 
                 totalIterations > 0 && 
                 totalIterations < DENSIFY_UNTIL_ITER) {
                 std::cout << std::endl << "Resetting opacity at iteration " << totalIterations << std::endl;
                 
+                // Clamp opacities in Gaussian buffer
                 Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
                 for (size_t i = 0; i < gaussianCount; i++) {
                     // Clamp opacity to max 0.01: min(current, sigmoid^-1(0.01))
@@ -1055,21 +1098,18 @@ void MTLEngine::train(size_t numEpochs) {
                 optimizer->resetOpacityMomentum();
             }
             
-            // ============================================================
-            // DENSITY CONTROL
-            // Only run between iterations 500 and 15000
-            // Skip 500 iterations after EACH opacity reset to let Gaussians recover
-            // ============================================================
             // Check if we're within 500 iterations after ANY opacity reset (3000, 6000, 9000, 12000)
             size_t itersSinceLastReset = totalIterations % OPACITY_RESET_INTERVAL;
             bool justAfterReset = (totalIterations >= OPACITY_RESET_INTERVAL && 
                                    itersSinceLastReset > 0 && 
                                    itersSinceLastReset <= 500);
+            // Density control condition
             bool shouldDensify = (totalIterations >= DENSIFY_FROM_ITER &&
                                   totalIterations < DENSIFY_UNTIL_ITER &&
                                   totalIterations % densityControlInterval == 0 &&
                                   !justAfterReset);
             
+            // Apply density control if needed
             if (shouldDensify) {
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
                                          nullptr, gaussianCount, totalIterations);
@@ -1090,8 +1130,10 @@ void MTLEngine::train(size_t numEpochs) {
             pool->release();
         }
         
+        // Update position buffer at end of epoch
         updatePositionBuffer();
         
+        // Epoch timing
         auto epochEnd = std::chrono::high_resolution_clock::now();
         auto epochDuration = std::chrono::duration_cast<std::chrono::seconds>(epochEnd - epochStart).count();
         
@@ -1099,6 +1141,7 @@ void MTLEngine::train(size_t numEpochs) {
         float currentLR = exponentialLRDecay(POSITION_LR_INIT, POSITION_LR_FINAL, 
                                              totalIterations, totalExpectedIters);
         
+        // Epoch summary
         std::cout << std::endl << "=== Epoch " << epoch << " | Loss: "
                   << (epochLoss / trainingImages.size())
                   << " | Gaussians: " << gaussianCount
@@ -1106,12 +1149,14 @@ void MTLEngine::train(size_t numEpochs) {
                   << " | Time: " << epochDuration << "s ===" << std::endl;
     }
     
+    // Total training time
     auto endTime = std::chrono::high_resolution_clock::now();
     auto totalDuration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
     
     std::cout << "Training complete! Total time: " << totalDuration << "s" << std::endl;
 }
 
+// Export rendered views for all training images to specified folder
 void MTLEngine::exportTrainingViews(const std::string& outputFolder) {
     if (trainingImages.empty()) {
         std::cerr << "No training images to export views for!" << std::endl;
@@ -1124,8 +1169,10 @@ void MTLEngine::exportTrainingViews(const std::string& outputFolder) {
     
     std::cout << "\n=== Exporting " << trainingImages.size() << " training views to " << outputFolder << " ===" << std::endl;
     
+    // Start timer
     auto startTime = std::chrono::high_resolution_clock::now();
     
+    // Loop over training images
     for (size_t imgIdx = 0; imgIdx < trainingImages.size(); imgIdx++) {
         const TrainingImage& img = trainingImages[imgIdx];
         const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
@@ -1153,10 +1200,12 @@ void MTLEngine::exportTrainingViews(const std::string& outputFolder) {
         proj.columns[3][2] = -(far * near) / (far - near);
         uniforms.projectionMatrix = proj;
         
+        // Compute view-projection matrix
         uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
         uniforms.screenSize = simd_make_float2((float)cam.width, (float)cam.height);
         uniforms.focalLength = simd_make_float2(cam.fx, cam.fy);
         
+        // Compute camera position from view matrix
         simd_float3x3 R;
         R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
         R.columns[1] = uniforms.viewMatrix.columns[1].xyz;
@@ -1184,6 +1233,7 @@ void MTLEngine::exportTrainingViews(const std::string& outputFolder) {
         }
     }
     
+    // Final timing
     auto endTime = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
     

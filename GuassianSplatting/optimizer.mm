@@ -8,31 +8,38 @@
 #include "optimizer.hpp"
 #include <iostream>
 
+// Adam Optimizer class for updating Gaussian parameters
 AdamOptimizer::AdamOptimizer(MTL::Device* device, MTL::Library* library, size_t numGaussians)
 : device(device), numGaussians(numGaussians), timestep(0) {
     
+    // Create compute pipeline for Adam optimizer
     NS::Error* error = nullptr;
+    // Load Adam compute function
     MTL::Function* func = library->newFunction(NS::String::string("adamStep", NS::ASCIIStringEncoding));
+    // Create compute pipeline state
     adamPSO = device->newComputePipelineState(func, &error);
     if(!adamPSO) {
         std::cerr << "Failed to create Adam pipeline" << std::endl;
     }
     
+    // Release function
     func->release();
     
+    // Allocate Adam state buffers
     allocateBuffers(numGaussians);
     reset();
 }
 
+// Allocate or reallocate Adam state buffers
 void AdamOptimizer::allocateBuffers(size_t count) {
     // Using 3 floats (12 bytes) per vec3, not simd_float3 (16 bytes)
-    // This matches the shader's manual indexing: tid * 3 + 0/1/2
-    size_t posSize = count * 3 * sizeof(float);   // 12 bytes per element
-    size_t scaleSize = count * 3 * sizeof(float); // 12 bytes per element
+    size_t posSize = count * 3 * sizeof(float);   
+    size_t scaleSize = count * 3 * sizeof(float);
     size_t rotSize = count * sizeof(simd_float4);
     size_t opacitySize = count * sizeof(float);
     size_t shSize = count * 12 * sizeof(float);
     
+    // Allocate buffers
     m_position = device->newBuffer(posSize, MTL::ResourceStorageModeShared);
     m_scale = device->newBuffer(scaleSize, MTL::ResourceStorageModeShared);
     m_rotation = device->newBuffer(rotSize, MTL::ResourceStorageModeShared);
@@ -45,13 +52,14 @@ void AdamOptimizer::allocateBuffers(size_t count) {
     v_opacity = device->newBuffer(opacitySize, MTL::ResourceStorageModeShared);
     v_sh = device->newBuffer(shSize, MTL::ResourceStorageModeShared);
     
-    // Debug buffer: 16 floats for GPU-side debugging
+    // Debug buffer 16 floats for GPU-side debugging
     debugBuffer = device->newBuffer(16 * sizeof(float), MTL::ResourceStorageModeShared);
     memset(debugBuffer->contents(), 0, 16 * sizeof(float));
     
     paramsBuffer = device->newBuffer(sizeof(AdamParams), MTL::ResourceStorageModeShared);
 }
 
+// Destructor to release buffers
 AdamOptimizer::~AdamOptimizer() {
     m_position->release();
     m_scale->release();
@@ -68,6 +76,7 @@ AdamOptimizer::~AdamOptimizer() {
     adamPSO->release();
 }
 
+// Reset Adam state buffers to zero
 void AdamOptimizer::reset() {
     timestep = 0;
     memset(m_position->contents(), 0, m_position->length());
@@ -82,11 +91,13 @@ void AdamOptimizer::reset() {
     memset(v_sh->contents(), 0, v_sh->length());
 }
 
+// Resize Adam state buffers if number of Gaussians increases
 void AdamOptimizer::resizeIfNeeded(size_t newNumGaussians) {
     if (newNumGaussians <= numGaussians) return;
     
     std::cout << "Resizing optimizer buffers from " << numGaussians << " to " << newNumGaussians << std::endl;
     
+    // Helper lambda to resize a buffer
     auto resizeBuffer = [this](MTL::Buffer*& buf, size_t newSize) {
         MTL::Buffer* newBuf = device->newBuffer(newSize, MTL::ResourceStorageModeShared);
         // Copy existing data
@@ -100,13 +111,14 @@ void AdamOptimizer::resizeIfNeeded(size_t newNumGaussians) {
         buf = newBuf;
     };
     
-    // Using 3 floats (12 bytes) per vec3, not simd_float3 (16 bytes)
+    // Calculate new sizes
     size_t posSize = newNumGaussians * 3 * sizeof(float);
     size_t scaleSize = newNumGaussians * 3 * sizeof(float);
     size_t rotSize = newNumGaussians * sizeof(simd_float4);
     size_t opacitySize = newNumGaussians * sizeof(float);
     size_t shSize = newNumGaussians * 12 * sizeof(float);
     
+    // Resize all buffers
     resizeBuffer(m_position, posSize);
     resizeBuffer(m_scale, scaleSize);
     resizeBuffer(m_rotation, rotSize);
@@ -121,14 +133,15 @@ void AdamOptimizer::resizeIfNeeded(size_t newNumGaussians) {
     numGaussians = newNumGaussians;
 }
 
+// Reset momentum for opacity to allow fresh learning after opacity reset
 void AdamOptimizer::resetOpacityMomentum() {
-    // Reset momentum for opacity to allow fresh learning after opacity reset
     memset(m_opacity->contents(), 0, numGaussians * sizeof(float));
     memset(v_opacity->contents(), 0, numGaussians * sizeof(float));
 }
 
+// Debug print Adam state for a specific Gaussian
 void AdamOptimizer::debugPrintState(int idx) {
-    // Now using float* with stride 3, not simd_float3*
+    // Get state pointers
     float* m_pos = (float*)m_position->contents();
     float* v_pos = (float*)v_position->contents();
     float* m_scl = (float*)m_scale->contents();
@@ -148,12 +161,12 @@ void AdamOptimizer::debugPrintState(int idx) {
     // Print first few raw bytes to verify we're reading correctly
     uint8_t* rawBytes = (uint8_t*)m_scale->contents();
     printf("[Adam Debug] m_scale raw bytes at idx %d offset %zu: ", idx, idx * 3 * sizeof(float));
-    for (int b = 0; b < 12; b++) {  // 3 floats = 12 bytes
+    for (int b = 0; b < 12; b++) {  
         printf("%02X ", rawBytes[idx * 3 * sizeof(float) + b]);
     }
     printf("\n");
     
-    // Sanity check: momentum should be in reasonable range [-1, 1] with 0.5 gradient clip
+    // momentum should be in reasonable range [-1, 1] with 0.5 gradient clip
     // After clipping gradients to [-0.5, 0.5], momentum can at most grow by 0.1*0.5 = 0.05 per step
     if (fabsf(m_scl[idx*3+0]) > 1.0f || fabsf(m_scl[idx*3+1]) > 1.0f || fabsf(m_scl[idx*3+2]) > 1.0f) {
         printf("[WARNING] m_scale out of expected range! Max expected ~0.5 with gradient clip.\n");
@@ -164,6 +177,7 @@ void AdamOptimizer::debugPrintState(int idx) {
     }
 }
 
+// Print GPU debug information for Adam step
 void AdamOptimizer::printGPUDebug() {
     float* debug = (float*)debugBuffer->contents();
     printf("\n[GPU Debug] timestep=%u\n", timestep);
@@ -175,6 +189,7 @@ void AdamOptimizer::printGPUDebug() {
     printf("[GPU Debug] scale_old = (%.6f, %.6f, %.6f)\n", debug[14], debug[15], 0.0f);  // Only 2 values fit
 }
 
+// Perform one Adam optimization step
 void AdamOptimizer::step(MTL::CommandQueue* queue,
                          MTL::Buffer* gaussians,
                          MTL::Buffer* gradients,
@@ -185,9 +200,11 @@ void AdamOptimizer::step(MTL::CommandQueue* queue,
                          float lr_sh) {
     timestep++;
     
+    // Create command buffer and encoder
     MTL::CommandBuffer* cmd = queue->commandBuffer();
     MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
     
+    // Set pipeline and buffers
     enc->setComputePipelineState(adamPSO);
     enc->setBuffer(gaussians, 0, 0);
     enc->setBuffer(gradients, 0, 1);
@@ -203,9 +220,11 @@ void AdamOptimizer::step(MTL::CommandQueue* queue,
     enc->setBuffer(v_opacity, 0, 10);
     enc->setBuffer(v_sh, 0, 11);
     
+    // Set learning rates
     float lrs[5] = {lr_position, lr_scale, lr_rotation, lr_opacity, lr_sh};
     enc->setBytes(lrs, sizeof(lrs), 12);
 
+    // Set Adam hyperparameters
     float beta1 = 0.9f;
     float beta2 = 0.999f;
     float epsilon = 1e-8f;
@@ -214,12 +233,15 @@ void AdamOptimizer::step(MTL::CommandQueue* queue,
     enc->setBytes(&beta2, sizeof(float), 14);
     enc->setBytes(&epsilon, sizeof(float), 15);
     enc->setBytes(params, sizeof(params), 16);
-    enc->setBuffer(debugBuffer, 0, 17);  // Debug buffer for GPU-side debugging
+    // Debug buffer for GPU-side debugging
+    enc->setBuffer(debugBuffer, 0, 17);  
 
+    // Dispatch threads
     MTL::Size grid = MTL::Size(numGaussians, 1, 1);
     MTL::Size threadgroup = MTL::Size(64, 1, 1);
     enc->dispatchThreads(grid, threadgroup);
     
+    // End encoding and commit
     enc->endEncoding();
     cmd->commit();
     cmd->waitUntilCompleted();

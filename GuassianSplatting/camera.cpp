@@ -9,6 +9,7 @@
 #include "AAPLMathUtilities.h"
 #include <algorithm>
 
+// Camera Constructor, initializes camera parameters and computes initial matrices
 Camera::Camera(simd_float3 target, float azimuth, float elevation, float distance_from_target, float fov, float aspect_ratio, float near_plane, float far_plane)
         :target(target),
         azimuth(azimuth),
@@ -23,6 +24,7 @@ Camera::Camera(simd_float3 target, float azimuth, float elevation, float distanc
     updateMatrices();
 }
 
+// Update view and projection matrices based on current camera parameters
 void Camera::updateMatrices() {
     float x  = distance_from_target * cos(elevation) * sin(azimuth);
     float y = distance_from_target * sin(elevation);
@@ -37,6 +39,7 @@ void Camera::updateMatrices() {
     projection_matrix = matrix_perspective_left_hand(fov, aspect_ratio, near_plane, far_plane);
 }
 
+// Orbit the camera around the target point
 void Camera::orbit(float deltaAzimuth, float deltaElevation) {
     azimuth += deltaAzimuth;
     elevation += deltaElevation;
@@ -48,6 +51,7 @@ void Camera::orbit(float deltaAzimuth, float deltaElevation) {
     updateMatrices();
 }
 
+// Zoom the camera in and out by adjusting the distance from the target
 void Camera::zoom(float deltaDistance) {
     distance_from_target += deltaDistance;
     
@@ -56,6 +60,7 @@ void Camera::zoom(float deltaDistance) {
     updateMatrices();
 }
 
+// Pan the camera by moving the target point
 void Camera::pan(float deltaX, float deltaY) {
     simd_float3 forward = simd_normalize(target - position);
     simd_float3 right  = simd_normalize(simd_cross(forward, up));
@@ -67,6 +72,7 @@ void Camera::pan(float deltaX, float deltaY) {
     updateMatrices();
 }
 
+// Set a new aspect ratio and update the projection matrix
 void Camera::setAspectRatio(float aspect) {
     aspect_ratio = aspect;
     updateMatrices();

@@ -5,7 +5,6 @@
 //  Created by Colin Taylor Taylor on 2025-12-24.
 //
 
-
 #include <iostream>
 #include <Metal/Metal.hpp>
 #include "mtl_engine.hpp"
@@ -15,6 +14,7 @@
 #include "image_loader.hpp"
 #include "ply_exporter.hpp"
 
+// Compute Mean Nearest Neighbor Distance for a point
 float computeMeanNearestNeighborDistance(const std::vector<ColmapPoint>& points,
                                           size_t pointIdx,
                                           int k = 3) {
@@ -23,14 +23,17 @@ float computeMeanNearestNeighborDistance(const std::vector<ColmapPoint>& points,
     // Use a max-heap to find k smallest distances
     std::priority_queue<float> nearestDistances;
     
+    // Iterate through all points to find nearest neighbors
     for (size_t i = 0; i < points.size(); i++) {
         if (i == pointIdx) continue;
         
+        // Compute Euclidean distance
         float dx = points[i].position.x - pt.position.x;
         float dy = points[i].position.y - pt.position.y;
         float dz = points[i].position.z - pt.position.z;
         float dist = sqrtf(dx*dx + dy*dy + dz*dz);
         
+        // Maintain a max-heap of size k
         if (nearestDistances.size() < k) {
             nearestDistances.push(dist);
         } else if (dist < nearestDistances.top()) {
@@ -48,9 +51,11 @@ float computeMeanNearestNeighborDistance(const std::vector<ColmapPoint>& points,
         count++;
     }
     
-    return (count > 0) ? (sum / count) : 0.1f;  // Default if no neighbors
+    // Default if no neighbors
+    return (count > 0) ? (sum / count) : 0.1f;  
 }
 
+// Create Gaussians from COLMAP points
 std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneExtent) {
     std::vector<Gaussian> gaussians;
     gaussians.reserve(colmap.points.size());
@@ -58,9 +63,10 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
     // SH_C0 constant for DC term
     const float SH_C0 = 0.28209479177387814f;
     
-    // Scene extent is now passed in (computed from cameras)
+    // Scene extent is now passed in that was computed from camera positions
     std::cout << "Using scene extent: " << sceneExtent << std::endl;
     
+    // Print out first 5 camera world positions for debugging
     std::cout << "\n=== Camera Position Debug ===" << std::endl;
     for (int i = 0; i < std::min(5, (int)colmap.images.size()); i++) {
         simd_float3 pos = getCameraWorldPosition(colmap.images[i]);
@@ -72,13 +78,9 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
                   << colmap.images[i].translation.z << ")" << std::endl;
     }
 
-    
-    // ============================================================
-    // OPTION 1: Compute per-point scale from nearest neighbors (RECOMMENDED)
-    // This matches the official implementation
-    // ============================================================
     std::cout << "Computing initial scales from nearest neighbor distances..." << std::endl;
     
+    // Precompute initial scales based on nearest neighbor distances
     std::vector<float> initialScales(colmap.points.size());
     
     // For large point clouds, sampling can speed this up
@@ -90,7 +92,9 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
         size_t sampleSize = std::min((size_t)1000, colmap.points.size());
         size_t step = colmap.points.size() / sampleSize;
         
+        // Sample points at regular intervals
         for (size_t i = 0; i < colmap.points.size(); i += step) {
+            // Compute mean nearest neighbor distance for sampled point
             float dist = computeMeanNearestNeighborDistance(colmap.points, i, 3);
             sampleScales.push_back(dist);
         }
@@ -101,12 +105,14 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
         
         std::cout << "Using median nearest neighbor distance: " << medianScale << std::endl;
         
+        // Assign median scale to all points
         for (size_t i = 0; i < colmap.points.size(); i++) {
             initialScales[i] = medianScale;
         }
     } else {
-        // Compute for all points (slower but more accurate)
+        // Compute for all points
         for (size_t i = 0; i < colmap.points.size(); i++) {
+            // Compute mean nearest neighbor distance for point
             initialScales[i] = computeMeanNearestNeighborDistance(colmap.points, i, 3);
             
             if (i % 5000 == 0) {
@@ -116,35 +122,32 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
         std::cout << std::endl;
     }
     
-    // ============================================================
-    // CREATE GAUSSIANS
-    // ============================================================
+    // Create Gaussians using initial scales
     for (size_t i = 0; i < colmap.points.size(); i++) {
         const auto& pt = colmap.points[i];
         Gaussian g;
         
         g.position = pt.position;
         
-        // ============================================================
-        // SCALE INITIALIZATION (LOG SPACE)
-        // Use nearest neighbor distance, clamped to reasonable range
-        // ============================================================
+        // Get initial scale
         float scale = initialScales[i];
         
         // Clamp scale to reasonable range relative to scene
-        float minScale = 0.0001f * sceneExtent;  // Very small minimum
-        float maxScale = 0.1f * sceneExtent;     // Reasonable maximum
+         // Very small minimum
+        float minScale = 0.0001f * sceneExtent; 
+        // Reasonable maximum
+        float maxScale = 0.1f * sceneExtent;     
         scale = std::clamp(scale, minScale, maxScale);
         
         // Convert to log space
         float logScale = std::log(scale);
         g.scale = simd_make_float3(logScale, logScale, logScale);
         
-        // Identity quaternion: (w=1, x=0, y=0, z=0)
+        // Identity quaternion (w=1, x=0, y=0, z=0)
         // Stored as float4(.x=w, .y=x, .z=y, .w=z)
         g.rotation = simd_make_float4(1.0f, 0.0f, 0.0f, 0.0f);
         
-        // Initial opacity in RAW space: sigmoid(0) = 0.5
+        // Initial opacity in raw space: sigmoid(0) = 0.5
         // Start with visible opacity so gradients can flow
         g.opacity = 0.0f;
         
@@ -192,10 +195,12 @@ int main(int argc, char* argv[]) {
     std::string colmapPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/";
     std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4";
     std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
-    size_t numEpochs = 155;  // Train for 10 epochs
+    // 30k Iterations for 194 images
+    size_t numEpochs = 155; 
     bool viewOnly = false;
     std::string viewPlyPath = "";
     
+    // Parse command line arguments
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--colmap" && i + 1 < argc) {
@@ -227,6 +232,7 @@ int main(int argc, char* argv[]) {
         std::cout << "=== View Mode ===" << std::endl;
         std::cout << "Loading: " << viewPlyPath << std::endl;
         
+        // Load Gaussians from PLY
         auto gaussians = load_ply(viewPlyPath);
         if (gaussians.empty()) {
             std::cerr << "Error: Failed to load PLY file!" << std::endl;
@@ -251,16 +257,21 @@ int main(int argc, char* argv[]) {
             (min_y + max_y) / 2.0f,
             (min_z + max_z) / 2.0f
         );
+        // Diagonal size
         float diagonal = simd_length(simd_make_float3(max_x - min_x, max_y - min_y, max_z - min_z));
         
         std::cout << "Scene center: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
         std::cout << "Scene diagonal: " << diagonal << std::endl;
         
         // Start closer for better initial view, with slight downward angle
-        float viewDistance = std::max(0.5f * diagonal, 1.0f);  // At least 1 unit away
-        float nearPlane = std::max(0.01f, diagonal * 0.001f);  // Closer near plane for small scenes
-        float farPlane = std::max(100.0f, diagonal * 10.0f);   // Far enough to see everything
+        // At least 1 unit away
+        float viewDistance = std::max(0.5f * diagonal, 1.0f);  
+         // Closer near plane for small scenes
+        float nearPlane = std::max(0.01f, diagonal * 0.001f); 
+        // Far enough to see everything
+        float farPlane = std::max(100.0f, diagonal * 10.0f);   
         
+        // Print camera setup
         std::cout << "Initial view distance: " << viewDistance << std::endl;
         std::cout << "Near/Far planes: " << nearPlane << " / " << farPlane << std::endl;
         
@@ -268,6 +279,7 @@ int main(int argc, char* argv[]) {
                                45.0f * M_PI / 180.0f, 800.0f / 600.0f,
                                nearPlane, farPlane);
         
+        // Initialize and run engine
         MTLEngine engine;
         engine.init();
         engine.loadGaussians(gaussians, diagonal);
@@ -292,13 +304,14 @@ int main(int argc, char* argv[]) {
     std::cout << "Epochs: " << numEpochs << std::endl;
     std::cout << std::endl;
     
+    // Load COLMAP data
     ColmapData colmap = loadColmap(colmapPath);
     
     // Compute scene extent from camera positions BEFORE creating gaussians
     float sceneExtent = computeSceneExtent(colmap);
     std::cout << "Scene extent (from cameras): " << sceneExtent << std::endl;
 
-    
+    // Create Gaussians from COLMAP points
     auto gaussians = gaussiansFromColmap(colmap,sceneExtent);
     
     // Debug struct layout
@@ -329,6 +342,7 @@ int main(int argc, char* argv[]) {
     float min_x = FLT_MAX, min_y = FLT_MAX, min_z = FLT_MAX;
     float max_x = -FLT_MAX, max_y = -FLT_MAX, max_z = -FLT_MAX;
 
+    // Iterate through Gaussians to find bounds
     for (const Gaussian& g : gaussians) {
         min_x = fmin(min_x, g.position.x);
         max_x = fmax(max_x, g.position.x);
@@ -340,6 +354,7 @@ int main(int argc, char* argv[]) {
         max_z = fmax(max_z, g.position.z);
     }
     
+    // Compute center and diagonal
     simd_float3 center = simd_make_float3(
         (min_x + max_x) / 2.0f,
         (min_y + max_y) / 2.0f,
@@ -365,23 +380,27 @@ int main(int argc, char* argv[]) {
     printf("Target: (%.3f, %.3f, %.3f)\n", center.x, center.y, center.z);
     printf("Distance: %.3f\n", 1.5f * diagonal);
 
+    // Initialize engine for training
     MTLEngine engine;
     engine.initHeadless();
+    // Load training data
     engine.loadTrainingData(colmap, imagePath);
+    // Load Gaussians
     engine.loadGaussians(gaussians, sceneExtent);
     
     printf("\n=== Starting Training ===\n");
     engine.train(numEpochs);
     
     // Export rendered views from each training camera
-    // Get output folder from PLY path (same directory, "renders" subfolder)
     std::string rendersFolder = outputPath;
+    // Replace filename with 'renders' folder
     size_t lastSlash = rendersFolder.rfind('/');
     if (lastSlash != std::string::npos) {
         rendersFolder = rendersFolder.substr(0, lastSlash) + "/renders";
     } else {
         rendersFolder = "renders";
     }
+    // Export training views
     engine.exportTrainingViews(rendersFolder);
     
     // Export trained Gaussians to PLY
@@ -389,6 +408,7 @@ int main(int argc, char* argv[]) {
     const Gaussian* trainedGaussians = engine.getGaussians();
     size_t gaussianCount = engine.getGaussianCount();
     
+    // Export only if we have Gaussians
     if (trainedGaussians && gaussianCount > 0) {
         PLYExporter::exportPLY(outputPath, trainedGaussians, gaussianCount);
     } else {
@@ -397,6 +417,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    // Cleanup engine
     engine.cleanup();
     
     // Now open viewer with the exported PLY
@@ -422,6 +443,7 @@ int main(int argc, char* argv[]) {
     min_x = FLT_MAX; min_y = FLT_MAX; min_z = FLT_MAX;
     max_x = -FLT_MAX; max_y = -FLT_MAX; max_z = -FLT_MAX;
     
+    // Iterate through Gaussians to find bounds
     for (const Gaussian& g : loadedGaussians) {
         min_x = fmin(min_x, g.position.x);
         max_x = fmax(max_x, g.position.x);
@@ -431,6 +453,7 @@ int main(int argc, char* argv[]) {
         max_z = fmax(max_z, g.position.z);
     }
     
+    // Compute center and diagonal
     center = simd_make_float3(
         (min_x + max_x) / 2.0f,
         (min_y + max_y) / 2.0f,
@@ -441,7 +464,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Viewer scene center: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
     std::cout << "Viewer scene diagonal: " << diagonal << std::endl;
     
-    // Use distance based on scene size - position camera closer to see details
+    // Use distance based on scene size and position camera closer to see details
     float viewDistance = std::max(0.5f * diagonal, 1.0f);
     float nearPlane = std::max(0.01f, diagonal * 0.001f);
     float farPlane = std::max(100.0f, diagonal * 10.0f);
@@ -451,10 +474,12 @@ int main(int argc, char* argv[]) {
     // Position camera to look at the actual scene center
     simd_float3 viewTarget = center;
     
+    // Create viewer camera
     Camera viewerCamera = Camera(viewTarget, 0, 0.4f, viewDistance,
                                   45.0f * M_PI / 180.0f, 800.0f / 600.0f,
                                   nearPlane, farPlane);
     
+    // Initialize and run viewer engine
     MTLEngine viewerEngine;
     viewerEngine.init();
     // Load training data so T key and arrow keys work for navigating training views

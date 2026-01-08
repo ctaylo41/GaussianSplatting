@@ -1,35 +1,40 @@
 //
-//  density_control.mm
+//  density_control.hpp
 //  GuassianSplatting
 //
-//  Adaptive density control for Gaussian splatting training
-//
-//  IMPORTANT: Scale is in LOG space internally!
-//  - To get actual scale: exp(g.scale)
-//  - When splitting, new log scale = old log scale + log(scaleFactor)
+//  Created by Colin Taylor Taylor on 2025-12-28.
 //
 
 #include "density_control.hpp"
 #include <iostream>
 #include <cmath>
 #include "gradients.hpp"
-#include <dispatch/dispatch.h>  // Apple's GCD for parallel operations
+ // Apple's GCD for parallel operations
+#include <dispatch/dispatch.h> 
 
 // Number of threads for parallel operations
 static const int NUM_THREADS = 8;
 
 // Paper's recommended thresholds (from official 3DGS)
-static constexpr float GRAD_THRESHOLD = 0.0002f;      // densify_grad_threshold
-static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  // min_opacity
-static constexpr float PERCENT_DENSE = 0.001f;         // percent_dense for clone vs split
+
+// densify_grad_threshold
+static constexpr float GRAD_THRESHOLD = 0.0002f;      
+// min_opacity
+static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  
+// percent_dense for clone vs split
+static constexpr float PERCENT_DENSE = 0.001f;         
 static constexpr size_t MAX_GAUSSIANS = 500000;
-static constexpr size_t DENSIFY_FROM_ITER = 500;      // Start densification
-static constexpr size_t DENSIFY_UNTIL_ITER = 15000;   // Stop densification
-static constexpr float MAX_SCALE_LOG = 4.0f;          // Clamp scale values
+// Start densification
+static constexpr size_t DENSIFY_FROM_ITER = 500;      
+// Stop densification
+static constexpr size_t DENSIFY_UNTIL_ITER = 15000;   
+// Clamp scale values
+static constexpr float MAX_SCALE_LOG = 4.0f;          
 
-// Scene extent - will be set during initialization
-static float sceneExtent = 1.0f;  // Default, should be set to scene diagonal
+// Scene extent set during initialization
+static float sceneExtent = 1.0f; 
 
+// Approximate screen radius of a Gaussian as fraction of image width
 float computeApproxScreenRadius(const Gaussian& g,
                                  float focalLength,
                                  float avgDepth,
@@ -40,7 +45,7 @@ float computeApproxScreenRadius(const Gaussian& g,
         expf(std::clamp(g.scale.y, -4.0f, 4.0f))),
         expf(std::clamp(g.scale.z, -4.0f, 4.0f)));
     
-    // Approximate screen radius: focal * scale / depth * multiplier
+    // Approximate screen radius = focal * scale / depth * multiplier
     // 3 sigma covers 99% of Gaussian, so multiply by 3
     float screenRadius = focalLength * maxScale * 3.0f / avgDepth;
     
@@ -48,7 +53,7 @@ float computeApproxScreenRadius(const Gaussian& g,
     return screenRadius / imageWidth;
 }
 
-
+// Set scene extent for relative thresholds
 void DensityController::setSceneExtent(float extent) {
     sceneExtent = extent;
     std::cout << "Density control scene extent set to: " << extent << std::endl;
@@ -56,38 +61,44 @@ void DensityController::setSceneExtent(float extent) {
     std::cout << "  Prune threshold (world): " << (0.1f * extent) << " world units" << std::endl;
 }
 
+// Constructor
 DensityController::DensityController(MTL::Device* device, MTL::Library* library)
     : device(device)
     , maxGaussians(MAX_GAUSSIANS)
 {
+    // Allocate buffers
     gradientAccum = device->newBuffer(maxGaussians * sizeof(float), MTL::ResourceStorageModeShared);
     gradientCount = device->newBuffer(maxGaussians * sizeof(uint32_t), MTL::ResourceStorageModeShared);
     markerBuffer = device->newBuffer(maxGaussians * sizeof(uint32_t), MTL::ResourceStorageModeShared);
     
-    // NEW: Store position gradients for gradient-directed cloning
+    // Store position gradients for gradient-directed cloning
     positionGradAccum = device->newBuffer(maxGaussians * sizeof(simd_float3), MTL::ResourceStorageModeShared);
     
+    // Initialize accumulators
     resetAccumulator(maxGaussians);
 }
 
+// Destructor
 DensityController::~DensityController() {
+    // Release buffers
     if (gradientAccum) gradientAccum->release();
     if (gradientCount) gradientCount->release();
     if (markerBuffer) markerBuffer->release();
     if (positionGradAccum) positionGradAccum->release();
 }
 
+// Reset accumulators
 void DensityController::resetAccumulator(size_t gaussianCount) {
+    // Reset accumulators to zero using memset
     memset(gradientAccum->contents(), 0, gaussianCount * sizeof(float));
     memset(gradientCount->contents(), 0, gaussianCount * sizeof(uint32_t));
     memset(positionGradAccum->contents(), 0, gaussianCount * sizeof(simd_float3));
 }
 
+// Accumulate gradients into internal buffers
 void DensityController::accumulateGradients(MTL::CommandQueue* queue,
                                             MTL::Buffer* gradients,
                                             size_t gaussianCount) {
-    // Accumulate gradient magnitudes for density control decisions
-    // PARALLELIZED with GCD for significant speedup
     
     // Must match gradients.hpp and tiled_shaders.metal
     struct GaussianGradients {
@@ -97,28 +108,34 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
         float _pad1;
         simd_float4 rotation;
         float sh[12];
-        float viewspace_grad_x;  // Screen-space gradient for density control
+        float viewspace_grad_x;
         float viewspace_grad_y;
         float _pad2, _pad3;
     };
     
+    // Access buffer contents
     GaussianGradients* grads = (GaussianGradients*)gradients->contents();
     float* accumGrad = (float*)gradientAccum->contents();
     uint32_t* counts = (uint32_t*)gradientCount->contents();
     simd_float3* posGradAccum = (simd_float3*)positionGradAccum->contents();
     
+    // Parallel accumulation using GCD
     dispatch_queue_t dispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
     size_t chunkSize = (gaussianCount + NUM_THREADS - 1) / NUM_THREADS;
     
+    // Parallel loop
     dispatch_apply((size_t)NUM_THREADS, dispatchQueue, ^(size_t t) {
+        // Compute chunk range
         size_t start = t * chunkSize;
         size_t end = std::min(start + chunkSize, gaussianCount);
         
+        // Accumulate gradients for this chunk
         for (size_t i = start; i < end; i++) {
-            // Use VIEWSPACE (screen-space) gradients for density control
+            // Use viewspace gradients for density control
             float gradMag = sqrtf(grads[i].viewspace_grad_x * grads[i].viewspace_grad_x +
                                   grads[i].viewspace_grad_y * grads[i].viewspace_grad_y);
             
+            // Only accumulate valid gradients
             if (!std::isnan(gradMag) && !std::isinf(gradMag)) {
                 accumGrad[i] += gradMag;
                 counts[i]++;
@@ -132,6 +149,7 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
     });
 }
 
+// Apply density control prune, clone, split Gaussians
 DensityStats DensityController::apply(MTL::CommandQueue* queue,
                                       MTL::Buffer*& gaussianBuffer,
                                       MTL::Buffer*& positionBuffer,
@@ -150,19 +168,21 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     // Check if we should densify at this iteration
     bool canDensify = (iteration >= DENSIFY_FROM_ITER && iteration < DENSIFY_UNTIL_ITER);
     
+    // If not densifying and past densify_until_iter, skip
     if (!canDensify && iteration >= DENSIFY_UNTIL_ITER) {
         std::cout << "Densification stopped at iteration " << iteration << std::endl;
         resetAccumulator(gaussianCount);
         return stats;
     }
     
+    // Access buffer contents
     Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
     uint32_t* markers = (uint32_t*)markerBuffer->contents();
     float* accumGrad = (float*)gradientAccum->contents();
     uint32_t* counts = (uint32_t*)gradientCount->contents();
     simd_float3* posGradAccum = (simd_float3*)positionGradAccum->contents();
     
-    // Viewspace pruning threshold (20% of image width is too big)
+    // Viewspace pruning threshold 20% of image width
     const float maxScreenFraction = 0.2f;
     
     // Per-thread counters for parallel first pass
@@ -170,6 +190,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     static uint32_t threadCloned[NUM_THREADS];
     static uint32_t threadSplit[NUM_THREADS];
     
+    // Reset per-thread counters
     memset(threadPruned, 0, sizeof(threadPruned));
     memset(threadCloned, 0, sizeof(threadCloned));
     memset(threadSplit, 0, sizeof(threadSplit));
@@ -178,16 +199,19 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     const float splitThreshold = 0.01f * sceneExtent;
     const float pruneThreshold = 0.1f * sceneExtent;
     
+    // Parallel first pass to decide prune/clone/split
     dispatch_queue_t dispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
     size_t chunkSize = (gaussianCount + NUM_THREADS - 1) / NUM_THREADS;
     
-    // First pass: decide what to do with each Gaussian (PARALLEL)
+    // First pass decide what to do with each Gaussian
     dispatch_apply((size_t)NUM_THREADS, dispatchQueue, ^(size_t t) {
+        // Compute chunk range
         size_t start = t * chunkSize;
         size_t end = std::min(start + chunkSize, gaussianCount);
         
         uint32_t localPruned = 0, localCloned = 0, localSplit = 0;
         
+        // Process Gaussians in this chunk
         for (size_t i = start; i < end; i++) {
             Gaussian& g = gaussians[i];
             
@@ -197,7 +221,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             // Get average gradient
             float avgGrad = (counts[i] > 0) ? (accumGrad[i] / counts[i]) : 0.0f;
             
-            // Compute max scale in WORLD units (apply exp to log scale)
+            // Compute max scale in world units applying exp to log scale
             float maxScaleVal = fmaxf(fmaxf(
                 expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
                 expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG))),
@@ -211,29 +235,34 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
                 shouldPrune = true;
             }
             
-            // Viewspace-based pruning: prune Gaussians with large screen-space footprints
+            // Viewspace-based pruning prune Gaussians with large screen-space footprints
             float screenFraction = computeApproxScreenRadius(g, focalLength, avgDepth, imageWidth);
             if (screenFraction > maxScreenFraction) {
                 shouldPrune = true;
             }
             
+            // Mark accordingly and prune
             if (shouldPrune) {
-                markers[i] = 1;  // Prune
+                markers[i] = 1;
                 localPruned++;
             } else if (canDensify && avgGrad > GRAD_THRESHOLD) {
                 // Official logic: clone if small, split if large
                 if (maxScaleVal > splitThreshold) {
-                    markers[i] = 3;  // Split large Gaussians
+                    // Split large Gaussians
+                    markers[i] = 3;  
                     localSplit++;
                 } else {
-                    markers[i] = 2;  // Clone small Gaussians
+                    // Clone small Gaussians
+                    markers[i] = 2;  
                     localCloned++;
                 }
             } else {
-                markers[i] = 0;  // Keep
+                // Keep
+                markers[i] = 0;  
             }
         }
         
+        // Store local counts
         threadPruned[t] = localPruned;
         threadCloned[t] = localCloned;
         threadSplit[t] = localSplit;
@@ -269,7 +298,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
                 excess--;
             }
         }
-        
+        // Recompute new count
         newCount = gaussianCount - stats.numPruned + stats.numCloned + stats.numSplit;
     }
     
@@ -277,6 +306,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     MTL::Buffer* newGaussianBuffer = device->newBuffer(newCount * sizeof(Gaussian), MTL::ResourceStorageModeShared);
     MTL::Buffer* newPositionsBuffer = device->newBuffer(newCount * sizeof(simd_float3), MTL::ResourceStorageModeShared);
     
+    // Access new buffer contents
     Gaussian* newGaussians = (Gaussian*)newGaussianBuffer->contents();
     simd_float3* newPositions = (simd_float3*)newPositionsBuffer->contents();
     
@@ -287,7 +317,8 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
         uint32_t marker = markers[i];
         
         if (marker == 1) {
-            continue;  // Pruned
+            // Pruned
+            continue;  
         }
         
         if (marker == 0) {
@@ -296,12 +327,12 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             newPositions[writeIdx] = g.position;
             writeIdx++;
         } else if (marker == 2) {
-            // Clone: Keep original
+            // Clone Keep original
             newGaussians[writeIdx] = g;
             newPositions[writeIdx] = g.position;
             writeIdx++;
             
-            // Create clone moved in gradient direction (official behavior)
+            // Create clone moved in gradient direction
             Gaussian cloned = g;
             
             // Get accumulated position gradient
@@ -311,36 +342,39 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             if (gradNorm > 1e-8f) {
                 // Normalize and scale by actual Gaussian size
                 float actualScale = expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG));
-                float moveDistance = actualScale * 2.0f;  // Move by 2x the Gaussian's scale
+                // Move by 2x the Gaussian's scale
+                float moveDistance = actualScale * 2.0f;  
                 
+                // Move along gradient direction
                 cloned.position.x += (posGrad.x / gradNorm) * moveDistance;
                 cloned.position.y += (posGrad.y / gradNorm) * moveDistance;
                 cloned.position.z += (posGrad.z / gradNorm) * moveDistance;
             } else {
-                // Fallback: small random perturbation proportional to scale
+                // small random perturbation proportional to scale
                 float actualScale = expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG));
                 cloned.position.x += actualScale * ((float)rand() / RAND_MAX - 0.5f);
                 cloned.position.y += actualScale * ((float)rand() / RAND_MAX - 0.5f);
                 cloned.position.z += actualScale * ((float)rand() / RAND_MAX - 0.5f);
             }
             
+            // Write clone
             newGaussians[writeIdx] = cloned;
             newPositions[writeIdx] = cloned.position;
             writeIdx++;
         } else if (marker == 3) {
-            // Split: create two smaller Gaussians
-            float scaleFactor = 1.0f / 1.6f;  // Paper uses φ = 1.6
-            float logScaleFactor = logf(scaleFactor);  // Add this to log scale
-            
-            // Get actual scale (apply exp to log scale)
+            // Split and create two smaller Gaussians
+             // Paper uses 1.6
+            float scaleFactor = 1.0f / 1.6f; 
+            float logScaleFactor = logf(scaleFactor); 
+
+            // Get actual scale by applying exp to log scale
             simd_float3 scale = simd_make_float3(
                 expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
                 expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
                 expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG))
             );
             
-            // Sample offset from Gaussian distribution (official uses PDF sampling)
-            // Simplified: offset along major axis scaled by actual size
+            // Generate random offset direction
             simd_float3 offset;
             float maxS = fmaxf(fmaxf(scale.x, scale.y), scale.z);
             
@@ -366,20 +400,21 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             }};
             offset = simd_mul(R, offset);
             
-            // Child 1: positive offset, smaller scale
+            // Child 1 positive offset, smaller scale
             Gaussian child1 = g;
             child1.position = g.position + offset;
-            // Scale is in LOG space - add log(scaleFactor) to make smaller
+            // Scale is in log space, so add log(scaleFactor)
             child1.scale = simd_make_float3(
                 g.scale.x + logScaleFactor,
                 g.scale.y + logScaleFactor,
                 g.scale.z + logScaleFactor
             );
+            // Write child 1
             newGaussians[writeIdx] = child1;
             newPositions[writeIdx] = child1.position;
             writeIdx++;
             
-            // Child 2: negative offset, same smaller scale
+            // Child 2 negative offset, same smaller scale
             Gaussian child2 = g;
             child2.position = g.position - offset;
             child2.scale = child1.scale;
@@ -396,6 +431,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     positionBuffer = newPositionsBuffer;
     gaussianCount = writeIdx;
     
+    // Reset accumulators for next iteration
     resetAccumulator(gaussianCount);
     
     std::cout << "Density control: pruned=" << stats.numPruned

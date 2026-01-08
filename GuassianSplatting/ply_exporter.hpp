@@ -17,9 +17,10 @@
 #include <cmath>
 #include "ply_loader.hpp"
 
+// PLY Exporter class
 class PLYExporter {
 public:
-    
+    // Export Gaussians to PLY file
     static bool exportPLY(const std::string& filename,
                           const Gaussian* gaussians,
                           size_t count) {
@@ -106,7 +107,7 @@ public:
             file.write(reinterpret_cast<const char*>(&zero), sizeof(float));
             file.write(reinterpret_cast<const char*>(&zero), sizeof(float));
             
-            // SH DC terms (indices 0, 4, 8 in our layout)
+            // SH DC terms 
             float sh_dc_0 = g.sh[0];
             float sh_dc_1 = g.sh[4];
             float sh_dc_2 = g.sh[8];
@@ -114,11 +115,14 @@ public:
             file.write(reinterpret_cast<const char*>(&sh_dc_1), sizeof(float));
             file.write(reinterpret_cast<const char*>(&sh_dc_2), sizeof(float));
             
-            // SH rest - interleaved by coefficient
+            // SH rest interleaved by coefficient
             float sh_rest[9] = {
-                g.sh[1], g.sh[5], g.sh[9],    // coef 1: R, G, B
-                g.sh[2], g.sh[6], g.sh[10],   // coef 2: R, G, B
-                g.sh[3], g.sh[7], g.sh[11]    // coef 3: R, G, B
+                // coef 1: R, G, B
+                g.sh[1], g.sh[5], g.sh[9],    
+                // coef 2: R, G, B
+                g.sh[2], g.sh[6], g.sh[10],   
+                // coef 3: R, G, B
+                g.sh[3], g.sh[7], g.sh[11]    
             };
             for (int j = 0; j < 9; j++) {
                 file.write(reinterpret_cast<const char*>(&sh_rest[j]), sizeof(float));
@@ -137,10 +141,10 @@ public:
             file.write(reinterpret_cast<const char*>(&scale_z), sizeof(float));
             
             // Rotation: internal (.x=w, .y=x, .z=y, .w=z) -> PLY (rot_0=w, rot_1=x, rot_2=y, rot_3=z)
-            float rot_w = g.rotation.x;  // w
-            float rot_x = g.rotation.y;  // x
-            float rot_y = g.rotation.z;  // y
-            float rot_z = g.rotation.w;  // z
+            float rot_w = g.rotation.x; 
+            float rot_x = g.rotation.y; 
+            float rot_y = g.rotation.z;
+            float rot_z = g.rotation.w;
             file.write(reinterpret_cast<const char*>(&rot_w), sizeof(float));
             file.write(reinterpret_cast<const char*>(&rot_x), sizeof(float));
             file.write(reinterpret_cast<const char*>(&rot_y), sizeof(float));
@@ -151,7 +155,7 @@ public:
         
         std::cout << "Exported " << validCount << " Gaussians to " << filename << std::endl;
         
-        // Debug: show first exported Gaussian
+        // Debug show first exported Gaussian
         if (count > 0) {
             const Gaussian& g = gaussians[0];
             std::cout << "First exported Gaussian:" << std::endl;

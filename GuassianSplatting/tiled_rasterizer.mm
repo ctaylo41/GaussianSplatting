@@ -1,16 +1,18 @@
 //
-//  tiled_rasterizer.mm
+//  tile_rasterizer.hpp
 //  GuassianSplatting
+//
+//  Created by Colin Taylor Taylor on 2025-12-28.
 //
 
 #include "tiled_rasterizer.hpp"
-#include "ply_loader.hpp"  // For Gaussian struct
+#include "ply_loader.hpp" 
 #include <iostream>
 #include <algorithm>
 #include <cstring>
 #include <cstddef>
 #include <vector>
-#include <dispatch/dispatch.h>  // Apple's GCD for parallel operations
+#include <dispatch/dispatch.h> 
 #include <chrono>
 #include <atomic>
 
@@ -28,6 +30,7 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
         return;
     }
     
+    // Temporary storage
     static std::vector<std::pair<uint64_t, uint32_t>> temp;
     if (temp.size() < n) temp.resize(n);
     
@@ -36,8 +39,10 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
     static uint32_t globalPrefix[256];
     static uint32_t threadOffset[NUM_THREADS][256];
     
+    // Dispatch queue for parallel tasks
     dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
     
+    // Source and destination pointers
     auto* src = &pairs;
     auto* dst = &temp;
     
@@ -46,11 +51,12 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
         int shift = pass * 8;
         size_t chunkSize = (n + NUM_THREADS - 1) / NUM_THREADS;
         
-        // Step 1: Parallel histogram (each thread counts its chunk)
+        // Step 1: Parallel histogram each thread computes its own histogram
         dispatch_apply(NUM_THREADS, queue, ^(size_t t) {
             memset(threadHist[t], 0, 256 * sizeof(uint32_t));
             size_t start = t * chunkSize;
             size_t end = std::min(start + chunkSize, n);
+            // Build histogram
             for (size_t i = start; i < end; i++) {
                 uint8_t digit = ((*src)[i].first >> shift) & 0xFF;
                 threadHist[t][digit]++;
@@ -61,6 +67,7 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
         uint32_t sum = 0;
         for (int d = 0; d < 256; d++) {
             globalPrefix[d] = sum;
+            // Compute per-thread offsets
             for (int t = 0; t < NUM_THREADS; t++) {
                 threadOffset[t][d] = sum;
                 sum += threadHist[t][d];
@@ -71,15 +78,17 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
         dispatch_apply(NUM_THREADS, queue, ^(size_t t) {
             uint32_t localOffset[256];
             memcpy(localOffset, threadOffset[t], 256 * sizeof(uint32_t));
-            
+            // Process chunk
             size_t start = t * chunkSize;
             size_t end = std::min(start + chunkSize, n);
+            // Scatter elements
             for (size_t i = start; i < end; i++) {
                 uint8_t digit = ((*src)[i].first >> shift) & 0xFF;
                 (*dst)[localOffset[digit]++] = (*src)[i];
             }
         });
         
+        // Swap source and destination
         std::swap(src, dst);
     }
     
@@ -89,6 +98,7 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
     }
 }
 
+// Constructor
 TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uint32_t maxGaussians)
     : device(device)
     , maxGaussians(maxGaussians)
@@ -101,7 +111,7 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
 {
     createPipelines(library);
     
-    // Verify struct alignment - should be 88 bytes
+    // Verify struct alignment should be 88 bytes
     printf("sizeof(ProjectedGaussian) = %zu bytes (expected 88)\n", sizeof(ProjectedGaussian));
     printf("  offsetof(screenPos) = %zu (expected 0)\n", offsetof(ProjectedGaussian, screenPos));
     printf("  offsetof(conic) = %zu (expected 8)\n", offsetof(ProjectedGaussian, conic));
@@ -124,7 +134,7 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
     uniformBuffer = device->newBuffer(sizeof(TiledUniforms), MTL::ResourceStorageModeShared);
     totalPairsBuffer = device->newBuffer(sizeof(uint32_t), MTL::ResourceStorageModeShared);
     
-    // Start with reasonable default - will grow if needed
+    // Start with reasonable default will grow if needed
     maxPairs = maxGaussians * AVG_TILES_PER_GAUSSIAN;
     gaussianKeys = device->newBuffer(maxPairs * sizeof(uint64_t), MTL::ResourceStorageModeShared);
     gaussianValues = device->newBuffer(maxPairs * sizeof(uint32_t), MTL::ResourceStorageModeShared);
@@ -137,6 +147,7 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
     perPixelLastIdx = nullptr;
 }
 
+// Destructor
 TiledRasterizer::~TiledRasterizer() {
     if (projectedGaussians) projectedGaussians->release();
     if (gaussianKeys) gaussianKeys->release();
@@ -154,15 +165,19 @@ TiledRasterizer::~TiledRasterizer() {
     if (generatePairsPSO) generatePairsPSO->release();
 }
 
+// Create compute pipelines
 void TiledRasterizer::createPipelines(MTL::Library* library) {
     NS::Error* error = nullptr;
     
+    // Helper to create pipeline
     auto makePipeline = [&](const char* name) -> MTL::ComputePipelineState* {
+        // Find function
         MTL::Function* func = library->newFunction(NS::String::string(name, NS::ASCIIStringEncoding));
         if (!func) {
             std::cerr << "Failed to find function: " << name << std::endl;
             return nullptr;
         }
+        // Create pipeline
         MTL::ComputePipelineState* pso = device->newComputePipelineState(func, &error);
         func->release();
         if (!pso) {
@@ -172,6 +187,7 @@ void TiledRasterizer::createPipelines(MTL::Library* library) {
         return pso;
     };
     
+    // Create pipelines
     projectGaussiansPSO = makePipeline("projectGaussians");
     tiledForwardPSO = makePipeline("tiledForward");
     tiledBackwardPSO = makePipeline("tiledBackward");
@@ -179,69 +195,85 @@ void TiledRasterizer::createPipelines(MTL::Library* library) {
     generatePairsPSO = makePipeline("generateTilePairs");
 }
 
+// Ensure buffers have enough capacity
 void TiledRasterizer::ensureBufferCapacity(uint32_t width, uint32_t height, size_t gaussianCount) {
+    // Compute required tiles
     uint32_t newNumTilesX = (width + TILE_SIZE - 1) / TILE_SIZE;
     uint32_t newNumTilesY = (height + TILE_SIZE - 1) / TILE_SIZE;
     uint32_t newMaxTiles = newNumTilesX * newNumTilesY;
     uint32_t numPixels = width * height;
     
+    // Check if reallocation needed
     bool needsTileRealloc = (newMaxTiles > maxTiles);
     bool needsPixelRealloc = (numPixels > currentWidth * currentHeight);
     
+    // Reallocate if needed
     if (needsTileRealloc) {
         if (tileRanges) tileRanges->release();
         maxTiles = newMaxTiles;
         tileRanges = device->newBuffer(maxTiles * sizeof(TileRange), MTL::ResourceStorageModeShared);
     }
     
+    // Per-pixel last index buffer
     if (needsPixelRealloc || !perPixelLastIdx) {
         if (perPixelLastIdx) perPixelLastIdx->release();
         perPixelLastIdx = device->newBuffer(numPixels * sizeof(uint32_t), MTL::ResourceStorageModeShared);
     }
     
+    // Update current sizes
     currentWidth = width;
     currentHeight = height;
     numTilesX = newNumTilesX;
     numTilesY = newNumTilesY;
 }
 
+// Ensure pairs buffer has enough capacity
 void TiledRasterizer::ensurePairsCapacity(uint32_t requiredPairs) {
-    // Sanity check - don't allocate more than 100M pairs (prevents corruption issues)
+    // Don't allocate more than 100M pairs to prevent corruption issues
     if (requiredPairs > 100000000) {
         std::cerr << "WARNING: requiredPairs too large (" << requiredPairs << "), clamping to 100M" << std::endl;
         requiredPairs = 100000000;
     }
     
+    // Check if reallocation needed
     if (requiredPairs <= maxPairs) return;
     
     // Grow by 1.5x or to required size, whichever is larger
     uint32_t newMaxPairs = std::max(requiredPairs, (uint32_t)(maxPairs * 1.5));
     
+    // Debug print
     std::cout << "Growing pairs buffer: " << maxPairs << " -> " << newMaxPairs << std::endl;
     
+    // Reallocate buffers
     if (gaussianKeys) gaussianKeys->release();
     if (gaussianValues) gaussianValues->release();
     
+    // Update maxPairs
     maxPairs = newMaxPairs;
     gaussianKeys = device->newBuffer(maxPairs * sizeof(uint64_t), MTL::ResourceStorageModeShared);
     gaussianValues = device->newBuffer(maxPairs * sizeof(uint32_t), MTL::ResourceStorageModeShared);
 }
 
+// Forward pass
 void TiledRasterizer::forward(MTL::CommandQueue* queue,
                                MTL::Buffer* gaussianBuffer,
                                size_t gaussianCount,
                                const TiledUniforms& uniforms,
                                MTL::Texture* outputTexture) {
     
+    // Start timing the forward pass
     auto forwardStart = std::chrono::high_resolution_clock::now();
     
+    // Get output texture size
     uint32_t width = (uint32_t)outputTexture->width();
     uint32_t height = (uint32_t)outputTexture->height();
     
+    // ensure buffers have enough capacity
     ensureBufferCapacity(width, height, gaussianCount);
     
-    // DEBUG: Print a few input Gaussians (once)
+    // Print input Gaussian info 
     static bool inputDebugPrinted = false;
+    // Print only once
     if (!inputDebugPrinted) {
         Gaussian* gPtr = (Gaussian*)gaussianBuffer->contents();
         std::cout << "=== Input Gaussian Debug ===" << std::endl;
@@ -272,32 +304,36 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     // Reset atomic counter for GPU pair generation
     *((uint32_t*)pairCounterBuffer->contents()) = 0;
     
-    // Ensure buffer capacity (estimate based on gaussian count)
+    // Ensure buffer capacity estimate based on gaussian count
     uint32_t estimatedPairs = (uint32_t)(gaussianCount * AVG_TILES_PER_GAUSSIAN);
     ensurePairsCapacity(estimatedPairs);
     
-    // BATCHED: Project + Pair Generation in single command buffer
+    // Project + Pair Generation in single command buffer
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
     
     // Step 1: Project all Gaussians
     {
+        // Project Gaussians to screen space
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
         enc->setComputePipelineState(projectGaussiansPSO);
         enc->setBuffer(gaussianBuffer, 0, 0);
         enc->setBuffer(projectedGaussians, 0, 1);
         enc->setBuffer(uniformBuffer, 0, 2);
         
+        // Set number of Gaussians
         NS::UInteger threadGroupSize = projectGaussiansPSO->maxTotalThreadsPerThreadgroup();
         if (threadGroupSize > 256) threadGroupSize = 256;
         
+        // Dispatch threads
         MTL::Size grid = MTL::Size(gaussianCount, 1, 1);
         MTL::Size threadgroup = MTL::Size(threadGroupSize, 1, 1);
         enc->dispatchThreads(grid, threadgroup);
         enc->endEncoding();
     }
     
-    // Step 2: GPU Pair Generation (same command buffer - no sync needed)
+    // Step 2: GPU Pair Generation same command buffer so no sync needed
     {
+        // Generate pairs on GPU
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
         enc->setComputePipelineState(generatePairsPSO);
         enc->setBuffer(projectedGaussians, 0, 0);
@@ -305,32 +341,37 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         enc->setBuffer(gaussianValues, 0, 2);
         enc->setBuffer(pairCounterBuffer, 0, 3);
         
+        // Set parameters
         uint32_t numG = (uint32_t)gaussianCount;
         enc->setBytes(&numG, sizeof(uint32_t), 4);
         enc->setBytes(&numTilesX, sizeof(uint32_t), 5);
         enc->setBytes(&maxPairs, sizeof(uint32_t), 6);
         
+        // Dispatch threads
         NS::UInteger threadGroupSize = generatePairsPSO->maxTotalThreadsPerThreadgroup();
         if (threadGroupSize > 256) threadGroupSize = 256;
         
+        // Dispatch threads
         MTL::Size grid = MTL::Size(gaussianCount, 1, 1);
         MTL::Size threadgroup = MTL::Size(threadGroupSize, 1, 1);
         enc->dispatchThreads(grid, threadgroup);
         enc->endEncoding();
     }
     
-    // Submit and wait - need results for CPU sorting
+    // Submit and wait need results for CPU sorting
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
     
+    // Timing after projection + pair generation
     auto t2 = std::chrono::high_resolution_clock::now();
     
     // Step 2: CPU-side tile binning and sorting
     ProjectedGaussian* projPtr = (ProjectedGaussian*)projectedGaussians->contents();
     
-    // DEBUG: Print some projected Gaussian info (once)
+    // DEBUG Print some projected Gaussian info
     static bool debugPrinted = false;
     if (!debugPrinted) {
+        // Print radius and tile info for first 100 Gaussians
         Gaussian* gPtr = (Gaussian*)gaussianBuffer->contents();
         int validCount = 0;
         float avgRadius = 0, minRadius = 1e10, maxRadius = 0;
@@ -371,13 +412,14 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
                     std::cout << "  Tile bounds: (" << p.tileMinX << "," << p.tileMinY << ") to (" << p.tileMaxX << "," << p.tileMaxY << ") = " << actualTiles << " tiles" << std::endl;
                     std::cout << "  Expected tiles: (" << expectedMinTileX << "," << expectedMinTileY << ") to (" << expectedMaxTileX << "," << expectedMaxTileY << ") = " << expectedTiles << " tiles" << std::endl;
                     
-                    // Sanity check: radius should be related to depth (closer = bigger)
-                    float roughScreenScale = worldScaleMax / p.depth;  // Very rough approximation
+                    // Radius should be related to depth (closer = bigger)
+                    float roughScreenScale = worldScaleMax / p.depth;
                     std::cout << "  Rough screen scale (worldMax/depth): " << roughScreenScale << std::endl;
                 }
             }
         }
         
+        // Summary
         if (validCount > 0) {
             std::cout << "\nSummary (first 100 Gaussians):" << std::endl;
             std::cout << "  Valid: " << validCount << std::endl;
@@ -388,9 +430,10 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         std::cout << "=== End Radius Debug ===\n" << std::endl;
     }
     
+    // Timing after projection
     auto t3 = std::chrono::high_resolution_clock::now();
     
-    // Read total pairs from atomic counter (GPU pair gen already ran in batched command buffer)
+    // Read total pairs from atomic counter GPU pair gen already ran in batched command buffer
     uint32_t totalPairs = *((uint32_t*)pairCounterBuffer->contents());
     
     // Clamp if we exceeded buffer
@@ -399,6 +442,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         totalPairs = maxPairs;
     }
     
+    // Timing after reading total pairs
     if (totalPairs == 0) {
         // Clear tile ranges
         memset(tileRanges->contents(), 0, maxTiles * sizeof(TileRange));
@@ -412,18 +456,20 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     }
     
     // Copy GPU-generated pairs to CPU vector for sorting
-    // (GPU wrote directly to gaussianKeys/gaussianValues buffers)
+    // GPU wrote directly to gaussianKeys/gaussianValues buffers
     static std::vector<std::pair<uint64_t, uint32_t>> pairs;
     pairs.resize(totalPairs);
     
+    // Copy from GPU buffers to CPU
     uint64_t* gpuKeys = (uint64_t*)gaussianKeys->contents();
     uint32_t* gpuValues = (uint32_t*)gaussianValues->contents();
     
+    // Populate pairs vector
     for (uint32_t i = 0; i < totalPairs; i++) {
         pairs[i] = {gpuKeys[i], gpuValues[i]};
     }
     
-    // Sort by key (tile + depth) - use fast CPU radix sort
+    // Sort by key (tile + depth) use fast CPU radix sort
     parallelRadixSort(pairs);
     
     // Copy sorted data back to GPU buffers
@@ -435,11 +481,12 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     
     auto t6 = std::chrono::high_resolution_clock::now();
     
-    // BATCHED: Build tile ranges + Render in single command buffer
+    // Build tile ranges + Render in single command buffer
     cmdBuffer = queue->commandBuffer();
     
     // Build tile ranges on GPU using parallel binary search
     {
+        // Setup compute encoder and buffers 
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
         enc->setComputePipelineState(buildTileRangesPSO);
         enc->setBuffer(gaussianKeys, 0, 0);
@@ -447,41 +494,48 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         enc->setBytes(&pairCount, sizeof(uint32_t), 2);
         enc->setBytes(&maxTiles, sizeof(uint32_t), 3);
         
+        // Dispatch threads
         NS::UInteger threadGroupSize = buildTileRangesPSO->maxTotalThreadsPerThreadgroup();
         if (threadGroupSize > 256) threadGroupSize = 256;
         
+        // Dispatch threads
         MTL::Size grid = MTL::Size(maxTiles, 1, 1);
         MTL::Size threadgroup = MTL::Size(threadGroupSize, 1, 1);
         enc->dispatchThreads(grid, threadgroup);
         enc->endEncoding();
     }
     
-    // GPU forward rendering (same command buffer - no sync needed)
+    // GPU forward rendering same command buffer no sync needed
     {
+        // Setup compute encoder and buffers
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
         enc->setComputePipelineState(tiledForwardPSO);
         enc->setBuffer(gaussianBuffer, 0, 0);
         enc->setBuffer(projectedGaussians, 0, 1);
-        enc->setBuffer(gaussianValues, 0, 2);  // sortedIndices
+        // sortedIndices
+        enc->setBuffer(gaussianValues, 0, 2);  
         enc->setBuffer(tileRanges, 0, 3);
         enc->setBuffer(uniformBuffer, 0, 4);
         enc->setBuffer(perPixelLastIdx, 0, 5);
         enc->setTexture(outputTexture, 0);
         
+        // Dispatch threads
         MTL::Size grid = MTL::Size(width, height, 1);
         MTL::Size threadgroup = MTL::Size(TILE_SIZE, TILE_SIZE, 1);
         enc->dispatchThreads(grid, threadgroup);
         enc->endEncoding();
     }
     
+    // Submit and wait for render to complete
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
     
     auto t7 = std::chrono::high_resolution_clock::now();
     
-    // DEBUG: Check tile ranges for gaps/overlaps (after render completes)
+    // Check tile ranges for gaps/overlaps after render completes
     TileRange* ranges = (TileRange*)tileRanges->contents();
     static bool tileRangeDebugPrinted = false;
+    // Print only once
     if (!tileRangeDebugPrinted) {
         std::cout << "\n=== Tile Range Debug ===" << std::endl;
         std::cout << "Total pairs: " << pairCount << ", Total tiles: " << maxTiles << std::endl;
@@ -493,6 +547,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         bool foundGap = false;
         bool foundOverlap = false;
         
+        // Iterate over tiles and print ranges
         for (uint32_t tile = 0; tile < maxTiles && tile < 10000; tile++) {
             if (ranges[tile].count > 0) {
                 tilesWithData++;
@@ -526,6 +581,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
                       << " depthKey=0x" << std::hex << depthBits << std::dec << std::endl;
         }
         
+        // Summary
         std::cout << "\nSummary:" << std::endl;
         std::cout << "  Tiles with Gaussians: " << tilesWithData << "/" << maxTiles << std::endl;
         std::cout << "  Total coverage: " << totalCoverage << " (should equal pairCount=" << pairCount << ")" << std::endl;
@@ -543,17 +599,23 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     static double totalProjectPairGenTime = 0, totalSortTime = 0;
     static double totalRangeRenderTime = 0, totalForwardTime = 0;
     
-    double projectPairGenMs = std::chrono::duration<double, std::milli>(t2 - t1).count();  // Project + PairGen batched
-    double sortMs = std::chrono::duration<double, std::milli>(t6 - t3).count();  // Sort + copy
-    double rangeRenderMs = std::chrono::duration<double, std::milli>(t7 - t6).count();  // Range + Render batched
+    // Project + PairGen batched
+    double projectPairGenMs = std::chrono::duration<double, std::milli>(t2 - t1).count(); 
+    // Sort + copy
+    double sortMs = std::chrono::duration<double, std::milli>(t6 - t3).count();  
+    // Range + Render batched
+    double rangeRenderMs = std::chrono::duration<double, std::milli>(t7 - t6).count();  
+    // Total forward
     double forwardMs = std::chrono::duration<double, std::milli>(t7 - forwardStart).count();
     
+    // Accumulate
     totalProjectPairGenTime += projectPairGenMs;
     totalSortTime += sortMs;
     totalRangeRenderTime += rangeRenderMs;
     totalForwardTime += forwardMs;
     frameCount++;
     
+    // Print every 100 frames
     if (frameCount == 100) {
         printf("\n=== Forward Pass Timing (avg over %d frames) ===\n", frameCount);
         printf("  Project+PairGen (GPU):  %6.2f ms\n", totalProjectPairGenTime / frameCount);
@@ -567,6 +629,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     }
 }
 
+// Backward pass
 void TiledRasterizer::backward(MTL::CommandQueue* queue,
                                 MTL::Buffer* gaussianBuffer,
                                 MTL::Buffer* gradientBuffer,
@@ -589,26 +652,29 @@ void TiledRasterizer::backward(MTL::CommandQueue* queue,
     memcpy(uniformBuffer->contents(), &u, sizeof(TiledUniforms));
     
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
-    
+    // Backward rendering
     {
+        // Setup compute encoder and buffers
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
         enc->setComputePipelineState(tiledBackwardPSO);
         enc->setBuffer(gaussianBuffer, 0, 0);
         enc->setBuffer(gradientBuffer, 0, 1);
         enc->setBuffer(projectedGaussians, 0, 2);
-        enc->setBuffer(gaussianValues, 0, 3);  // sortedIndices
+        // sortedIndices
+        enc->setBuffer(gaussianValues, 0, 3);  
         enc->setBuffer(tileRanges, 0, 4);
         enc->setBuffer(uniformBuffer, 0, 5);
         enc->setBuffer(perPixelLastIdx, 0, 6);
         enc->setTexture(renderedTexture, 0);
         enc->setTexture(groundTruthTexture, 1);
         
+        // Dispatch threads
         MTL::Size grid = MTL::Size(width, height, 1);
         MTL::Size threadgroup = MTL::Size(TILE_SIZE, TILE_SIZE, 1);
         enc->dispatchThreads(grid, threadgroup);
         enc->endEncoding();
     }
-    
+    // Submit and wait for render to complete
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
 }

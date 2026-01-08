@@ -5,6 +5,7 @@
 //  Created by Colin Taylor Taylor on 2025-12-24.
 //
 
+// Metal C++ Wrappers
 #define NS_PRIVATE_IMPLEMENTATION
 #define CA_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION

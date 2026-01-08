@@ -1,5 +1,12 @@
+//
+//  mtl_engine.hpp
+//  GuassianSplatting
+//
+//  Created by Colin Taylor Taylor on 2025-12-24.
+//
 #pragma once
 
+// Metal and GLFW imports
 #define GLFW_INCLUDE_NONE
 #import <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_COCOA
@@ -19,6 +26,7 @@
 #include "density_control.hpp"
 #include "tiled_rasterizer.hpp"
 
+// Uniforms structure for passing camera and screen data to shaders
 struct Uniforms {
     simd_float4x4 viewMatrix;
     simd_float4x4 projectionMatrix;
@@ -31,6 +39,7 @@ struct Uniforms {
 
 class MTLEngine {
 public:
+    // Public interface methods for engine creation and operation
     void init();
     void run(Camera& camera);
     void cleanup();
@@ -48,28 +57,36 @@ public:
 
 
 private:
+    // Private helper methods and members
+    // Initialization methods
     void initDevice();
     void initWindow();
     void setupCallbacks();
     
+    // Metal setup methods
     void initCommandQueue();
     void createPipeline();
     void render(Camera& camera);
     void loadShaders();
     void createDepthTexture();
     
+    // Input handling callbacks
     static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
     static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos);
     static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset);
     
+    // Member variables
+    // Metal and windowing
     MTL::Device* metalDevice;
     GLFWwindow* glfwWindow;
     NSWindow* metalWindow;
     CAMetalLayer* metalLayer;
     
+    // Metal resources
     MTL::Buffer* gaussianBuffer = nullptr;
     size_t gaussianCount;
     
+    // Shader and pipeline
     MTL::Library* shaderLibrary;
     MTL::RenderPipelineState* pipelineState;
     MTL::CommandQueue* commandQueue;
@@ -79,29 +96,37 @@ private:
     MTL::Texture* depthTexture;
     MTL::Buffer* sequentialIndexBuffer = nullptr;
     
+    // Input handling
     bool isDragging = false;
     bool isPanning = false;
     double lastMouseX = 0;
     double lastMouseY = 0;
     Camera* activeCamera = nullptr;
     
+    // Buffers and utilities
     MTL::Buffer* positionBuffer = nullptr;
     GPURadixSort32* gpuSort = nullptr;
     
+    // Window dimensions
     int windowWidth = 800;
     int windowHeight = 600;
     
+    // Callback for window resize
     static void framebufferSizeCallback(GLFWwindow* window, int width, int height);
     
+    // Training data
     std::vector<TrainingImage> trainingImages;
-    
-    bool useTrainingView = true;  // Default to training view for proper scale
+    // Default to training view for proper scale
+    bool useTrainingView = true;  
     size_t currentTrainingIndex = 0;
     
+    // Input handling
     static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
     
+    // COLMAP data
     ColmapData colmapData;
     
+    // Camera matrix conversions
     simd_float4x4 projectionFromColmap(const ColmapCamera& cam, float nearZ, float farZ);
     simd_float4x4 viewMatrixFromColmap(simd_float4 quat, simd_float3 translation);
     
@@ -118,7 +143,8 @@ private:
     MTL::Buffer* ssimBuffer = nullptr;
     MTL::Buffer* combinedLossBuffer = nullptr;
     MTL::Buffer* totalLossBuffer = nullptr;
-    float lambdaDSSIM = 0.2f;  // Paper: 0.2 weight for D-SSIM
+    // Paper: 0.2 weight for D-SSIM
+    float lambdaDSSIM = 0.2f;  
     void createLossPipeline();
     float computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth);
     

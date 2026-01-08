@@ -1,16 +1,8 @@
 //
-//  ply_loader.cpp
+//  mtl_engine.hpp
 //  GuassianSplatting
 //
-//  CRITICAL: This loader must match the internal representation expected by shaders:
-//  - Scale: stored in LOG space (shader applies exp())
-//  - Opacity: stored as RAW pre-sigmoid value (shader applies sigmoid())
-//  - Rotation: stored as (w,x,y,z) in float4 where .x=w, .y=x, .z=y, .w=z
-//
-//  External PLY Compatibility:
-//  - Standard 3DGS PLY files store scales already in log space
-//  - Standard 3DGS PLY files store opacity in raw (pre-sigmoid) space
-//  - Rotation stored as (rot_0=w, rot_1=x, rot_2=y, rot_3=z)
+//  Created by Colin Taylor Taylor on 2025-12-24.
 //
 
 #include "ply_loader.hpp"
@@ -21,23 +13,17 @@
 #include <float.h>
 #include <algorithm>
 
-// Detect if scales appear to be in linear space rather than log space
-// Log-space scales from 3DGS are typically in range [-10, 2]
-// Linear scales would be small positive numbers like [0.001, 1.0]
-//
-// Standard 3DGS PLY files store scales in LOG SPACE.
-// The log scale typically ranges from -8 to 0, giving linear scales of 0.0003 to 1.0
-// If we see scales that are all positive but less than 1, they might be LINEAR (not log)
-// If we see scales with negative values, they are LOG SPACE (standard)
-// If we see scales with positive values > 2, they are LOG SPACE (would give huge linear scales)
+// Heuristic to detect if scales are in linear or log space
 bool detectLinearScales(const float* scale_data, size_t count, float& outMinVal, float& outMaxVal) {
     if (count == 0) return false;
     
+    // Analyze a sample of scales
     int positiveCount = 0;
     int negativeCount = 0;
     float maxVal = -FLT_MAX;
     float minVal = FLT_MAX;
     
+    // Sample up to 1000 scales for analysis
     size_t sampleSize = std::min(count, (size_t)1000);
     for (size_t i = 0; i < sampleSize; i++) {
         for (int j = 0; j < 3; j++) {
@@ -49,6 +35,7 @@ bool detectLinearScales(const float* scale_data, size_t count, float& outMinVal,
         }
     }
     
+    // Output min/max values
     outMinVal = minVal;
     outMaxVal = maxVal;
     
@@ -60,21 +47,20 @@ bool detectLinearScales(const float* scale_data, size_t count, float& outMinVal,
         return false; // Log space
     }
     
-    // All positive: check the range
-    // Log scales > 2 would give exp() > 7.4 which is large
-    // Linear scales are typically small (< 1)
-    // If max is small and positive, likely linear
+    // If all values are between 0 and 1, likely linear
     if (maxVal <= 1.0f && minVal > 0.0f) {
-        return true;  // Likely linear
+        // Likely linear
+        return true;  
     }
     
-    // Otherwise, assume log space (positive log scales are valid)
+    // Default to log space
     return false;
 }
 
+// Load Gaussians from PLY file
 std::vector<Gaussian> load_ply(const std::string& file_path) {
     std::vector<Gaussian> gaussians;
-    
+    // Open the PLY file
     try {
         std::ifstream file(file_path, std::ios::binary);
         if(!file.is_open()) {
@@ -82,11 +68,14 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             return gaussians;
         }
         
+        // Parse PLY header
         tinyply::PlyFile ply_file;
         ply_file.parse_header(file);
         
+        // Request necessary properties
         std::shared_ptr<tinyply::PlyData> positions, scales, rotations, opacities, sh_dcs;
         
+        // Request position
         try {
             positions = ply_file.request_properties_from_element("vertex", {"x","y","z"});
         } catch (...) {
@@ -94,6 +83,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             return gaussians;
         }
         
+        // Request scale
         try {
             scales = ply_file.request_properties_from_element("vertex", {"scale_0", "scale_1","scale_2"});
         } catch (...) {
@@ -101,6 +91,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             return gaussians;
         }
         
+        // Request rotation
         try {
             rotations = ply_file.request_properties_from_element("vertex", {"rot_0", "rot_1", "rot_2", "rot_3"});
         } catch (...) {
@@ -108,6 +99,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             return gaussians;
         }
         
+        // Request opacity
         try {
             opacities = ply_file.request_properties_from_element("vertex", {"opacity"});
         } catch (...) {
@@ -115,6 +107,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             return gaussians;
         }
         
+        // Request SH DC coefficients
         try {
             sh_dcs = ply_file.request_properties_from_element("vertex", {"f_dc_0","f_dc_1","f_dc_2"});
         } catch (...) {
@@ -122,6 +115,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             return gaussians;
         }
         
+        // Request SH rest coefficients (degree 1)
         std::shared_ptr<tinyply::PlyData> sh_rest;
         
         try {
@@ -135,11 +129,14 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             sh_rest = nullptr;
         }
         
+        // Read the data from the file
         ply_file.read(file);
         
+        // Process loaded data
         size_t vertex_count = positions->count;
         std::cout << "Loading " << vertex_count << " gaussians..." << std::endl;
         
+        // Get raw data pointers
         const float* pos_data = reinterpret_cast<const float*>(positions->buffer.get());
         const float* scale_data = reinterpret_cast<const float*>(scales->buffer.get());
         const float* rot_data = reinterpret_cast<const float*>(rotations->buffer.get());
@@ -158,6 +155,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             std::cout << "  Linear scale range: [" << std::exp(scaleMin) << ", " << std::exp(scaleMax) << "]" << std::endl;
         }
 
+        // Reserve space
         gaussians.reserve(vertex_count);
         
         int numSkipped = 0;
@@ -165,7 +163,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
         for(size_t i = 0; i < vertex_count; i++) {
             Gaussian g;
             
-            // ===== POSITION: Direct copy =====
+            // position
             g.position = simd_make_float3(pos_data[i*3 + 0],
                                           pos_data[i*3 + 1],
                                           pos_data[i*3 + 2]);
@@ -178,7 +176,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
                 continue;
             }
             
-            // ===== SCALE: Handle both linear and log formats =====
+            // scale
             float s0 = scale_data[i*3 + 0];
             float s1 = scale_data[i*3 + 1];
             float s2 = scale_data[i*3 + 2];
@@ -192,7 +190,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             }
             
             // Clamp scales to reasonable range for viewing
-            // Higher limit for external PLY compatibility (training uses stricter 4.0)
+            // Higher limit for external PLY compatibility
             const float MAX_LOG_SCALE = 8.0f;
             s0 = std::clamp(s0, -MAX_LOG_SCALE, MAX_LOG_SCALE);
             s1 = std::clamp(s1, -MAX_LOG_SCALE, MAX_LOG_SCALE);
@@ -200,11 +198,11 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             
             g.scale = simd_make_float3(s0, s1, s2);
             
-            // ===== ROTATION: PLY format is (rot_0=w, rot_1=x, rot_2=y, rot_3=z) =====
-            float qw = rot_data[i*4 + 0];  // rot_0 = w
-            float qx = rot_data[i*4 + 1];  // rot_1 = x
-            float qy = rot_data[i*4 + 2];  // rot_2 = y
-            float qz = rot_data[i*4 + 3];  // rot_3 = z
+            // rotation
+            float qw = rot_data[i*4 + 0];  
+            float qx = rot_data[i*4 + 1]; 
+            float qy = rot_data[i*4 + 2]; 
+            float qz = rot_data[i*4 + 3];
             
             // Normalize quaternion
             float q_len = std::sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
@@ -214,17 +212,18 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
                 qw = 1.0f; qx = 0.0f; qy = 0.0f; qz = 0.0f;
             }
             
-            // Store as (w, x, y, z) - shader expects q.x=w, q.y=x, q.z=y, q.w=z
+            // Store as (w, x, y, z) the shader expects q.x=w, q.y=x, q.z=y, q.w=z
             g.rotation = simd_make_float4(qw, qx, qy, qz);
             
-            // ===== OPACITY: Keep as RAW - DO NOT apply sigmoid()! =====
+            // opacity
             g.opacity = opacity_data[i];
             
-            // ===== SH COEFFICIENTS =====
-            g.sh[0] = sh_dc_data[i * 3 + 0];  // R DC
-            g.sh[4] = sh_dc_data[i * 3 + 1];  // G DC
-            g.sh[8] = sh_dc_data[i * 3 + 2];  // B DC
+            // SH coefficients
+            g.sh[0] = sh_dc_data[i * 3 + 0]; 
+            g.sh[4] = sh_dc_data[i * 3 + 1];
+            g.sh[8] = sh_dc_data[i * 3 + 2];
             
+            // Fill in rest of SH coefficients
             if (sh_rest_data) {
                 g.sh[1] = sh_rest_data[i * 9 + 0];
                 g.sh[5] = sh_rest_data[i * 9 + 1];
@@ -244,6 +243,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             gaussians.push_back(g);
         }
         
+        // Summary
         std::cout << "Loaded " << gaussians.size() << " gaussians successfully" << std::endl;
         if (numSkipped > 0) {
             std::cout << "Skipped " << numSkipped << " invalid gaussians" << std::endl;

@@ -9,6 +9,7 @@
 #include <Metal/Metal.hpp>
 #include <simd/simd.h>
 
+// Adam optimizer parameters structure
 struct AdamParams {
     float lr;
     float beta1;
@@ -18,19 +19,26 @@ struct AdamParams {
     uint32_t numGaussians;
 };
 
+// Adam Optimizer class for updating Gaussian parameters
 class AdamOptimizer {
 public:
+    // Constructor and destructor
     AdamOptimizer(MTL::Device* device, MTL::Library* library, size_t numGaussians);
     ~AdamOptimizer();
     
     void step(MTL::CommandQueue* queue,
               MTL::Buffer* gausians,
               MTL::Buffer* gradients,
-              float lr_position = 0.00016f,   // Official default
-              float lr_scale = 0.005f,        // Official default
-              float lr_rotation = 0.001f,     // Official default
-              float lr_opacity = 0.05f,       // Official default
-              float lr_sh = 0.0025f);         // Official default
+               // Official default
+              float lr_position = 0.00016f,  
+              // Official default
+              float lr_scale = 0.005f,        
+              // Official default
+              float lr_rotation = 0.001f,     
+              // Official default
+              float lr_opacity = 0.05f,       
+              // Official default
+              float lr_sh = 0.0025f);         
     
     void reset();
     
@@ -40,7 +48,7 @@ public:
     // Reset opacity momentum after opacity reset
     void resetOpacityMomentum();
     
-    // Debug: print Adam state for first Gaussian
+    // Debug print Adam state for first Gaussian
     void debugPrintState(int gaussianIdx = 0);
     
     // Get current timestep
@@ -50,12 +58,14 @@ public:
     void printGPUDebug();
 
 private:
+    // Metal device and compute pipeline
     MTL::Device* device;
     MTL::ComputePipelineState* adamPSO;
     
-    // GPU debug buffer - 16 floats for debugging
+    // GPU debug buffer 16 floats for debugging
     MTL::Buffer* debugBuffer;
     
+    // Adam state buffers
     MTL::Buffer* m_position;
     MTL::Buffer* m_scale;
     MTL::Buffer* m_rotation;
@@ -68,10 +78,12 @@ private:
     MTL::Buffer* v_opacity;
     MTL::Buffer* v_sh;
     
+    // Adam parameters buffer
     MTL::Buffer* paramsBuffer;
     
     size_t numGaussians;
     uint32_t timestep = 0;
     
+    // Allocate or reallocate Adam state buffers
     void allocateBuffers(size_t count);
 };
