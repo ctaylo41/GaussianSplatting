@@ -174,8 +174,9 @@ kernel void projectGaussians(
     float qLen = length(q);
     q = (qLen > 0.001) ? (q / qLen) : float4(1, 0, 0, 0);
     
-    // Build 3D covariance: Sigma = R * S^2 * R^T = M^T * M where M = S * R
-    // This matches official 3DGS convention
+    // Build 3D covariance using official 3DGS convention:
+    // M = S * R, Sigma = M^T * M = R^T * S^2 * R
+    // This is mathematically equivalent to R * S^2 * R^T but matches official backward pass
     float3x3 R = quatToMat(q);
     // Diagonal scale matrix - Metal column constructor
     float3x3 S = float3x3(
@@ -183,9 +184,9 @@ kernel void projectGaussians(
         float3(0, scale.y, 0),
         float3(0, 0, scale.z)
     );
-    // Official convention: S * R
+    // Official 3DGS convention: M = S * R
     float3x3 M = S * R;  
-    // M^T * M
+    // Sigma = M^T * M = (S * R)^T * (S * R) = R^T * S^2 * R
     float3x3 Sigma3D = transpose(M) * M;  
     
     // View space projection using same approach as official 3DGS
@@ -206,23 +207,25 @@ kernel void projectGaussians(
     float J11 = fy / z_cam;
     float J12 = -fy * tytz / z_cam;
     
-    // Jacobian matrix
+    // Jacobian matrix (row-major construction matching official 3DGS)
+    // Official uses: J = | fx/z   0    -fx*tx/z^2 |
+    //                    |  0   fy/z   -fy*ty/z^2 |
+    //                    |  0    0         0      |
     float3x3 J = float3x3(
-        float3(J00, 0, 0), 
-        float3(0, J11, 0),
-        float3(J02, J12, 0)
+        float3(J00, 0, J02),   // Row 0 -> Column 0 in Metal
+        float3(0, J11, J12),   // Row 1 -> Column 1 in Metal  
+        float3(0, 0, 0)        // Row 2 -> Column 2 in Metal
     );
     
-    // View matrix rotation world-to-view
+    // View matrix rotation world-to-view (extract 3x3 rotation)
     float3x3 W = float3x3(uniforms.viewMatrix[0].xyz,
                           uniforms.viewMatrix[1].xyz,
                           uniforms.viewMatrix[2].xyz);
     
-    // Combined transform T = W * J
+    // Combined transform T = W * J (official 3DGS convention)
     float3x3 T = W * J;
     
-    // Project 3D covariance to 2D
-    // cov2D = T^T * Sigma3D * T
+    // Project 3D covariance to 2D: cov2D = T^T * Sigma3D * T (official formula)
     float3x3 cov2D_mat = transpose(T) * Sigma3D * T;
     
     // Extract 2D covariance components
@@ -597,29 +600,30 @@ kernel void tiledBackward(
                                           + cov_a * cov_b * dL_dConic.z);
         
         // Cov3D gradient
-        // Forward cov2D = T^T * Sigma3D * T where T = W * J
-        // Gradient dL/dSigma3D = T * dL/dCov2D * T^T
+        // Forward: cov2D = T^T * Sigma3D * T where T = W * J
+        // Gradient: for Y = A^T * X * A, dL/dX = A * dL/dY * A^T
+        // So: dL/dSigma3D = T * dL/dCov2D * T^T
         float3 t_cam = float3(p.viewPos_xy, p.depth);
         txtz = t_cam.x / t_cam.z;
         tytz = t_cam.y / t_cam.z;
         
-        // Jacobian of projection
+        // Jacobian of projection (must match forward pass exactly!)
         float J00 = fx / t_cam.z;
         float J02 = -fx * txtz / t_cam.z;
         float J11 = fy / t_cam.z;
         float J12 = -fy * tytz / t_cam.z;
         
-        // Jacobian matrix
+        // Jacobian matrix (same structure as forward)
         float3x3 J = float3x3(
-            float3(J00, 0, 0),
-            float3(0, J11, 0),
-            float3(J02, J12, 0)
+            float3(J00, 0, J02),   // Row 0 -> Column 0
+            float3(0, J11, J12),   // Row 1 -> Column 1
+            float3(0, 0, 0)        // Row 2 -> Column 2
         );
         
-        // T = W * J
+        // T = W * J (must match forward pass exactly!)
         float3x3 T_mat = viewRot * J;
         
-        // dL/dCov2D as 2x2 matrix
+        // dL/dCov2D as 2x2 matrix embedded in 3x3
         // Extend to 3x3 with zeros for the third row/col
         float3x3 dL_dCov2D_mat = float3x3(
             float3(dL_dCov2D.x, dL_dCov2D.y, 0),
@@ -627,75 +631,83 @@ kernel void tiledBackward(
             float3(0, 0, 0)
         );
         
-        // dL/dSigma3D = T * dL/dCov2D * T^T
+        // For cov2D = T^T * Sigma3D * T, gradient is: dL/dSigma3D = T * dL/dCov2D * T^T
         float3x3 dL_dCov3D = T_mat * dL_dCov2D_mat * transpose(T_mat);
         
         // Scale and Rotation gradients
-        // Sigma3D = M^T * M, M = S * R 
-        // dL/dM = 2 * M * dL/dSigma3D
+        // Following official 3DGS: M = S * R, Sigma = M^T * M
+        // This is equivalent to our R * S convention with Sigma = M * M^T
+        // but we need consistent gradient formulas
         Gaussian g_orig = gaussians[gIdx];
         float3 scale = exp(clamp(g_orig.scale, -MAX_SCALE, MAX_SCALE));
-        float3x3 R = quatToMat(g_orig.rotation);
+        
+        // Quaternion components: q = (w, x, y, z) stored as (q.x, q.y, q.z, q.w)
+        float4 q = g_orig.rotation;
+        float r = q.x;  // w component
+        float x_q = q.y;  // x component  
+        float y_q = q.z;  // y component
+        float z_q = q.w;  // z component
+        
+        // Build rotation matrix (same as quatToMat but we need the components)
+        float3x3 R = quatToMat(q);
+        
+        // Using M = S * R convention from official 3DGS
+        // S is diagonal scale matrix
         float3x3 S = float3x3(
             float3(scale.x, 0, 0),
             float3(0, scale.y, 0),
             float3(0, 0, scale.z)
         );
-        // S * R
-        float3x3 M = S * R;  
+        float3x3 M = S * R;  // Official convention: S * R
         
-        // dL_dM = 2 * M * dL_dCov3D
+        // For Sigma = M^T * M: dL/dM = 2 * M * dL/dSigma (note order!)
         float3x3 dL_dM = 2.0f * M * dL_dCov3D;
         
-        // dL/dS = dL/dM * R^T
-        // Equivalent to diagonal of dL_dM * R^T
+        // Transpose for easier gradient computation (matching official code)
         float3x3 Rt = transpose(R);
-        float3x3 dLdM_Rt = dL_dM * Rt;
-        float3 dL_dScale_val = float3(dLdM_Rt[0][0], dLdM_Rt[1][1], dLdM_Rt[2][2]);
+        float3x3 dL_dMt = transpose(dL_dM);
         
-        // Convert to log scale gradient
-        // dL/d(log_s) = dL/ds * s
+        // For M = S * R: dL/dS diagonal = R^T row i dot dL/dM^T column i
+        // Official: dL_dscale->x = glm::dot(Rt[0], dL_dMt[0]);
+        float3 dL_dScale_val = float3(
+            dot(Rt[0], dL_dMt[0]),
+            dot(Rt[1], dL_dMt[1]),
+            dot(Rt[2], dL_dMt[2])
+        );
+        
+        // Convert to log scale gradient: dL/d(log_s) = dL/ds * s
         float3 dL_dLogScale = dL_dScale_val * scale;
         
-        // Rotation gradient
-        // dL/dR = S * dL/dM
-        // M = S * R
-        // dL/dR = S^T * dL/dM = S * dL/dM
-        float3x3 dL_dR = float3x3(
-            scale.x * dL_dM[0],
-            scale.y * dL_dM[1],
-            scale.z * dL_dM[2]
+        // For M = S * R: dL/dR = S * dL/dM (multiply rows by scale)
+        // Prepare dL_dMt scaled by s for quaternion gradient (official approach)
+        // dL_dMt[col] *= s[col]
+        float3x3 dL_dMt_scaled = float3x3(
+            dL_dMt[0] * scale.x,
+            dL_dMt[1] * scale.y,
+            dL_dMt[2] * scale.z
         );
         
-        // Quaternion gradient from rotation matrix gradient
-        // Using the standard formula for dR/dq
-        float4 dL_dq = float4(0);
-        float w = g_orig.rotation.x;
-        float x = g_orig.rotation.y;
-        float y = g_orig.rotation.z;
-        float z_rot = g_orig.rotation.w;
+        // Quaternion gradient using official 3DGS formulas
+        // These are derived from dR/dq for R as a function of quaternion (r,x,y,z)
+        float4 dL_dq;
+        dL_dq.x = 2.0f * (z_q * (dL_dMt_scaled[0][1] - dL_dMt_scaled[1][0]) +
+                         y_q * (dL_dMt_scaled[2][0] - dL_dMt_scaled[0][2]) +
+                         x_q * (dL_dMt_scaled[1][2] - dL_dMt_scaled[2][1]));
         
-        // Derivatives of R w.r.t. quaternion components
-        dL_dq.x = 2.0f * (
-            dot(dL_dR[0], float3(0, z_rot, -y)) +
-            dot(dL_dR[1], float3(-z_rot, 0, x)) +
-            dot(dL_dR[2], float3(y, -x, 0))
-        );
-        dL_dq.y = 2.0f * (
-            dot(dL_dR[0], float3(0, y, z_rot)) +
-            dot(dL_dR[1], float3(y, -2*x, w)) +
-            dot(dL_dR[2], float3(z_rot, -w, -2*x))
-        );
-        dL_dq.z = 2.0f * (
-            dot(dL_dR[0], float3(-2*y, x, w)) +
-            dot(dL_dR[1], float3(x, 0, z_rot)) +
-            dot(dL_dR[2], float3(-w, z_rot, -2*y))
-        );
-        dL_dq.w = 2.0f * (
-            dot(dL_dR[0], float3(-2*z_rot, -w, x)) +
-            dot(dL_dR[1], float3(w, -2*z_rot, y)) +
-            dot(dL_dR[2], float3(x, y, 0))
-        );
+        dL_dq.y = 2.0f * (y_q * (dL_dMt_scaled[1][0] + dL_dMt_scaled[0][1]) +
+                         z_q * (dL_dMt_scaled[2][0] + dL_dMt_scaled[0][2]) +
+                         r * (dL_dMt_scaled[1][2] - dL_dMt_scaled[2][1]) -
+                         2.0f * x_q * (dL_dMt_scaled[2][2] + dL_dMt_scaled[1][1]));
+        
+        dL_dq.z = 2.0f * (x_q * (dL_dMt_scaled[1][0] + dL_dMt_scaled[0][1]) +
+                         r * (dL_dMt_scaled[2][0] - dL_dMt_scaled[0][2]) +
+                         z_q * (dL_dMt_scaled[1][2] + dL_dMt_scaled[2][1]) -
+                         2.0f * y_q * (dL_dMt_scaled[2][2] + dL_dMt_scaled[0][0]));
+        
+        dL_dq.w = 2.0f * (r * (dL_dMt_scaled[0][1] - dL_dMt_scaled[1][0]) +
+                         x_q * (dL_dMt_scaled[2][0] + dL_dMt_scaled[0][2]) +
+                         y_q * (dL_dMt_scaled[1][2] + dL_dMt_scaled[2][1]) -
+                         2.0f * z_q * (dL_dMt_scaled[1][1] + dL_dMt_scaled[0][0]));
         
         // Per-pixel gradient clamp critical to prevent explosion
         // A Gaussian may receive gradients from 1000s of pixels, so this must be small
