@@ -1,5 +1,5 @@
 //
-//  tile_rasterizer.hpp
+//  tiled_shaders.metal
 //  GuassianSplatting
 //
 //  Created by Colin Taylor Taylor on 2025-12-28.
@@ -178,7 +178,7 @@ kernel void projectGaussians(
     // M = S * R, Sigma = M^T * M = R^T * S^2 * R
     // This is mathematically equivalent to R * S^2 * R^T but matches official backward pass
     float3x3 R = quatToMat(q);
-    // Diagonal scale matrix - Metal column constructor
+    // Diagonal scale matrix
     float3x3 S = float3x3(
         float3(scale.x, 0, 0),
         float3(0, scale.y, 0),
@@ -207,17 +207,14 @@ kernel void projectGaussians(
     float J11 = fy / z_cam;
     float J12 = -fy * tytz / z_cam;
     
-    // Jacobian matrix (row-major construction matching official 3DGS)
-    // Official uses: J = | fx/z   0    -fx*tx/z^2 |
-    //                    |  0   fy/z   -fy*ty/z^2 |
-    //                    |  0    0         0      |
+    // Jacobian matrix
     float3x3 J = float3x3(
-        float3(J00, 0, J02),   // Row 0 -> Column 0 in Metal
-        float3(0, J11, J12),   // Row 1 -> Column 1 in Metal  
-        float3(0, 0, 0)        // Row 2 -> Column 2 in Metal
+        float3(J00, 0, 0),     
+        float3(0, J11, 0),  
+        float3(J02, J12, 0)
     );
     
-    // View matrix rotation world-to-view (extract 3x3 rotation)
+    // View matrix rotation world-to-view extract 3x3 rotation
     float3x3 W = float3x3(uniforms.viewMatrix[0].xyz,
                           uniforms.viewMatrix[1].xyz,
                           uniforms.viewMatrix[2].xyz);
@@ -225,7 +222,7 @@ kernel void projectGaussians(
     // Combined transform T = W * J (official 3DGS convention)
     float3x3 T = W * J;
     
-    // Project 3D covariance to 2D: cov2D = T^T * Sigma3D * T (official formula)
+    // Project 3D covariance to 2D cov2D = T^T * Sigma3D * T (official formula)
     float3x3 cov2D_mat = transpose(T) * Sigma3D * T;
     
     // Extract 2D covariance components
@@ -613,14 +610,14 @@ kernel void tiledBackward(
         float J11 = fy / t_cam.z;
         float J12 = -fy * tytz / t_cam.z;
         
-        // Jacobian matrix (same structure as forward)
+        // Jacobian matrix
         float3x3 J = float3x3(
-            float3(J00, 0, J02),   // Row 0 -> Column 0
-            float3(0, J11, J12),   // Row 1 -> Column 1
-            float3(0, 0, 0)        // Row 2 -> Column 2
+            float3(J00, 0, 0),
+            float3(0, J11, 0),
+            float3(J02, J12, 0)
         );
         
-        // T = W * J (must match forward pass exactly!)
+        // T = W * J
         float3x3 T_mat = viewRot * J;
         
         // dL/dCov2D as 2x2 matrix embedded in 3x3
@@ -631,24 +628,23 @@ kernel void tiledBackward(
             float3(0, 0, 0)
         );
         
-        // For cov2D = T^T * Sigma3D * T, gradient is: dL/dSigma3D = T * dL/dCov2D * T^T
+        // For cov2D = T^T * Sigma3D * T, gradient is dL/dSigma3D = T * dL/dCov2D * T^T
         float3x3 dL_dCov3D = T_mat * dL_dCov2D_mat * transpose(T_mat);
         
         // Scale and Rotation gradients
         // Following official 3DGS: M = S * R, Sigma = M^T * M
         // This is equivalent to our R * S convention with Sigma = M * M^T
-        // but we need consistent gradient formulas
         Gaussian g_orig = gaussians[gIdx];
         float3 scale = exp(clamp(g_orig.scale, -MAX_SCALE, MAX_SCALE));
         
         // Quaternion components: q = (w, x, y, z) stored as (q.x, q.y, q.z, q.w)
         float4 q = g_orig.rotation;
-        float r = q.x;  // w component
-        float x_q = q.y;  // x component  
-        float y_q = q.z;  // y component
-        float z_q = q.w;  // z component
+        float r = q.x;
+        float x_q = q.y;
+        float y_q = q.z;
+        float z_q = q.w;
         
-        // Build rotation matrix (same as quatToMat but we need the components)
+        // Build rotation matrix
         float3x3 R = quatToMat(q);
         
         // Using M = S * R convention from official 3DGS
@@ -658,28 +654,27 @@ kernel void tiledBackward(
             float3(0, scale.y, 0),
             float3(0, 0, scale.z)
         );
-        float3x3 M = S * R;  // Official convention: S * R
+        float3x3 M = S * R; 
         
-        // For Sigma = M^T * M: dL/dM = 2 * M * dL/dSigma (note order!)
+        // For Sigma = M^T * M dL/dM = 2 * M * dL/dSigma
         float3x3 dL_dM = 2.0f * M * dL_dCov3D;
         
-        // Transpose for easier gradient computation (matching official code)
+        // Transpose for easier gradient computation
         float3x3 Rt = transpose(R);
         float3x3 dL_dMt = transpose(dL_dM);
         
-        // For M = S * R: dL/dS diagonal = R^T row i dot dL/dM^T column i
-        // Official: dL_dscale->x = glm::dot(Rt[0], dL_dMt[0]);
+        // For M = S * R dL/dS diagonal = R^T row i dot dL/dM^T column i
         float3 dL_dScale_val = float3(
             dot(Rt[0], dL_dMt[0]),
             dot(Rt[1], dL_dMt[1]),
             dot(Rt[2], dL_dMt[2])
         );
         
-        // Convert to log scale gradient: dL/d(log_s) = dL/ds * s
+        // Convert to log scale gradient dL/d(log_s) = dL/ds * s
         float3 dL_dLogScale = dL_dScale_val * scale;
         
-        // For M = S * R: dL/dR = S * dL/dM (multiply rows by scale)
-        // Prepare dL_dMt scaled by s for quaternion gradient (official approach)
+        // For M = S * R dL/dR = S * dL/dM multiply rows by scale
+        // Prepare dL_dMt scaled by s for quaternion gradient
         // dL_dMt[col] *= s[col]
         float3x3 dL_dMt_scaled = float3x3(
             dL_dMt[0] * scale.x,
@@ -687,8 +682,7 @@ kernel void tiledBackward(
             dL_dMt[2] * scale.z
         );
         
-        // Quaternion gradient using official 3DGS formulas
-        // These are derived from dR/dq for R as a function of quaternion (r,x,y,z)
+        // Quaternion gradient using 3DGS formulas
         float4 dL_dq;
         dL_dq.x = 2.0f * (z_q * (dL_dMt_scaled[0][1] - dL_dMt_scaled[1][0]) +
                          y_q * (dL_dMt_scaled[2][0] - dL_dMt_scaled[0][2]) +
@@ -709,50 +703,45 @@ kernel void tiledBackward(
                          y_q * (dL_dMt_scaled[1][2] + dL_dMt_scaled[2][1]) -
                          2.0f * z_q * (dL_dMt_scaled[1][1] + dL_dMt_scaled[0][0]));
         
-        // Per-pixel gradient clamp critical to prevent explosion
-        // A Gaussian may receive gradients from 1000s of pixels, so this must be small
-        float clampVal = 0.01f;
-        
         // Atomic accumulation
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0],
-            clamp(dL_dColor.r * SH_C0, -clampVal, clampVal), memory_order_relaxed);
+            dL_dColor.r * SH_C0, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[4],
-            clamp(dL_dColor.g * SH_C0, -clampVal, clampVal), memory_order_relaxed);
+            dL_dColor.g * SH_C0, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[8],
-            clamp(dL_dColor.b * SH_C0, -clampVal, clampVal), memory_order_relaxed);
+            dL_dColor.b * SH_C0, memory_order_relaxed);
         
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].opacity,
-            clamp(dL_dRawOpacity, -clampVal, clampVal), memory_order_relaxed);
+            dL_dRawOpacity, memory_order_relaxed);
         
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_x,
-            clamp(dL_dWorldPos.x, -clampVal, clampVal), memory_order_relaxed);
+            dL_dWorldPos.x, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_y,
-            clamp(dL_dWorldPos.y, -clampVal, clampVal), memory_order_relaxed);
+            dL_dWorldPos.y, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_z,
-            clamp(dL_dWorldPos.z, -clampVal, clampVal), memory_order_relaxed);
+            dL_dWorldPos.z, memory_order_relaxed);
         
         // Viewspace screen-space gradients for density control
-        // Official implementations uses norm of these 2D gradients for densification
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_x,
-            clamp(dL_dScreenPos.x, -clampVal, clampVal), memory_order_relaxed);
+            dL_dScreenPos.x, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_y,
-            clamp(dL_dScreenPos.y, -clampVal, clampVal), memory_order_relaxed);
+            dL_dScreenPos.y, memory_order_relaxed);
         
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_x,
-            clamp(dL_dLogScale.x, -clampVal, clampVal), memory_order_relaxed);
+            dL_dLogScale.x, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_y,
-            clamp(dL_dLogScale.y, -clampVal, clampVal), memory_order_relaxed);
+            dL_dLogScale.y, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_z,
-            clamp(dL_dLogScale.z, -clampVal, clampVal), memory_order_relaxed);
+            dL_dLogScale.z, memory_order_relaxed);
         
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 0,
-            clamp(dL_dq.x, -clampVal, clampVal), memory_order_relaxed);
+            dL_dq.x, memory_order_relaxed);
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 1,
-            clamp(dL_dq.y, -clampVal, clampVal), memory_order_relaxed);
+            dL_dq.y, memory_order_relaxed);
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 2,
-            clamp(dL_dq.z, -clampVal, clampVal), memory_order_relaxed);
+            dL_dq.z, memory_order_relaxed);
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 3,
-            clamp(dL_dq.w, -clampVal, clampVal), memory_order_relaxed);
+            dL_dq.w, memory_order_relaxed);
     }
 }
 
