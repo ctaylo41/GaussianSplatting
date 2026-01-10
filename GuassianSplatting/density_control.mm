@@ -19,26 +19,43 @@ static const int NUM_THREADS = 8;
 
 // densify_grad_threshold
 static constexpr float GRAD_THRESHOLD = 0.0002f;      
-// min_opacity
-static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  
-// percent_dense for clone vs split
-static constexpr float PERCENT_DENSE = 0.001f;         
+// min_opacity - MUST be much lower than opacity reset value (sigmoid(-4.6) = 0.01)
+// Give plenty of margin for Gaussians to recover after reset!
+static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  // Official uses 0.005
+// percent_dense for clone vs split (MUST match official: 0.01)
+static constexpr float PERCENT_DENSE = 0.01f;  // Was 0.001 - FIXED to match official!         
 static constexpr size_t MAX_GAUSSIANS = 500000;
 // Start densification
 static constexpr size_t DENSIFY_FROM_ITER = 500;      
 // Stop densification
 static constexpr size_t DENSIFY_UNTIL_ITER = 15000;   
 // Clamp scale values
-static constexpr float MAX_SCALE_LOG = 4.0f;          
+static constexpr float MAX_SCALE_LOG = 4.0f;
+// Opacity reset interval - SKIP density control around these iterations! (3000, 6000, 9000, 12000)
+static constexpr size_t OPACITY_RESET_INTERVAL = 3000;
+// Warm-up iterations after opacity reset before resuming density control
+static constexpr size_t OPACITY_RESET_WARMUP = 200;          
 
 // Scene extent set during initialization
 static float sceneExtent = 1.0f; 
+
+// Helper: check if we're within warm-up period after any opacity reset
+static bool isInOpacityResetWarmup(size_t iteration) {
+    if (iteration < OPACITY_RESET_INTERVAL) return false;
+    size_t itersSinceReset = iteration % OPACITY_RESET_INTERVAL;
+    // At exact reset iteration (0) or within WARMUP iterations after
+    return (itersSinceReset < OPACITY_RESET_WARMUP);
+} 
 
 // Approximate screen radius of a Gaussian as fraction of image width
 float computeApproxScreenRadius(const Gaussian& g,
                                  float focalLength,
                                  float avgDepth,
                                  float imageWidth) {
+    // Safety check for avgDepth to prevent division by zero or huge values
+    const float MIN_DEPTH = 0.1f;
+    float safeDepth = fmaxf(avgDepth, MIN_DEPTH);
+    
     // Get max scale in world units
     float maxScale = fmaxf(fmaxf(
         expf(std::clamp(g.scale.x, -4.0f, 4.0f)),
@@ -47,7 +64,7 @@ float computeApproxScreenRadius(const Gaussian& g,
     
     // Approximate screen radius = focal * scale / depth * multiplier
     // 3 sigma covers 99% of Gaussian, so multiply by 3
-    float screenRadius = focalLength * maxScale * 3.0f / avgDepth;
+    float screenRadius = focalLength * maxScale * 3.0f / safeDepth;
     
     // Normalize to fraction of image width
     return screenRadius / imageWidth;
@@ -135,8 +152,13 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
             float gradMag = sqrtf(grads[i].viewspace_grad_x * grads[i].viewspace_grad_x +
                                   grads[i].viewspace_grad_y * grads[i].viewspace_grad_y);
             
+            // Clamp gradient magnitude to prevent explosive accumulation
+            // This is critical around opacity reset when gradients can spike
+            const float MAX_GRAD_MAG = 1.0f;
+            gradMag = std::min(gradMag, MAX_GRAD_MAG);
+            
             // Only accumulate valid gradients
-            if (!std::isnan(gradMag) && !std::isinf(gradMag)) {
+            if (!std::isnan(gradMag) && !std::isinf(gradMag) && gradMag > 0.0f) {
                 accumGrad[i] += gradMag;
                 counts[i]++;
                 
@@ -165,11 +187,20 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
 
     DensityStats stats = {0, 0, 0};
     
-    // Check if we should densify at this iteration
-    bool canDensify = (iteration >= DENSIFY_FROM_ITER && iteration < DENSIFY_UNTIL_ITER);
+    // Skip density control during opacity reset warmup period
+    // This prevents bad decisions with post-reset low opacities
+    if (isInOpacityResetWarmup(iteration)) {
+        std::cout << "Skipping density control - opacity reset warmup (iter " << iteration << ")" << std::endl;
+        resetAccumulator(gaussianCount);
+        return stats;
+    }
     
-    // If not densifying and past densify_until_iter, skip
-    if (!canDensify && iteration >= DENSIFY_UNTIL_ITER) {
+    // Check if we should densify at this iteration
+    // Official: if iteration > opt.densify_from_iter (uses > not >=)
+    bool canDensify = (iteration > DENSIFY_FROM_ITER && iteration < DENSIFY_UNTIL_ITER);
+    
+    // If past densify_until_iter, just return
+    if (iteration >= DENSIFY_UNTIL_ITER) {
         std::cout << "Densification stopped at iteration " << iteration << std::endl;
         resetAccumulator(gaussianCount);
         return stats;
@@ -182,8 +213,11 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     uint32_t* counts = (uint32_t*)gradientCount->contents();
     simd_float3* posGradAccum = (simd_float3*)positionGradAccum->contents();
     
-    // Viewspace pruning threshold 20% of image width
-    const float maxScreenFraction = 0.2f;
+    // Official: size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+    // Screen-based pruning only enabled AFTER first opacity reset (iter > 3000)
+    // Using 40 pixels instead of 20 to be more conservative (we approximate screen radius)
+    const float maxScreenPixels = 40.0f;
+    const bool enableScreenPruning = (iteration > OPACITY_RESET_INTERVAL);
     
     // Per-thread counters for parallel first pass
     static uint32_t threadPruned[NUM_THREADS];
@@ -195,8 +229,8 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     memset(threadCloned, 0, sizeof(threadCloned));
     memset(threadSplit, 0, sizeof(threadSplit));
     
-    // Capture locals for block
-    const float splitThreshold = 0.01f * sceneExtent;
+    // Capture locals for block - now using correct PERCENT_DENSE = 0.01
+    const float splitThreshold = PERCENT_DENSE * sceneExtent;
     const float pruneThreshold = 0.1f * sceneExtent;
     
     // Parallel first pass to decide prune/clone/split
@@ -227,18 +261,28 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
                 expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG))),
                 expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG)));
             
-            // Decision logic (matches official 3DGS densify_and_prune)
+            // ============================================
+            // PRUNE LOGIC (matching official densify_and_prune)
+            // ============================================
+            // Official: prune_mask = (self.get_opacity < min_opacity).squeeze()
             bool shouldPrune = (opacity < OPACITY_PRUNE_THRESHOLD);
             
-            // Also prune Gaussians that are too large in world space
-            if (maxScaleVal > pruneThreshold) {
-                shouldPrune = true;
-            }
-            
-            // Viewspace-based pruning prune Gaussians with large screen-space footprints
-            float screenFraction = computeApproxScreenRadius(g, focalLength, avgDepth, imageWidth);
-            if (screenFraction > maxScreenFraction) {
-                shouldPrune = true;
+            // Official (when max_screen_size is set, i.e., after iter 3000):
+            //   big_points_vs = self.max_radii2D > max_screen_size
+            //   big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            //   prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            if (enableScreenPruning) {
+                // Prune based on world-space scale (always, after iter 3000)
+                if (maxScaleVal > pruneThreshold) {
+                    shouldPrune = true;
+                }
+                
+                // Prune based on screen radius (approximation of max_radii2D > 20)
+                float screenFraction = computeApproxScreenRadius(g, focalLength, avgDepth, imageWidth);
+                float screenRadiusPixels = screenFraction * imageWidth;
+                if (screenRadiusPixels > maxScreenPixels) {
+                    shouldPrune = true;
+                }
             }
             
             // Mark accordingly and prune
@@ -327,37 +371,16 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             newPositions[writeIdx] = g.position;
             writeIdx++;
         } else if (marker == 2) {
-            // Clone Keep original
+            // Clone: Keep original
             newGaussians[writeIdx] = g;
             newPositions[writeIdx] = g.position;
             writeIdx++;
             
-            // Create clone moved in gradient direction
+            // Official implementation: clone is IDENTICAL copy at same position
+            // The optimizer naturally moves them apart during gradient descent
             Gaussian cloned = g;
             
-            // Get accumulated position gradient
-            simd_float3 posGrad = posGradAccum[i];
-            float gradNorm = sqrtf(posGrad.x * posGrad.x + posGrad.y * posGrad.y + posGrad.z * posGrad.z);
-            
-            if (gradNorm > 1e-8f) {
-                // Normalize and scale by actual Gaussian size
-                float actualScale = expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG));
-                // Move by 2x the Gaussian's scale
-                float moveDistance = actualScale * 2.0f;  
-                
-                // Move along gradient direction
-                cloned.position.x += (posGrad.x / gradNorm) * moveDistance;
-                cloned.position.y += (posGrad.y / gradNorm) * moveDistance;
-                cloned.position.z += (posGrad.z / gradNorm) * moveDistance;
-            } else {
-                // small random perturbation proportional to scale
-                float actualScale = expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG));
-                cloned.position.x += actualScale * ((float)rand() / RAND_MAX - 0.5f);
-                cloned.position.y += actualScale * ((float)rand() / RAND_MAX - 0.5f);
-                cloned.position.z += actualScale * ((float)rand() / RAND_MAX - 0.5f);
-            }
-            
-            // Write clone
+            // Write clone at same position (matching official behavior)
             newGaussians[writeIdx] = cloned;
             newPositions[writeIdx] = cloned.position;
             writeIdx++;

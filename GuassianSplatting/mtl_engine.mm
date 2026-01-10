@@ -110,8 +110,27 @@ void MTLEngine::run(Camera& camera) {
             
             // Density control application
             if (totalIterations % densityControlInterval == 0 && totalIterations > 500) {
+                // Get camera parameters for screen-space pruning
+                // Use scaled intrinsics to match actual training texture resolution
+                const TrainingImage& currentImg = trainingImages[currentImageIdx];
+                const ColmapCamera& cam = colmapData.cameras.at(currentImg.cameraId);
+                
+                uint32_t actualWidth = currentImg.texture->width();
+                float scaleX = (float)actualWidth / (float)cam.width;
+                
+                // Scale focal length to match actual training resolution
+                float focalLength = cam.fx * scaleX;
+                float imageWidth = (float)actualWidth;
+                float avgDepth = sceneExtent;
+                
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
-                                         nullptr, gaussianCount, totalIterations);
+                                         nullptr, gaussianCount, totalIterations,
+                                         0.0002f,
+                                         0.003f,  // min_opacity: must be lower than reset value (0.01)
+                                         0.1f * sceneExtent,
+                                         focalLength,
+                                         imageWidth,
+                                         avgDepth);
                 
                 // Reallocate gradients buffer if needed
                 if (gaussianGradients->length() < gaussianCount * sizeof(GaussianGradients)) {
@@ -289,7 +308,8 @@ void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians, float scen
         std::cout << "WARNING: Using point cloud extent (fallback): " << sceneExtent << std::endl;
     }
     
-    // Set scene extent in density controller
+    // Store and set scene extent for density control
+    this->sceneExtent = sceneExtent;
     std::cout << "Density control using scene extent: " << sceneExtent << std::endl;
     DensityController::setSceneExtent(sceneExtent);
     
@@ -1078,41 +1098,50 @@ void MTLEngine::train(size_t numEpochs) {
                           << "] Loss: " << (epochLoss / (imgIdx + 1)) << std::flush;
             }
             
-            // Opacity reset every OPACITY_RESET_INTERVAL iterations before DENSIFY_UNTIL_ITER 
-            if (totalIterations % OPACITY_RESET_INTERVAL == 0 && 
-                totalIterations > 0 && 
-                totalIterations < DENSIFY_UNTIL_ITER) {
-                std::cout << std::endl << "Resetting opacity at iteration " << totalIterations << std::endl;
-                
-                // Clamp opacities in Gaussian buffer
-                Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
-                for (size_t i = 0; i < gaussianCount; i++) {
-                    // Clamp opacity to max 0.01: min(current, sigmoid^-1(0.01))
-                    // This keeps already-low opacities unchanged but caps high ones
-                    if (gaussians[i].opacity > OPACITY_RESET_VALUE) {
-                        gaussians[i].opacity = OPACITY_RESET_VALUE;
-                    }
-                }
-                
-                // Reset optimizer momentum for opacity to allow fresh learning
-                optimizer->resetOpacityMomentum();
-            }
+            // ============================================
+            // DENSITY CONTROL (must happen BEFORE opacity reset - matching official order!)
+            // ============================================
+            // Official logic: size_threshold = 20 if iteration > opacity_reset_interval else None
+            // Note: uses > not >= so at iter 3000, size_threshold is still None
+            bool enableScreenPruning = (totalIterations > OPACITY_RESET_INTERVAL);
             
-            // Check if we're within 500 iterations after ANY opacity reset (3000, 6000, 9000, 12000)
-            size_t itersSinceLastReset = totalIterations % OPACITY_RESET_INTERVAL;
-            bool justAfterReset = (totalIterations >= OPACITY_RESET_INTERVAL && 
-                                   itersSinceLastReset > 0 && 
-                                   itersSinceLastReset <= 500);
-            // Density control condition
-            bool shouldDensify = (totalIterations >= DENSIFY_FROM_ITER &&
+            // Density control condition (matching official train.py)
+            // Official: if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0
+            bool shouldDensify = (totalIterations > DENSIFY_FROM_ITER &&
                                   totalIterations < DENSIFY_UNTIL_ITER &&
-                                  totalIterations % densityControlInterval == 0 &&
-                                  !justAfterReset);
+                                  totalIterations % densityControlInterval == 0);
             
             // Apply density control if needed
             if (shouldDensify) {
+                // Get camera parameters for screen-space pruning
+                const TrainingImage& currentImg = trainingImages[imgIdx];
+                const ColmapCamera& cam = colmapData.cameras.at(currentImg.cameraId);
+                
+                uint32_t actualWidth = currentImg.texture->width();
+                float scaleX = (float)actualWidth / (float)cam.width;
+                float focalLength = cam.fx * scaleX;
+                float imageWidth = (float)actualWidth;
+                // Use conservative avgDepth to prevent over-aggressive screen pruning
+                float avgDepth = 2.0f * sceneExtent;
+
+                if (totalIterations % 1000 == 0) {
+                    std::cout << "Density params: fx=" << focalLength 
+                            << " width=" << imageWidth 
+                            << " avgDepth=" << avgDepth 
+                            << " sceneExtent=" << sceneExtent 
+                            << " screenPrune=" << (enableScreenPruning ? "ON" : "OFF") << std::endl;
+                }
+                
+                // Pass enableScreenPruning to density controller
+                // Official uses size_threshold=20 pixels when enabled
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
-                                         nullptr, gaussianCount, totalIterations);
+                                         nullptr, gaussianCount, totalIterations,
+                                         0.0002f,
+                                         0.005f,  // min_opacity: official uses 0.005
+                                         0.1f * sceneExtent,
+                                         focalLength,
+                                         imageWidth,
+                                         avgDepth);
                 
                 // Resize gradient buffer if needed
                 if (gaussianGradients->length() < gaussianCount * sizeof(GaussianGradients)) {
@@ -1125,6 +1154,31 @@ void MTLEngine::train(size_t numEpochs) {
                 if (optimizer) {
                     optimizer->resizeIfNeeded(gaussianCount);
                 }
+            }
+            
+            // ============================================
+            // OPACITY RESET (must happen AFTER density control - matching official order!)
+            // ============================================
+            if (totalIterations % OPACITY_RESET_INTERVAL == 0 && 
+                totalIterations > 0 && 
+                totalIterations < DENSIFY_UNTIL_ITER) {
+                std::cout << std::endl << "Resetting opacity at iteration " << totalIterations << std::endl;
+                
+                // Clamp opacities in Gaussian buffer
+                Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
+                for (size_t i = 0; i < gaussianCount; i++) {
+                    // Clamp opacity to max 0.01: min(current, sigmoid^-1(0.01))
+                    if (gaussians[i].opacity > OPACITY_RESET_VALUE) {
+                        gaussians[i].opacity = OPACITY_RESET_VALUE;
+                    }
+                }
+                
+                // Reset optimizer momentum for opacity to allow fresh learning
+                optimizer->resetOpacityMomentum();
+                
+                // Reset gradient accumulators after opacity reset
+                // This ensures next densification uses fresh post-reset gradients
+                densityController->resetAccumulator(gaussianCount);
             }
             
             pool->release();

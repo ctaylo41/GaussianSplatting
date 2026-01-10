@@ -165,6 +165,7 @@ private:
     AdamOptimizer* optimizer = nullptr;
     DensityController* densityController = nullptr;
     size_t densityControlInterval = 100;
+    float sceneExtent = 1.0f;  // Scene extent for density control thresholds
     
     // Training state
     bool isTraining = false;

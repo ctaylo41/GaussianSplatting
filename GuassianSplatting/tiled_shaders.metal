@@ -184,10 +184,10 @@ kernel void projectGaussians(
         float3(0, scale.y, 0),
         float3(0, 0, scale.z)
     );
-    // Official 3DGS convention: M = S * R
-    float3x3 M = S * R;  
-    // Sigma = M^T * M = (S * R)^T * (S * R) = R^T * S^2 * R
-    float3x3 Sigma3D = transpose(M) * M;  
+    // Viewer/paper convention: M = R * S
+    float3x3 M = R * S;
+    // Sigma = M * M^T
+    float3x3 Sigma3D = M * transpose(M);
     
     // View space projection using same approach as official 3DGS
     float z_cam = viewPos.z;
@@ -219,11 +219,10 @@ kernel void projectGaussians(
                           uniforms.viewMatrix[1].xyz,
                           uniforms.viewMatrix[2].xyz);
     
-    // Combined transform T = W * J (official 3DGS convention)
-    float3x3 T = W * J;
-    
-    // Project 3D covariance to 2D cov2D = T^T * Sigma3D * T (official formula)
-    float3x3 cov2D_mat = transpose(T) * Sigma3D * T;
+    // Combined transform T = J * W (matches paper and viewer)
+    float3x3 T = J * W;
+    // Project 3D covariance to 2D cov2D = T * Sigma3D * T^T (matches paper and viewer)
+    float3x3 cov2D_mat = T * Sigma3D * transpose(T);
     
     // Extract 2D covariance components
     float a = cov2D_mat[0][0];  
@@ -597,9 +596,9 @@ kernel void tiledBackward(
                                           + cov_a * cov_b * dL_dConic.z);
         
         // Cov3D gradient
-        // Forward: cov2D = T^T * Sigma3D * T where T = W * J
-        // Gradient: for Y = A^T * X * A, dL/dX = A * dL/dY * A^T
-        // So: dL/dSigma3D = T * dL/dCov2D * T^T
+        // Forward: cov2D = T * Sigma3D * T^T where T = J * W
+        // Gradient: for Y = A * X * A^T, dL/dX = A^T * dL/dY * A
+        // So: dL/dSigma3D = T^T * dL/dCov2D * T
         float3 t_cam = float3(p.viewPos_xy, p.depth);
         txtz = t_cam.x / t_cam.z;
         tytz = t_cam.y / t_cam.z;
@@ -617,8 +616,8 @@ kernel void tiledBackward(
             float3(J02, J12, 0)
         );
         
-        // T = W * J
-        float3x3 T_mat = viewRot * J;
+        // T = J * viewRot (matches paper and viewer)
+        float3x3 T_mat = J * viewRot;
         
         // dL/dCov2D as 2x2 matrix embedded in 3x3
         // Extend to 3x3 with zeros for the third row/col
@@ -628,12 +627,11 @@ kernel void tiledBackward(
             float3(0, 0, 0)
         );
         
-        // For cov2D = T^T * Sigma3D * T, gradient is dL/dSigma3D = T * dL/dCov2D * T^T
-        float3x3 dL_dCov3D = T_mat * dL_dCov2D_mat * transpose(T_mat);
+        // For cov2D = T * Sigma3D * T^T, gradient is dL/dSigma3D = T^T * dL/dCov2D * T
+        float3x3 dL_dCov3D = transpose(T_mat) * dL_dCov2D_mat * T_mat;
         
         // Scale and Rotation gradients
-        // Following official 3DGS: M = S * R, Sigma = M^T * M
-        // This is equivalent to our R * S convention with Sigma = M * M^T
+        // Using convention: M = R * S, Sigma = M * M^T
         Gaussian g_orig = gaussians[gIdx];
         float3 scale = exp(clamp(g_orig.scale, -MAX_SCALE, MAX_SCALE));
         
@@ -647,40 +645,34 @@ kernel void tiledBackward(
         // Build rotation matrix
         float3x3 R = quatToMat(q);
         
-        // Using M = S * R convention from official 3DGS
+        // Viewer/paper convention: M = R * S
         // S is diagonal scale matrix
         float3x3 S = float3x3(
             float3(scale.x, 0, 0),
             float3(0, scale.y, 0),
             float3(0, 0, scale.z)
         );
-        float3x3 M = S * R; 
+        float3x3 M = R * S;
         
-        // For Sigma = M^T * M dL/dM = 2 * M * dL/dSigma
-        float3x3 dL_dM = 2.0f * M * dL_dCov3D;
+        // For Sigma = M * M^T, correct gradient is dL/dM = 2 * dL/dSigma * M
+        float3x3 dL_dM = 2.0f * dL_dCov3D * M;
         
-        // Transpose for easier gradient computation
+        // For M = R * S: dL/dS = R^T * dL/dM, extract diagonal
         float3x3 Rt = transpose(R);
-        float3x3 dL_dMt = transpose(dL_dM);
-        
-        // For M = S * R dL/dS diagonal = R^T row i dot dL/dM^T column i
-        float3 dL_dScale_val = float3(
-            dot(Rt[0], dL_dMt[0]),
-            dot(Rt[1], dL_dMt[1]),
-            dot(Rt[2], dL_dMt[2])
-        );
+        float3x3 Rt_dLdM = Rt * dL_dM;
+        float3 dL_dScale_val = float3(Rt_dLdM[0][0], Rt_dLdM[1][1], Rt_dLdM[2][2]);
         
         // Convert to log scale gradient dL/d(log_s) = dL/ds * s
         float3 dL_dLogScale = dL_dScale_val * scale;
         
-        // For M = S * R dL/dR = S * dL/dM multiply rows by scale
-        // Prepare dL_dMt scaled by s for quaternion gradient
-        // dL_dMt[col] *= s[col]
-        float3x3 dL_dMt_scaled = float3x3(
-            dL_dMt[0] * scale.x,
-            dL_dMt[1] * scale.y,
-            dL_dMt[2] * scale.z
+        // For M = R * S: dL/dR = dL/dM * S (scale columns of dL/dM)
+        float3x3 dL_dR = float3x3(
+            dL_dM[0] * scale.x,   // Column 0 * s_x
+            dL_dM[1] * scale.y,   // Column 1 * s_y
+            dL_dM[2] * scale.z    // Column 2 * s_z
         );
+        // Transpose for quaternion gradient formula compatibility
+        float3x3 dL_dMt_scaled = transpose(dL_dR);
         
         // Quaternion gradient using 3DGS formulas
         float4 dL_dq;
