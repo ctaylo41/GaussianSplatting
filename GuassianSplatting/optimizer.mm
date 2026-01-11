@@ -139,6 +139,54 @@ void AdamOptimizer::resetOpacityMomentum() {
     memset(v_opacity->contents(), 0, numGaussians * sizeof(float));
 }
 
+// Reset scale momentum after opacity reset (landscape changes dramatically)
+void AdamOptimizer::resetScaleMomentum() {
+    memset(m_scale->contents(), 0, numGaussians * 3 * sizeof(float));
+    memset(v_scale->contents(), 0, numGaussians * 3 * sizeof(float));
+    std::cout << "Reset scale momentum after opacity reset" << std::endl;
+}
+
+// Reset Adam state for Gaussians starting at index 'startIdx' (after split/clone)
+void AdamOptimizer::resetStateForNewGaussians(size_t startIdx) {
+    if (startIdx >= numGaussians) return;
+    
+    size_t numNew = numGaussians - startIdx;
+    
+    // Zero position momentum for new Gaussians
+    float* m_pos = (float*)m_position->contents();
+    float* v_pos = (float*)v_position->contents();
+    memset(m_pos + startIdx * 3, 0, numNew * 3 * sizeof(float));
+    memset(v_pos + startIdx * 3, 0, numNew * 3 * sizeof(float));
+    
+    // Zero scale momentum
+    float* m_scl = (float*)m_scale->contents();
+    float* v_scl = (float*)v_scale->contents();
+    memset(m_scl + startIdx * 3, 0, numNew * 3 * sizeof(float));
+    memset(v_scl + startIdx * 3, 0, numNew * 3 * sizeof(float));
+    
+    // Zero rotation momentum
+    simd_float4* m_rot = (simd_float4*)m_rotation->contents();
+    simd_float4* v_rot = (simd_float4*)v_rotation->contents();
+    for (size_t i = startIdx; i < numGaussians; i++) {
+        m_rot[i] = simd_make_float4(0, 0, 0, 0);
+        v_rot[i] = simd_make_float4(0, 0, 0, 0);
+    }
+    
+    // Zero opacity momentum
+    float* m_op = (float*)m_opacity->contents();
+    float* v_op = (float*)v_opacity->contents();
+    memset(m_op + startIdx, 0, numNew * sizeof(float));
+    memset(v_op + startIdx, 0, numNew * sizeof(float));
+    
+    // Zero SH momentum
+    float* m_sh_ptr = (float*)m_sh->contents();
+    float* v_sh_ptr = (float*)v_sh->contents();
+    memset(m_sh_ptr + startIdx * 12, 0, numNew * 12 * sizeof(float));
+    memset(v_sh_ptr + startIdx * 12, 0, numNew * 12 * sizeof(float));
+    
+    std::cout << "Reset Adam state for " << numNew << " new Gaussians starting at " << startIdx << std::endl;
+}
+
 // Debug print Adam state for a specific Gaussian
 void AdamOptimizer::debugPrintState(int idx) {
     // Get state pointers

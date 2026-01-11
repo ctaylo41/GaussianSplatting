@@ -91,6 +91,7 @@ private:
     MTL::ComputePipelineState* scatter64SimplePSO;
     MTL::ComputePipelineState* scatter64OptimizedPSO;
     MTL::ComputePipelineState* clearHistogramPSO;
+    MTL::ComputePipelineState* computeLocalRanks64PSO;
     
     // Double-buffered arrays
     MTL::Buffer* keysBuffers[2];
@@ -99,6 +100,7 @@ private:
     // Histogram
     MTL::Buffer* histogramBuffer;
     MTL::Buffer* digitCountersBuffer;
+    MTL::Buffer* localRanksBuffer;  // For scatter64Simple
     
     void createPipelines(MTL::Library* library);
     void ensureCapacity(size_t numElements);

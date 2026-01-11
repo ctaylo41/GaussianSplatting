@@ -254,6 +254,9 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         // The GPU clear was potentially racing with histogram32
         memset(histogramBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
         
+        // Clear digit counters for scatter phase
+        memset(digitCountersBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
+        
         cmdBuffer = queue->commandBuffer();
         
         // Build histogram
@@ -316,9 +319,10 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
             enc->setBuffer(valuesBuffers[srcIdx], 0, 1);
             enc->setBuffer(keysBuffers[dstIdx], 0, 2);
             enc->setBuffer(valuesBuffers[dstIdx], 0, 3);
-            enc->setBuffer(histogramBuffer, 0, 4);
-            enc->setBytes(&bitOffset, sizeof(uint32_t), 5);
-            enc->setBytes(&numElementsU32, sizeof(uint32_t), 6);
+            enc->setBuffer(histogramBuffer, 0, 4);  // prefixSums (read-only)
+            enc->setBuffer(digitCountersBuffer, 0, 5);  // digitCounters (atomic)
+            enc->setBytes(&bitOffset, sizeof(uint32_t), 6);
+            enc->setBytes(&numElementsU32, sizeof(uint32_t), 7);
             
             MTL::Size grid = MTL::Size(numElements, 1, 1);
             MTL::Size tg = MTL::Size(THREADGROUP_SIZE, 1, 1);
@@ -396,6 +400,8 @@ GPURadixSort64::GPURadixSort64(MTL::Device* device, MTL::Library* library, size_
                                         MTL::ResourceStorageModeShared);
     digitCountersBuffer = device->newBuffer(RADIX_SIZE * sizeof(uint32_t),
                                             MTL::ResourceStorageModeShared);
+    localRanksBuffer = device->newBuffer(maxElements * sizeof(uint32_t),
+                                         MTL::ResourceStorageModeShared);
 }
 
 // Destructor
@@ -406,12 +412,14 @@ GPURadixSort64::~GPURadixSort64() {
     if (valuesBuffers[1]) valuesBuffers[1]->release();
     if (histogramBuffer) histogramBuffer->release();
     if (digitCountersBuffer) digitCountersBuffer->release();
+    if (localRanksBuffer) localRanksBuffer->release();
     
     if (histogram64PSO) histogram64PSO->release();
     if (prefixSum256PSO) prefixSum256PSO->release();
     if (scatter64SimplePSO) scatter64SimplePSO->release();
     if (scatter64OptimizedPSO) scatter64OptimizedPSO->release();
     if (clearHistogramPSO) clearHistogramPSO->release();
+    if (computeLocalRanks64PSO) computeLocalRanks64PSO->release();
 }
 
 // Create compute pipelines
@@ -421,6 +429,7 @@ void GPURadixSort64::createPipelines(MTL::Library* library) {
     scatter64SimplePSO = createPipeline(device, library, "scatter64Simple");
     scatter64OptimizedPSO = createPipeline(device, library, "scatter64Optimized");
     clearHistogramPSO = createPipeline(device, library, "clearHistogram");
+    computeLocalRanks64PSO = createPipeline(device, library, "computeLocalRanks64");
 }
 
 // Ensure capacity of buffers
@@ -441,6 +450,11 @@ void GPURadixSort64::ensureCapacity(size_t numElements) {
     valuesBuffers[0] = device->newBuffer(maxElements * sizeof(uint32_t),
                                          MTL::ResourceStorageModeShared);
     valuesBuffers[1] = device->newBuffer(maxElements * sizeof(uint32_t),
+                                         MTL::ResourceStorageModeShared);
+    
+    // Reallocate localRanksBuffer if needed
+    if (localRanksBuffer) localRanksBuffer->release();
+    localRanksBuffer = device->newBuffer(maxElements * sizeof(uint32_t),
                                          MTL::ResourceStorageModeShared);
 }
 
@@ -500,6 +514,25 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
             }
         }
         
+        // Compute local ranks for scatter
+        cmdBuffer = queue->commandBuffer();
+        {
+            MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
+            enc->setComputePipelineState(computeLocalRanks64PSO);
+            enc->setBuffer(keysBuffers[srcIdx], 0, 0);
+            enc->setBuffer(localRanksBuffer, 0, 1);
+            enc->setBytes(&bitOffset, sizeof(uint32_t), 2);
+            enc->setBytes(&numElementsU32, sizeof(uint32_t), 3);
+            
+            MTL::Size grid = MTL::Size(numElements, 1, 1);
+            MTL::Size tg = MTL::Size(THREADGROUP_SIZE, 1, 1);
+            enc->dispatchThreads(grid, tg);
+            enc->endEncoding();
+        }
+        
+        cmdBuffer->commit();
+        cmdBuffer->waitUntilCompleted();
+        
         // Scatter
         cmdBuffer = queue->commandBuffer();
         {
@@ -510,8 +543,9 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
             enc->setBuffer(keysBuffers[dstIdx], 0, 2);
             enc->setBuffer(valuesBuffers[dstIdx], 0, 3);
             enc->setBuffer(histogramBuffer, 0, 4);
-            enc->setBytes(&bitOffset, sizeof(uint32_t), 5);
-            enc->setBytes(&numElementsU32, sizeof(uint32_t), 6);
+            enc->setBuffer(localRanksBuffer, 0, 5);
+            enc->setBytes(&bitOffset, sizeof(uint32_t), 6);
+            enc->setBytes(&numElementsU32, sizeof(uint32_t), 7);
             
             MTL::Size grid = MTL::Size(numElements, 1, 1);
             MTL::Size tg = MTL::Size(THREADGROUP_SIZE, 1, 1);

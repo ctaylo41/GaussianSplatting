@@ -4,8 +4,16 @@
 //
 //  Created by Colin Taylor Taylor on 2025-12-31.
 //
+// GPU Radix Sort Implementation for Gaussian Splatting
+//
+// FIXED BUGS (Jan 10, 2026):
+// 1. scatter32Simple: Now uses separate digitCounters buffer to avoid corrupting
+//    prefixSums across multiple passes
+// 2. Added computeLocalRanks64 kernel for scatter64Simple to compute position
+//    within digit buckets
+// 3. Fixed scatterOptimized32 to use localDigits array and proper local position
+//    calculation instead of O(n²) loop through localSortedKeys
 
-// BROKEN
 #include <metal_stdlib>
 using namespace metal;
 
@@ -163,17 +171,18 @@ kernel void prefixSum256(
     }
 }
 
-// Scater32 Simple O(1) per thread using atomic counters
-// Uses atomic_fetch_add to get unique write positions
+// Scatter32 Simple - Fixed to not corrupt prefix sums
+// Uses digitCounters for atomic increments, prefixSums for base offsets
 
 kernel void scatter32Simple(
     device const uint* keysIn [[buffer(0)]],
     device const uint* valuesIn [[buffer(1)]],
     device uint* keysOut [[buffer(2)]],
     device uint* valuesOut [[buffer(3)]],
-    device atomic_uint* prefixSums [[buffer(4)]],
-    constant uint& bitOffset [[buffer(5)]],
-    constant uint& numElements [[buffer(6)]],
+    device const uint* prefixSums [[buffer(4)]],
+    device atomic_uint* digitCounters [[buffer(5)]],
+    constant uint& bitOffset [[buffer(6)]],
+    constant uint& numElements [[buffer(7)]],
     uint id [[thread_position_in_grid]])
 {
     if (id >= numElements) return;
@@ -183,9 +192,10 @@ kernel void scatter32Simple(
     uint value = valuesIn[id];
     uint digit = (key >> bitOffset) & 0xFF;
     
-    // Use atomic fetch-add to get unique write position
-    // This is O(1) per thread instead of O(n) per thread
-    uint writePos = atomic_fetch_add_explicit(&prefixSums[digit], 1, memory_order_relaxed);
+    // Get base position from prefix sum and increment counter atomically
+    // This preserves prefixSums for next pass
+    uint offset = atomic_fetch_add_explicit(&digitCounters[digit], 1, memory_order_relaxed);
+    uint writePos = prefixSums[digit] + offset;
     
     // Bounds check before writing
     if (writePos < numElements) {
@@ -202,6 +212,33 @@ kernel void clearHistogram(
     if (id < RADIX_SIZE) {
         atomic_store_explicit(&histogram[id], 0, memory_order_relaxed);
     }
+}
+
+// Compute local ranks for scatter64Simple
+// Each thread computes its position within its digit bucket
+kernel void computeLocalRanks64(
+    device const ulong* keys [[buffer(0)]],
+    device uint* localRanks [[buffer(1)]],
+    constant uint& bitOffset [[buffer(2)]],
+    constant uint& numElements [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= numElements) return;
+    
+    ulong key = keys[id];
+    uint digit = (key >> bitOffset) & 0xFF;
+    
+    // Count how many elements with same digit come before this one
+    uint rank = 0;
+    for (uint i = 0; i < id; i++) {
+        ulong otherKey = keys[i];
+        uint otherDigit = (otherKey >> bitOffset) & 0xFF;
+        if (otherDigit == digit) {
+            rank++;
+        }
+    }
+    
+    localRanks[id] = rank;
 }
 
 // 64-BIT RADIX SORT for tile + depth compound keys
@@ -332,24 +369,27 @@ kernel void scatterOptimized32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Write to global memory
-    if (valid && tid < THREADGROUP_SIZE) {
-        uint myKey = localSortedKeys[tid];
-        uint myVal = localSortedValues[tid];
-        uint sortedDigit = (myKey >> bitOffset) & 0xFF;
+    // Write to global memory using proper position calculation
+    if (valid) {
+        // Find my position within my digit bucket in this threadgroup
+        uint myDigit = digit;
+        uint myLocalPos = 0;
         
-        // Count how many of this digit came before this position
-        uint posInDigit = 0;
+        // Count how many elements with same digit came before me in threadgroup
         for (uint i = 0; i < tid; i++) {
-            if (((localSortedKeys[i] >> bitOffset) & 0xFF) == sortedDigit) {
-                posInDigit++;
+            if (i < tgSize) {
+                uint otherDigit = localDigits[i];
+                if (otherDigit == myDigit) {
+                    myLocalPos++;
+                }
             }
         }
-        // Compute global position
-        uint globalPos = globalBaseOffsets[sortedDigit] + posInDigit;
+        
+        // Compute global position: global base for my digit + my local position
+        uint globalPos = globalBaseOffsets[myDigit] + myLocalPos;
         if (globalPos < numElements) {
-            keysOut[globalPos] = myKey;
-            valuesOut[globalPos] = myVal;
+            keysOut[globalPos] = key;
+            valuesOut[globalPos] = value;
         }
     }
 }

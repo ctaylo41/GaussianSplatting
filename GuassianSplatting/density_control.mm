@@ -24,7 +24,7 @@ static constexpr float GRAD_THRESHOLD = 0.0002f;
 static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  // Official uses 0.005
 // percent_dense for clone vs split (MUST match official: 0.01)
 static constexpr float PERCENT_DENSE = 0.01f;  // Was 0.001 - FIXED to match official!         
-static constexpr size_t MAX_GAUSSIANS = 500000;
+static constexpr size_t MAX_GAUSSIANS = 1000000;
 // Start densification
 static constexpr size_t DENSIFY_FROM_ITER = 500;      
 // Stop densification
@@ -34,17 +34,22 @@ static constexpr float MAX_SCALE_LOG = 4.0f;
 // Opacity reset interval - SKIP density control around these iterations! (3000, 6000, 9000, 12000)
 static constexpr size_t OPACITY_RESET_INTERVAL = 3000;
 // Warm-up iterations after opacity reset before resuming density control
-static constexpr size_t OPACITY_RESET_WARMUP = 200;          
+// Set to 0 to match official (they have no warmup)
+static constexpr size_t OPACITY_RESET_WARMUP = 0;          
 
 // Scene extent set during initialization
 static float sceneExtent = 1.0f; 
 
 // Helper: check if we're within warm-up period after any opacity reset
+// With OPACITY_RESET_WARMUP = 0, this always returns false (matching official)
 static bool isInOpacityResetWarmup(size_t iteration) {
+    if (OPACITY_RESET_WARMUP == 0) return false;  // No warmup - match official
     if (iteration < OPACITY_RESET_INTERVAL) return false;
     size_t itersSinceReset = iteration % OPACITY_RESET_INTERVAL;
-    // At exact reset iteration (0) or within WARMUP iterations after
-    return (itersSinceReset < OPACITY_RESET_WARMUP);
+    // Key fix: AT the reset iteration (itersSinceReset == 0),
+    // we MUST run density control + prune BEFORE reset
+    // Warmup only applies to iterations AFTER reset (1 to WARMUP-1)
+    return (itersSinceReset > 0 && itersSinceReset < OPACITY_RESET_WARMUP);
 } 
 
 // Approximate screen radius of a Gaussian as fraction of image width

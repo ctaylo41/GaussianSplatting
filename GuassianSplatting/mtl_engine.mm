@@ -1062,7 +1062,9 @@ void MTLEngine::train(size_t numEpochs) {
     // Back to official value - need Gaussians to shrink for sharpness
     const float SCALE_LR = 0.005f;  
     const float ROTATION_LR = 0.001f;
-    const float OPACITY_LR = 0.05f;
+    // Match official: opacity_lr = 0.025 (was 0.05, 2x too fast)
+    // Slower opacity recovery gives colors time to converge before becoming visible
+    const float OPACITY_LR = 0.025f;
     const float SH_LR = 0.0025f;
     
     // Total iterations for LR scheduling
@@ -1132,6 +1134,9 @@ void MTLEngine::train(size_t numEpochs) {
                             << " screenPrune=" << (enableScreenPruning ? "ON" : "OFF") << std::endl;
                 }
                 
+                // Save count BEFORE density control to detect new Gaussians
+                size_t oldCount = gaussianCount;
+                
                 // Pass enableScreenPruning to density controller
                 // Official uses size_threshold=20 pixels when enabled
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
@@ -1153,6 +1158,12 @@ void MTLEngine::train(size_t numEpochs) {
                 // Resize optimizer buffers if needed
                 if (optimizer) {
                     optimizer->resizeIfNeeded(gaussianCount);
+                    
+                    // Reset Adam state for new Gaussians (split/clone)
+                    // New Gaussians should start with zeroed momentum
+                    if (gaussianCount > oldCount) {
+                        optimizer->resetStateForNewGaussians(oldCount);
+                    }
                 }
             }
             
@@ -1173,11 +1184,10 @@ void MTLEngine::train(size_t numEpochs) {
                     }
                 }
                 
-                // Reset optimizer momentum for opacity to allow fresh learning
+                // Reset optimizer momentum for opacity AND scale
                 optimizer->resetOpacityMomentum();
+                optimizer->resetScaleMomentum();
                 
-                // Reset gradient accumulators after opacity reset
-                // This ensures next densification uses fresh post-reset gradients
                 densityController->resetAccumulator(gaussianCount);
             }
             

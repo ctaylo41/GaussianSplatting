@@ -48,6 +48,12 @@ public:
     // Reset opacity momentum after opacity reset
     void resetOpacityMomentum();
     
+    // Reset scale momentum after opacity reset (optimization landscape changes)
+    void resetScaleMomentum();
+    
+    // Reset Adam state for new Gaussians starting at startIdx (after split/clone)
+    void resetStateForNewGaussians(size_t startIdx);
+    
     // Debug print Adam state for first Gaussian
     void debugPrintState(int gaussianIdx = 0);
     
