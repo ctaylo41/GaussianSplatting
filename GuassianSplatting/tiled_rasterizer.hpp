@@ -10,6 +10,7 @@
 #include <simd/simd.h>
 #include "ply_loader.hpp"
 #include "gradients.hpp"
+#include "gpu_sort.hpp"
 
 // Must match shader definition exactly
 struct TileRange {
@@ -78,8 +79,9 @@ private:
     // Average Gaussians touch ~4-8 tiles
     static constexpr uint32_t AVG_TILES_PER_GAUSSIAN = 8;
     
-    // Metal device
+    // Metal device and library
     MTL::Device* device;
+    MTL::Library* library;
     
     // Compute pipelines
     MTL::ComputePipelineState* projectGaussiansPSO;
@@ -97,7 +99,11 @@ private:
     MTL::Buffer* perPixelLastIdx;
     MTL::Buffer* uniformBuffer;
     // Atomic counter for GPU pair generation
-    MTL::Buffer* pairCounterBuffer;  
+    MTL::Buffer* pairCounterBuffer;
+    
+    // Track which buffers contain the sorted data (may point to GPU sorter's internal buffers)
+    MTL::Buffer* activeSortedKeys;
+    MTL::Buffer* activeSortedValues;  
     
     // Capacity tracking
     uint32_t maxGaussians;
@@ -107,6 +113,9 @@ private:
     uint32_t currentHeight;
     uint32_t numTilesX;
     uint32_t numTilesY;
+    
+    // GPU radix sort for fast 64-bit sorting on GPU
+    GPURadixSort64* gpuRadixSort;
     
     // Helper methods
     void createPipelines(MTL::Library* library);

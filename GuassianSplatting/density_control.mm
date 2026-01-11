@@ -24,7 +24,7 @@ static constexpr float GRAD_THRESHOLD = 0.0002f;
 static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  // Official uses 0.005
 // percent_dense for clone vs split (MUST match official: 0.01)
 static constexpr float PERCENT_DENSE = 0.01f;  // Was 0.001 - FIXED to match official!         
-static constexpr size_t MAX_GAUSSIANS = 1000000;
+static constexpr size_t MAX_GAUSSIANS = 1500000;
 // Start densification
 static constexpr size_t DENSIFY_FROM_ITER = 500;      
 // Stop densification
@@ -174,6 +174,14 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
             }
         }
     });
+    
+    // Diagnostic: Sample opacity gradients to verify backprop is working (commented out - too verbose)
+    // float avgOpGrad = 0;
+    // size_t sampleCount = std::min((size_t)100, gaussianCount);
+    // for (size_t i = 0; i < sampleCount; i++) {
+    //     avgOpGrad += fabsf(grads[i].opacity);
+    // }
+    // std::cout << "Avg opacity gradient (first " << sampleCount << "): " << avgOpGrad/sampleCount << std::endl;
 }
 
 // Apply density control prune, clone, split Gaussians
@@ -238,6 +246,14 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     const float splitThreshold = PERCENT_DENSE * sceneExtent;
     const float pruneThreshold = 0.1f * sceneExtent;
     
+    // Debug: track scale stats for first few to diagnose clone vs split issue
+    static bool debugScales = false;
+    static size_t debugCount = 0;
+    if (iteration <= 4000) {
+        debugScales = true;
+        debugCount = 0;
+    }
+    
     // Parallel first pass to decide prune/clone/split
     dispatch_queue_t dispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
     size_t chunkSize = (gaussianCount + NUM_THREADS - 1) / NUM_THREADS;
@@ -300,10 +316,24 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
                     // Split large Gaussians
                     markers[i] = 3;  
                     localSplit++;
+                    
+                    // Debug: print first few splits
+                    if (debugScales && debugCount < 5) {
+                        std::cout << "  SPLIT: maxScale=" << maxScaleVal << " > thresh=" << splitThreshold 
+                                  << " scales=(" << expf(g.scale.x) << "," << expf(g.scale.y) << "," << expf(g.scale.z) << ")" << std::endl;
+                        debugCount++;
+                    }
                 } else {
                     // Clone small Gaussians
                     markers[i] = 2;  
                     localCloned++;
+                    
+                    // Debug: print first few clones
+                    if (debugScales && debugCount < 5) {
+                        std::cout << "  CLONE: maxScale=" << maxScaleVal << " <= thresh=" << splitThreshold 
+                                  << " scales=(" << expf(g.scale.x) << "," << expf(g.scale.y) << "," << expf(g.scale.z) << ")" << std::endl;
+                        debugCount++;
+                    }
                 }
             } else {
                 // Keep

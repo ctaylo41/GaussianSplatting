@@ -19,6 +19,9 @@
 // Number of threads for parallel operations
 static const int NUM_THREADS = 8;
 
+// Enable GPU sorting (set to false to use CPU radix sort)
+static constexpr bool USE_GPU_SORT = false;
+
 // FAST parallel radix sort using GCD
 // Optimized with parallel histogram and parallel scatter
 static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs) {
@@ -101,6 +104,7 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
 // Constructor
 TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uint32_t maxGaussians)
     : device(device)
+    , library(library)
     , maxGaussians(maxGaussians)
     , maxTiles(0)
     , maxPairs(0)
@@ -108,6 +112,8 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
     , currentHeight(0)
     , numTilesX(0)
     , numTilesY(0)
+    , activeSortedKeys(nullptr)
+    , activeSortedValues(nullptr)
 {
     createPipelines(library);
     
@@ -142,6 +148,9 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
     // Atomic counter for GPU pair generation
     pairCounterBuffer = device->newBuffer(sizeof(uint32_t), MTL::ResourceStorageModeShared);
     
+    // Initialize GPU radix sort for fast GPU-based 64-bit sorting
+    gpuRadixSort = new GPURadixSort64(device, library, maxPairs);
+    
     // Other buffers allocated on demand
     tileRanges = nullptr;
     perPixelLastIdx = nullptr;
@@ -157,6 +166,8 @@ TiledRasterizer::~TiledRasterizer() {
     if (perPixelLastIdx) perPixelLastIdx->release();
     if (uniformBuffer) uniformBuffer->release();
     if (pairCounterBuffer) pairCounterBuffer->release();
+    
+    if (gpuRadixSort) delete gpuRadixSort;
     
     if (projectGaussiansPSO) projectGaussiansPSO->release();
     if (tiledForwardPSO) tiledForwardPSO->release();
@@ -252,6 +263,12 @@ void TiledRasterizer::ensurePairsCapacity(uint32_t requiredPairs) {
     maxPairs = newMaxPairs;
     gaussianKeys = device->newBuffer(maxPairs * sizeof(uint64_t), MTL::ResourceStorageModeShared);
     gaussianValues = device->newBuffer(maxPairs * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    
+    // Also ensure GPU radix sort has enough capacity
+    if (gpuRadixSort) {
+        delete gpuRadixSort;
+        gpuRadixSort = new GPURadixSort64(device, library, maxPairs);
+    }
 }
 
 // Forward pass
@@ -455,29 +472,53 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         totalPairs = 50000000;
     }
     
-    // Copy GPU-generated pairs to CPU vector for sorting
-    // GPU wrote directly to gaussianKeys/gaussianValues buffers
-    static std::vector<std::pair<uint64_t, uint32_t>> pairs;
-    pairs.resize(totalPairs);
-    
-    // Copy from GPU buffers to CPU
-    uint64_t* gpuKeys = (uint64_t*)gaussianKeys->contents();
-    uint32_t* gpuValues = (uint32_t*)gaussianValues->contents();
-    
-    // Populate pairs vector
-    for (uint32_t i = 0; i < totalPairs; i++) {
-        pairs[i] = {gpuKeys[i], gpuValues[i]};
-    }
-    
-    // Sort by key tile + depth use fast CPU radix sort
-    parallelRadixSort(pairs);
-    
-    // Copy sorted data back to GPU buffers
     uint32_t pairCount = totalPairs;
-    for (uint32_t i = 0; i < pairCount; i++) {
-        gpuKeys[i] = pairs[i].first;
-        gpuValues[i] = pairs[i].second;
+    
+    // Choose which buffers to use based on sorting method
+    MTL::Buffer* sortedKeysBuffer = gaussianKeys;
+    MTL::Buffer* sortedValuesBuffer = gaussianValues;
+    
+    if (USE_GPU_SORT) {
+        std::cout << "Using GPU sort for " << totalPairs << " pairs" << std::endl;
+        // GPU sort - much faster, entirely on GPU
+        gpuRadixSort->sort(queue, gaussianKeys, gaussianValues, totalPairs);
+        // Use the GPU's internal sorted buffers directly
+        sortedKeysBuffer = gpuRadixSort->getSortedKeys();
+        sortedValuesBuffer = gpuRadixSort->getSortedValues();
+        std::cout << "GPU sort complete. Keys buffer: " << sortedKeysBuffer 
+                  << " Values buffer: " << sortedValuesBuffer << std::endl;
+    } else {
+        // CPU sort - slower, requires GPU->CPU->GPU copies
+        // Get pointers to buffers
+        uint64_t* gpuKeys = (uint64_t*)gaussianKeys->contents();
+        uint32_t* gpuValues = (uint32_t*)gaussianValues->contents();
+        
+        // Copy GPU-generated pairs to CPU vector for sorting
+        static std::vector<std::pair<uint64_t, uint32_t>> pairs;
+        pairs.resize(totalPairs);
+        
+        // Populate pairs vector
+        for (uint32_t i = 0; i < totalPairs; i++) {
+            pairs[i] = {gpuKeys[i], gpuValues[i]};
+        }
+        
+        // Sort by key using fast CPU radix sort
+        parallelRadixSort(pairs);
+        
+        // Copy sorted data back to GPU buffers
+        for (uint32_t i = 0; i < pairCount; i++) {
+            gpuKeys[i] = pairs[i].first;
+            gpuValues[i] = pairs[i].second;
+        }
     }
+    
+    // Store active sorted buffers for backward pass
+    activeSortedKeys = sortedKeysBuffer;
+    activeSortedValues = sortedValuesBuffer;
+    
+    // Get pointers for debug printing
+    uint64_t* gpuKeys = (uint64_t*)sortedKeysBuffer->contents();
+    uint32_t* gpuValues = (uint32_t*)sortedValuesBuffer->contents();
     
     auto t6 = std::chrono::high_resolution_clock::now();
     
@@ -486,10 +527,10 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     
     // Build tile ranges on GPU using parallel binary search
     {
-        // Setup compute encoder and buffers 
+        // Setup compute encoder and buffers - use sorted buffers
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
         enc->setComputePipelineState(buildTileRangesPSO);
-        enc->setBuffer(gaussianKeys, 0, 0);
+        enc->setBuffer(sortedKeysBuffer, 0, 0);  // Use sorted keys
         enc->setBuffer(tileRanges, 0, 1);
         enc->setBytes(&pairCount, sizeof(uint32_t), 2);
         enc->setBytes(&maxTiles, sizeof(uint32_t), 3);
@@ -512,8 +553,8 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         enc->setComputePipelineState(tiledForwardPSO);
         enc->setBuffer(gaussianBuffer, 0, 0);
         enc->setBuffer(projectedGaussians, 0, 1);
-        // sortedIndices
-        enc->setBuffer(gaussianValues, 0, 2);  
+        // sortedIndices - use sorted values buffer
+        enc->setBuffer(sortedValuesBuffer, 0, 2);  
         enc->setBuffer(tileRanges, 0, 3);
         enc->setBuffer(uniformBuffer, 0, 4);
         enc->setBuffer(perPixelLastIdx, 0, 5);
@@ -617,9 +658,10 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     
     // Print every 100 frames
     if (frameCount == 100) {
+        const char* sortMethod = USE_GPU_SORT ? "GPU" : "CPU";
         printf("\n=== Forward Pass Timing (avg over %d frames) ===\n", frameCount);
         printf("  Project+PairGen (GPU):  %6.2f ms\n", totalProjectPairGenTime / frameCount);
-        printf("  Sort+Copy (CPU):        %6.2f ms\n", totalSortTime / frameCount);
+        printf("  Sort (%s):              %6.2f ms\n", sortMethod, totalSortTime / frameCount);
         printf("  Range+Render (GPU):     %6.2f ms\n", totalRangeRenderTime / frameCount);
         printf("  TOTAL:                  %6.2f ms\n", totalForwardTime / frameCount);
         printf("  Pairs/frame:            ~%u\n", totalPairs);
@@ -660,8 +702,8 @@ void TiledRasterizer::backward(MTL::CommandQueue* queue,
         enc->setBuffer(gaussianBuffer, 0, 0);
         enc->setBuffer(gradientBuffer, 0, 1);
         enc->setBuffer(projectedGaussians, 0, 2);
-        // sortedIndices
-        enc->setBuffer(gaussianValues, 0, 3);  
+        // sortedIndices - use active sorted values buffer
+        enc->setBuffer(activeSortedValues, 0, 3);  
         enc->setBuffer(tileRanges, 0, 4);
         enc->setBuffer(uniformBuffer, 0, 5);
         enc->setBuffer(perPixelLastIdx, 0, 6);

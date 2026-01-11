@@ -88,10 +88,10 @@ private:
     // Compute pipelines
     MTL::ComputePipelineState* histogram64PSO;
     MTL::ComputePipelineState* prefixSum256PSO;
-    MTL::ComputePipelineState* scatter64SimplePSO;
+    MTL::ComputePipelineState* scatter64WithAtomicRankPSO;  // New O(1) atomic scatter
     MTL::ComputePipelineState* scatter64OptimizedPSO;
     MTL::ComputePipelineState* clearHistogramPSO;
-    MTL::ComputePipelineState* computeLocalRanks64PSO;
+    // REMOVED: computeLocalRanks64PSO - replaced with atomic scatter
     
     // Double-buffered arrays
     MTL::Buffer* keysBuffers[2];
@@ -100,7 +100,7 @@ private:
     // Histogram
     MTL::Buffer* histogramBuffer;
     MTL::Buffer* digitCountersBuffer;
-    MTL::Buffer* localRanksBuffer;  // For scatter64Simple
+    // REMOVED: localRanksBuffer - no longer needed with atomic scatter
     
     void createPipelines(MTL::Library* library);
     void ensureCapacity(size_t numElements);

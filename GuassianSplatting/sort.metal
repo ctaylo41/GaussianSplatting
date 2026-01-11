@@ -214,32 +214,8 @@ kernel void clearHistogram(
     }
 }
 
-// Compute local ranks for scatter64Simple
-// Each thread computes its position within its digit bucket
-kernel void computeLocalRanks64(
-    device const ulong* keys [[buffer(0)]],
-    device uint* localRanks [[buffer(1)]],
-    constant uint& bitOffset [[buffer(2)]],
-    constant uint& numElements [[buffer(3)]],
-    uint id [[thread_position_in_grid]])
-{
-    if (id >= numElements) return;
-    
-    ulong key = keys[id];
-    uint digit = (key >> bitOffset) & 0xFF;
-    
-    // Count how many elements with same digit come before this one
-    uint rank = 0;
-    for (uint i = 0; i < id; i++) {
-        ulong otherKey = keys[i];
-        uint otherDigit = (otherKey >> bitOffset) & 0xFF;
-        if (otherDigit == digit) {
-            rank++;
-        }
-    }
-    
-    localRanks[id] = rank;
-}
+// REMOVED: computeLocalRanks64 - replaced with atomic scatter
+// The O(n²) loop was the performance bottleneck
 
 // 64-BIT RADIX SORT for tile + depth compound keys
 
@@ -260,27 +236,33 @@ kernel void histogram64(
     }
 }
 
-kernel void scatter64Simple(
+// Atomic-based Scatter64 - O(1) per element instead of O(n²)
+// Uses atomic counters to compute local rank without loops
+kernel void scatter64WithAtomicRank(
     device const ulong* keysIn [[buffer(0)]],
     device const uint* valuesIn [[buffer(1)]],
     device ulong* keysOut [[buffer(2)]],
     device uint* valuesOut [[buffer(3)]],
     device const uint* prefixSums [[buffer(4)]],
-    device const uint* localRanks [[buffer(5)]],
+    device atomic_uint* digitCounters [[buffer(5)]],
     constant uint& bitOffset [[buffer(6)]],
     constant uint& numElements [[buffer(7)]],
     uint id [[thread_position_in_grid]])
 {
     if (id >= numElements) return;
-    // Extract key, value, and digit
+    
     ulong key = keysIn[id];
     uint value = valuesIn[id];
     uint digit = (key >> bitOffset) & 0xFF;
     
-    // Compute write position using prefix sums and local ranks
-    uint writePos = prefixSums[digit] + localRanks[id];
+    // Atomically get local rank (O(1) per element!)
+    // atomic_fetch_add returns the OLD value, which is exactly the count
+    // of same-digit elements that came before
+    uint localRank = atomic_fetch_add_explicit(&digitCounters[digit], 1, memory_order_relaxed);
     
-    // Bounds check before writing
+    // Final position = prefix sum + local rank
+    uint writePos = prefixSums[digit] + localRank;
+    
     if (writePos < numElements) {
         keysOut[writePos] = key;
         valuesOut[writePos] = value;
@@ -369,27 +351,18 @@ kernel void scatterOptimized32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Write to global memory using proper position calculation
-    if (valid) {
-        // Find my position within my digit bucket in this threadgroup
-        uint myDigit = digit;
-        uint myLocalPos = 0;
-        
-        // Count how many elements with same digit came before me in threadgroup
-        for (uint i = 0; i < tid; i++) {
-            if (i < tgSize) {
-                uint otherDigit = localDigits[i];
-                if (otherDigit == myDigit) {
-                    myLocalPos++;
-                }
-            }
+    // Write to global memory - use the sorted local arrays
+    // The localSortedKeys/Values were already placed in correct order by atomic localOffsets
+    if (tid < tgSize && tid < numElements) {
+        // Check if this position has valid data
+        uint localCount = 0;
+        for (uint i = 0; i < RADIX_SIZE; i++) {
+            localCount += localHist[i];
         }
         
-        // Compute global position: global base for my digit + my local position
-        uint globalPos = globalBaseOffsets[myDigit] + myLocalPos;
-        if (globalPos < numElements) {
-            keysOut[globalPos] = key;
-            valuesOut[globalPos] = value;
+        if (tid < localCount) {
+            keysOut[tgid * THREADGROUP_SIZE + tid] = localSortedKeys[tid];
+            valuesOut[tgid * THREADGROUP_SIZE + tid] = localSortedValues[tid];
         }
     }
 }
@@ -471,21 +444,18 @@ kernel void scatter64Optimized(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Write to global memory
-    if (valid && tid < THREADGROUP_SIZE) {
-        uint sortedDigit = (localSortedKeys[tid] >> bitOffset) & 0xFF;
-        // Count how many of this digit came before this position
-        uint posInDigit = 0;
-        for (uint i = 0; i < tid; i++) {
-            if (((localSortedKeys[i] >> bitOffset) & 0xFF) == sortedDigit) {
-                posInDigit++;
-            }
+    // Write to global memory - use sorted local arrays directly
+    // The localSortedKeys/Values were already placed in correct order by atomic localOffsets
+    if (tid < tgSize && tid < numElements) {
+        // Check if this position has valid data
+        uint localCount = 0;
+        for (uint i = 0; i < RADIX_SIZE; i++) {
+            localCount += localHist[i];
         }
-        // Compute global position
-        uint globalPos = globalBaseOffsets[sortedDigit] + posInDigit;
-        if (globalPos < numElements) {
-            keysOut[globalPos] = localSortedKeys[tid];
-            valuesOut[globalPos] = localSortedValues[tid];
+        
+        if (tid < localCount) {
+            keysOut[tgid * THREADGROUP_SIZE + tid] = localSortedKeys[tid];
+            valuesOut[tgid * THREADGROUP_SIZE + tid] = localSortedValues[tid];
         }
     }
 }
