@@ -238,6 +238,83 @@ kernel void histogram64(
 
 // Atomic-based Scatter64 - O(1) per element instead of O(n²)
 // Uses atomic counters to compute local rank without loops
+// Stable Scatter64 - Uses deterministic local ranks within threadgroups
+// This ensures radix sort stability by preserving relative order of elements with same digit
+kernel void scatter64Stable(
+    device const ulong* keysIn [[buffer(0)]],
+    device const uint* valuesIn [[buffer(1)]],
+    device ulong* keysOut [[buffer(2)]],
+    device uint* valuesOut [[buffer(3)]],
+    device const uint* prefixSums [[buffer(4)]],
+    device atomic_uint* globalDigitCounters [[buffer(5)]],
+    constant uint& bitOffset [[buffer(6)]],
+    constant uint& numElements [[buffer(7)]],
+    uint id [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    // Shared memory for this threadgroup
+    threadgroup uint localDigits[THREADGROUP_SIZE];
+    threadgroup uint localCounts[256];  // Count per digit in this threadgroup
+    threadgroup uint globalBaseForDigit[256];
+    
+    // Initialize counts
+    for (uint i = tid; i < 256; i += THREADGROUP_SIZE) {
+        localCounts[i] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Load data and store digit
+    bool valid = id < numElements;
+    ulong key = 0;
+    uint value = 0;
+    uint digit = 0;
+    
+    if (valid) {
+        key = keysIn[id];
+        value = valuesIn[id];
+        digit = (key >> bitOffset) & 0xFF;
+        localDigits[tid] = digit;
+        
+        // Count digits in this threadgroup
+        atomic_fetch_add_explicit((threadgroup atomic_uint*)&localCounts[digit], 1, memory_order_relaxed);
+    } else {
+        localDigits[tid] = 0xFFFFFFFF;  // Invalid marker
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // One thread per digit atomically reserves global space for this threadgroup
+    for (uint d = tid; d < 256; d += THREADGROUP_SIZE) {
+        uint count = localCounts[d];
+        if (count > 0) {
+            uint base = atomic_fetch_add_explicit(&globalDigitCounters[d], count, memory_order_relaxed);
+            globalBaseForDigit[d] = prefixSums[d] + base;
+        } else {
+            globalBaseForDigit[d] = prefixSums[d];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Compute local rank DETERMINISTICALLY (count same-digit elements with lower tid)
+    // This preserves input order = stability!
+    if (valid) {
+        uint localRank = 0;
+        for (uint i = 0; i < tid; i++) {
+            if (localDigits[i] == digit) {
+                localRank++;
+            }
+        }
+        
+        // Write to output
+        uint writePos = globalBaseForDigit[digit] + localRank;
+        if (writePos < numElements) {
+            keysOut[writePos] = key;
+            valuesOut[writePos] = value;
+        }
+    }
+}
+
+// OLD Non-stable version (kept for reference, but don't use)
 kernel void scatter64WithAtomicRank(
     device const ulong* keysIn [[buffer(0)]],
     device const uint* valuesIn [[buffer(1)]],
@@ -258,6 +335,7 @@ kernel void scatter64WithAtomicRank(
     // Atomically get local rank (O(1) per element!)
     // atomic_fetch_add returns the OLD value, which is exactly the count
     // of same-digit elements that came before
+    // NOTE: This is NOT stable - thread execution order is non-deterministic!
     uint localRank = atomic_fetch_add_explicit(&digitCounters[digit], 1, memory_order_relaxed);
     
     // Final position = prefix sum + local rank

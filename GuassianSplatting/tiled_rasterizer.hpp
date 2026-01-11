@@ -74,6 +74,9 @@ public:
                   MTL::Texture* renderedTexture,
                   MTL::Texture* groundTruthTexture);
     
+    // Get projected gaussians buffer (for density control radius tracking)
+    MTL::Buffer* getProjectedGaussians() const { return projectedGaussians; }
+    
 private:
     static constexpr uint32_t TILE_SIZE = 16;
     // Average Gaussians touch ~4-8 tiles

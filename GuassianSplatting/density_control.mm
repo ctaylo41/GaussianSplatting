@@ -24,7 +24,7 @@ static constexpr float GRAD_THRESHOLD = 0.0002f;
 static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  // Official uses 0.005
 // percent_dense for clone vs split (MUST match official: 0.01)
 static constexpr float PERCENT_DENSE = 0.01f;  // Was 0.001 - FIXED to match official!         
-static constexpr size_t MAX_GAUSSIANS = 1500000;
+static constexpr size_t MAX_GAUSSIANS = 1000000;
 // Start densification
 static constexpr size_t DENSIFY_FROM_ITER = 500;      
 // Stop densification
@@ -52,29 +52,6 @@ static bool isInOpacityResetWarmup(size_t iteration) {
     return (itersSinceReset > 0 && itersSinceReset < OPACITY_RESET_WARMUP);
 } 
 
-// Approximate screen radius of a Gaussian as fraction of image width
-float computeApproxScreenRadius(const Gaussian& g,
-                                 float focalLength,
-                                 float avgDepth,
-                                 float imageWidth) {
-    // Safety check for avgDepth to prevent division by zero or huge values
-    const float MIN_DEPTH = 0.1f;
-    float safeDepth = fmaxf(avgDepth, MIN_DEPTH);
-    
-    // Get max scale in world units
-    float maxScale = fmaxf(fmaxf(
-        expf(std::clamp(g.scale.x, -4.0f, 4.0f)),
-        expf(std::clamp(g.scale.y, -4.0f, 4.0f))),
-        expf(std::clamp(g.scale.z, -4.0f, 4.0f)));
-    
-    // Approximate screen radius = focal * scale / depth * multiplier
-    // 3 sigma covers 99% of Gaussian, so multiply by 3
-    float screenRadius = focalLength * maxScale * 3.0f / safeDepth;
-    
-    // Normalize to fraction of image width
-    return screenRadius / imageWidth;
-}
-
 // Set scene extent for relative thresholds
 void DensityController::setSceneExtent(float extent) {
     sceneExtent = extent;
@@ -96,6 +73,9 @@ DensityController::DensityController(MTL::Device* device, MTL::Library* library)
     // Store position gradients for gradient-directed cloning
     positionGradAccum = device->newBuffer(maxGaussians * sizeof(simd_float3), MTL::ResourceStorageModeShared);
     
+    // Track maximum screen-space radius across all views (official max_radii2D)
+    maxRadii2D = device->newBuffer(maxGaussians * sizeof(float), MTL::ResourceStorageModeShared);
+    
     // Initialize accumulators
     resetAccumulator(maxGaussians);
 }
@@ -107,6 +87,7 @@ DensityController::~DensityController() {
     if (gradientCount) gradientCount->release();
     if (markerBuffer) markerBuffer->release();
     if (positionGradAccum) positionGradAccum->release();
+    if (maxRadii2D) maxRadii2D->release();
 }
 
 // Reset accumulators
@@ -115,6 +96,7 @@ void DensityController::resetAccumulator(size_t gaussianCount) {
     memset(gradientAccum->contents(), 0, gaussianCount * sizeof(float));
     memset(gradientCount->contents(), 0, gaussianCount * sizeof(uint32_t));
     memset(positionGradAccum->contents(), 0, gaussianCount * sizeof(simd_float3));
+    memset(maxRadii2D->contents(), 0, gaussianCount * sizeof(float));
 }
 
 // Accumulate gradients into internal buffers
@@ -184,6 +166,37 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
     // std::cout << "Avg opacity gradient (first " << sampleCount << "): " << avgOpGrad/sampleCount << std::endl;
 }
 
+// Accumulate screen-space radii from rasterizer (for accurate size-based pruning)
+void DensityController::accumulateRadii(MTL::Buffer* projectedGaussians,
+                                        size_t gaussianCount) {
+    // ProjectedGaussian structure matches tiled_shaders.metal
+    struct ProjectedGaussian {
+        simd_float2 screenPos;
+        float depth;
+        simd_float2 viewPos_xy;
+        simd_float3 cov2D;
+        simd_float3 conic;
+        uint32_t gaussianIdx;
+        float radius;
+        uint32_t _pad1, _pad2;
+    };
+    
+    ProjectedGaussian* projected = (ProjectedGaussian*)projectedGaussians->contents();
+    float* maxRadii = (float*)maxRadii2D->contents();
+    
+    // Update max radius for each Gaussian (official uses max across all training views)
+    for (size_t i = 0; i < gaussianCount; i++) {
+        uint32_t gaussianIdx = projected[i].gaussianIdx;
+        if (gaussianIdx < gaussianCount) {
+            float currentRadius = projected[i].radius;
+            // Track maximum radius seen across all views
+            if (currentRadius > maxRadii[gaussianIdx]) {
+                maxRadii[gaussianIdx] = currentRadius;
+            }
+        }
+    }
+}
+
 // Apply density control prune, clone, split Gaussians
 DensityStats DensityController::apply(MTL::CommandQueue* queue,
                                       MTL::Buffer*& gaussianBuffer,
@@ -228,9 +241,12 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     
     // Official: size_threshold = 20 if iteration > opt.opacity_reset_interval else None
     // Screen-based pruning only enabled AFTER first opacity reset (iter > 3000)
-    // Using 40 pixels instead of 20 to be more conservative (we approximate screen radius)
-    const float maxScreenPixels = 40.0f;
+    // Match official exactly: 20 pixels
+    const float maxScreenPixels = 20.0f;
     const bool enableScreenPruning = (iteration > OPACITY_RESET_INTERVAL);
+    
+    // Access max_radii2D buffer (actual screen radii from rasterizer)
+    float* maxRadii = (float*)maxRadii2D->contents();
     
     // Per-thread counters for parallel first pass
     static uint32_t threadPruned[NUM_THREADS];
@@ -298,10 +314,9 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
                     shouldPrune = true;
                 }
                 
-                // Prune based on screen radius (approximation of max_radii2D > 20)
-                float screenFraction = computeApproxScreenRadius(g, focalLength, avgDepth, imageWidth);
-                float screenRadiusPixels = screenFraction * imageWidth;
-                if (screenRadiusPixels > maxScreenPixels) {
+                // Prune based on actual screen radius from rasterizer (official max_radii2D)
+                // This is EXACT, not an approximation
+                if (maxRadii[i] > maxScreenPixels) {
                     shouldPrune = true;
                 }
             }

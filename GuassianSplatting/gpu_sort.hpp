@@ -88,10 +88,10 @@ private:
     // Compute pipelines
     MTL::ComputePipelineState* histogram64PSO;
     MTL::ComputePipelineState* prefixSum256PSO;
-    MTL::ComputePipelineState* scatter64WithAtomicRankPSO;  // New O(1) atomic scatter
+    MTL::ComputePipelineState* scatter64StablePSO;  // NEW: Stable scatter with deterministic ranks
+    MTL::ComputePipelineState* scatter64WithAtomicRankPSO;  // OLD: Non-stable atomic scatter
     MTL::ComputePipelineState* scatter64OptimizedPSO;
     MTL::ComputePipelineState* clearHistogramPSO;
-    // REMOVED: computeLocalRanks64PSO - replaced with atomic scatter
     
     // Double-buffered arrays
     MTL::Buffer* keysBuffers[2];

@@ -109,7 +109,11 @@ void MTLEngine::run(Camera& camera) {
             }
             
             // Density control application
-            if (totalIterations % densityControlInterval == 0 && totalIterations > 500) {
+            // Stop densification at 15k iterations (matching official 3DGS)
+            const size_t DENSIFY_UNTIL_ITER = 15000;
+            if (totalIterations % densityControlInterval == 0 && 
+                totalIterations > 500 && 
+                totalIterations < DENSIFY_UNTIL_ITER) {
                 // Get camera parameters for screen-space pruning
                 // Use scaled intrinsics to match actual training texture resolution
                 const TrainingImage& currentImg = trainingImages[currentImageIdx];
@@ -994,8 +998,11 @@ float MTLEngine::trainStep(size_t imageIndex,
     tiledRasterizer->backward(commandQueue, gaussianBuffer, gaussianGradients, gaussianCount,
                               uniforms, renderTarget, img.texture);
     
-    // Accumulate for density control
+    // Accumulate gradients for density control
     densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
+    
+    // Accumulate actual screen-space radii from rasterizer (official max_radii2D)
+    densityController->accumulateRadii(tiledRasterizer->getProjectedGaussians(), gaussianCount);
     
     // Optimizer step with decayed learning rates
     optimizer->step(commandQueue, gaussianBuffer, gaussianGradients,
@@ -1123,8 +1130,10 @@ void MTLEngine::train(size_t numEpochs) {
                 float scaleX = (float)actualWidth / (float)cam.width;
                 float focalLength = cam.fx * scaleX;
                 float imageWidth = (float)actualWidth;
-                // Use conservative avgDepth to prevent over-aggressive screen pruning
-                float avgDepth = 2.0f * sceneExtent;
+                // Approximate average scene depth from camera distance to scene center
+                // Official uses max_radii2D from rasterizer; we approximate with typical camera distance
+                // Typical camera is ~3-5x scene extent away (orbital cameras looking at scene center)
+                float avgDepth = 4.0f * sceneExtent;
 
                 if (totalIterations % 1000 == 0) {
                     std::cout << "Density params: fx=" << focalLength 

@@ -415,6 +415,7 @@ GPURadixSort64::~GPURadixSort64() {
     
     if (histogram64PSO) histogram64PSO->release();
     if (prefixSum256PSO) prefixSum256PSO->release();
+    if (scatter64StablePSO) scatter64StablePSO->release();
     if (scatter64WithAtomicRankPSO) scatter64WithAtomicRankPSO->release();
     if (scatter64OptimizedPSO) scatter64OptimizedPSO->release();
     if (clearHistogramPSO) clearHistogramPSO->release();
@@ -424,10 +425,10 @@ GPURadixSort64::~GPURadixSort64() {
 void GPURadixSort64::createPipelines(MTL::Library* library) {
     histogram64PSO = createPipeline(device, library, "histogram64");
     prefixSum256PSO = createPipeline(device, library, "prefixSum256");
-    scatter64WithAtomicRankPSO = createPipeline(device, library, "scatter64WithAtomicRank");
+    scatter64StablePSO = createPipeline(device, library, "scatter64Stable");  // NEW stable version
+    scatter64WithAtomicRankPSO = createPipeline(device, library, "scatter64WithAtomicRank");  // OLD non-stable
     scatter64OptimizedPSO = createPipeline(device, library, "scatter64Optimized");
     clearHistogramPSO = createPipeline(device, library, "clearHistogram");
-    // REMOVED: computeLocalRanks64PSO - no longer needed with atomic scatter
 }
 
 // Ensure capacity of buffers
@@ -460,10 +461,10 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
     if (numElements == 0) return;
     
     // Verify pipelines exist
-    if (!histogram64PSO || !scatter64WithAtomicRankPSO || !clearHistogramPSO) {
+    if (!histogram64PSO || !scatter64StablePSO || !clearHistogramPSO) {
         std::cerr << "ERROR: GPURadixSort64 pipelines not initialized!" << std::endl;
         std::cerr << "  histogram64PSO: " << (histogram64PSO ? "OK" : "NULL") << std::endl;
-        std::cerr << "  scatter64WithAtomicRankPSO: " << (scatter64WithAtomicRankPSO ? "OK" : "NULL") << std::endl;
+        std::cerr << "  scatter64StablePSO: " << (scatter64StablePSO ? "OK" : "NULL") << std::endl;
         std::cerr << "  clearHistogramPSO: " << (clearHistogramPSO ? "OK" : "NULL") << std::endl;
         return;
     }
@@ -551,16 +552,16 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
         
         cmdBuffer = queue->commandBuffer();
         
-        // Scatter using atomic-based kernel (O(1) per element)
+        // Scatter using stable kernel (deterministic local ranks)
         {
             MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
-            enc->setComputePipelineState(scatter64WithAtomicRankPSO);
+            enc->setComputePipelineState(scatter64StablePSO);  // Use stable version
             enc->setBuffer(keysBuffers[srcIdx], 0, 0);
             enc->setBuffer(valuesBuffers[srcIdx], 0, 1);
             enc->setBuffer(keysBuffers[dstIdx], 0, 2);
             enc->setBuffer(valuesBuffers[dstIdx], 0, 3);
             enc->setBuffer(histogramBuffer, 0, 4);  // prefixSums
-            enc->setBuffer(digitCountersBuffer, 0, 5);  // atomic counters
+            enc->setBuffer(digitCountersBuffer, 0, 5);  // global counters
             enc->setBytes(&bitOffset, sizeof(uint32_t), 6);
             enc->setBytes(&numElementsU32, sizeof(uint32_t), 7);
             
