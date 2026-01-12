@@ -700,6 +700,7 @@ kernel void adamStep(
         // Clamp gradient
         float grad = clamp(g.sh[i], -clip, clip);
         uint idx = tid * 12 + i;
+        
         // Adam moment updates
         float m = beta1 * m_sh[idx] + (1.0 - beta1) * grad;
         float v = beta2 * v_sh[idx] + (1.0 - beta2) * grad * grad;
@@ -709,9 +710,12 @@ kernel void adamStep(
         float m_hat = m / bc1;
         float v_hat = v / bc2;
         float newSH = gaussians[tid].sh[i] - lrs[4] * m_hat / (sqrt(v_hat) + epsilon);
-        // Clamp SH values to prevent color explosion
-        // With SH_C0=0.282: color = SH*0.282 + 0.5
-        // SH in [-2, 2] gives color in [0.06, 0.94] - prevents saturation
-        gaussians[tid].sh[i] = clamp(newSH, -2.0f, 2.0f);
+        
+        // Clamp SH to reasonable range to prevent extreme values
+        // SH_C0 * sh + 0.5 should give colors in [0,1], so sh in [-1.77, 1.77]
+        // Using ±3.0 allows some overshoot for training dynamics
+        newSH = clamp(newSH, -3.0f, 3.0f);
+        
+        gaussians[tid].sh[i] = newSH;
     }
 }

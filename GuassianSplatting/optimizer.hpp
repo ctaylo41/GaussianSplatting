@@ -51,6 +51,9 @@ public:
     // Reset scale momentum after opacity reset (optimization landscape changes)
     void resetScaleMomentum();
     
+    // Reset SH momentum after opacity reset (colors may need to re-adapt)
+    void resetSHMomentum();
+    
     // Reset Adam state for new Gaussians starting at startIdx (after split/clone)
     void resetStateForNewGaussians(size_t startIdx);
     
@@ -59,6 +62,11 @@ public:
     
     // Get current timestep
     uint32_t getTimestep() const { return timestep; }
+    
+    // Debug accessors
+    MTL::Buffer* getMOpacityBuffer() { return m_opacity; }
+    MTL::Buffer* getMShBuffer() { return m_sh; }
+    MTL::Buffer* getVShBuffer() { return v_sh; }
     
     // Read GPU debug buffer after step
     void printGPUDebug();

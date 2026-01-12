@@ -318,6 +318,10 @@ void MTLEngine::loadGaussians(const std::vector<Gaussian>& gaussians, float scen
     std::cout << "Density control using scene extent: " << sceneExtent << std::endl;
     DensityController::setSceneExtent(sceneExtent);
     
+    // Verify struct sizes match Metal shader layout
+    static_assert(sizeof(Gaussian) == 112, "Gaussian struct must be 112 bytes to match Metal layout!");
+    static_assert(sizeof(GaussianGradients) == 112, "GaussianGradients struct must be 112 bytes to match Metal layout!");
+    
     // Initialize GPU radix sort, optimizer, density controller, and rasterizer
     gpuSort = new GPURadixSort32(metalDevice, shaderLibrary, 2000000);
     optimizer = new AdamOptimizer(metalDevice, shaderLibrary, 2000000);
@@ -1022,6 +1026,8 @@ float MTLEngine::trainStep(size_t imageIndex,
         int shNanCount = 0;
         float maxSH = -1e10f;
         float minSH = 1e10f;
+        int maxSHIdx = -1;
+        int minSHIdx = -1;
         float maxSHGrad = 0.0f;
         float avgSHGrad = 0.0f;
         int saturatedCount = 0;  // Colors near 0 or 1
@@ -1042,8 +1048,14 @@ float MTLEngine::trainStep(size_t imageIndex,
                     shNanCount++;
                     break;  // Only count once per Gaussian
                 }
-                maxSH = fmaxf(maxSH, g[i].sh[sh]);
-                minSH = fminf(minSH, g[i].sh[sh]);
+                if (g[i].sh[sh] > maxSH) {
+                    maxSH = g[i].sh[sh];
+                    maxSHIdx = i;
+                }
+                if (g[i].sh[sh] < minSH) {
+                    minSH = g[i].sh[sh];
+                    minSHIdx = i;
+                }
                 
                 // Check gradient magnitude for SH
                 float grad = grads[i].sh[sh];
@@ -1270,9 +1282,10 @@ void MTLEngine::train(size_t numEpochs) {
                     }
                 }
                 
-                // Reset optimizer momentum for opacity AND scale
+                // Reset optimizer momentum for opacity, scale, AND SH
                 optimizer->resetOpacityMomentum();
                 optimizer->resetScaleMomentum();
+                optimizer->resetSHMomentum();
                 
                 densityController->resetAccumulator(gaussianCount);
             }

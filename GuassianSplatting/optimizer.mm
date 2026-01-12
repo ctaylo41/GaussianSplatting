@@ -146,6 +146,13 @@ void AdamOptimizer::resetScaleMomentum() {
     std::cout << "Reset scale momentum after opacity reset" << std::endl;
 }
 
+// Reset SH momentum after opacity reset (colors may need to re-adapt)
+void AdamOptimizer::resetSHMomentum() {
+    memset(m_sh->contents(), 0, numGaussians * 12 * sizeof(float));
+    memset(v_sh->contents(), 0, numGaussians * 12 * sizeof(float));
+    std::cout << "Reset SH momentum after opacity reset" << std::endl;
+}
+
 // Reset Adam state for Gaussians starting at index 'startIdx' (after split/clone)
 void AdamOptimizer::resetStateForNewGaussians(size_t startIdx) {
     if (startIdx >= numGaussians) return;

@@ -501,10 +501,6 @@ kernel void tiledBackward(
         
         // Color gradient
         float3 dL_dColor = dL_dPixel * weight;
-        // if color is near 0 or 1 zero out gradient to prevent pushing out of bounds
-        if (p.color.r <= 0.01 || p.color.r >= 0.99) dL_dColor.r = 0;
-        if (p.color.g <= 0.01 || p.color.g >= 0.99) dL_dColor.g = 0;
-        if (p.color.b <= 0.01 || p.color.b >= 0.99) dL_dColor.b = 0;
         
         // Accumulate color gradient
         float dL_dAlpha = T * dot(dL_dPixel, p.color - accum_rec);
