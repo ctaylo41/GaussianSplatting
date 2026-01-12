@@ -8,6 +8,8 @@
 #include "density_control.hpp"
 #include <iostream>
 #include <cmath>
+#include <vector>
+#include <algorithm>
 #include "gradients.hpp"
  // Apple's GCD for parallel operations
 #include <dispatch/dispatch.h> 
@@ -169,31 +171,62 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
 // Accumulate screen-space radii from rasterizer (for accurate size-based pruning)
 void DensityController::accumulateRadii(MTL::Buffer* projectedGaussians,
                                         size_t gaussianCount) {
-    // ProjectedGaussian structure matches tiled_shaders.metal
+    // ProjectedGaussian structure MUST match tiled_rasterizer.hpp exactly!
     struct ProjectedGaussian {
-        simd_float2 screenPos;
-        float depth;
-        simd_float2 viewPos_xy;
-        simd_float3 cov2D;
-        simd_float3 conic;
-        uint32_t gaussianIdx;
-        float radius;
-        uint32_t _pad1, _pad2;
+        simd_float2 screenPos;   // offset 0, 8 bytes
+        float conic[3];          // offset 8, 12 bytes
+        float depth;             // offset 20, 4 bytes
+        float opacity;           // offset 24, 4 bytes
+        float color[3];          // offset 28, 12 bytes
+        float radius;            // offset 40, 4 bytes
+        uint32_t tileMinX;       // offset 44, 4 bytes
+        uint32_t tileMinY;       // offset 48, 4 bytes
+        uint32_t tileMaxX;       // offset 52, 4 bytes
+        uint32_t tileMaxY;       // offset 56, 4 bytes
+        float _pad1;             // offset 60, 4 bytes
+        simd_float2 viewPos_xy;  // offset 64, 8 bytes
+        float cov2D[3];          // offset 72, 12 bytes
+        float _pad2;             // offset 84, 4 bytes
     };
     
     ProjectedGaussian* projected = (ProjectedGaussian*)projectedGaussians->contents();
     float* maxRadii = (float*)maxRadii2D->contents();
     
-    // Update max radius for each Gaussian (official uses max across all training views)
-    for (size_t i = 0; i < gaussianCount; i++) {
-        uint32_t gaussianIdx = projected[i].gaussianIdx;
-        if (gaussianIdx < gaussianCount) {
-            float currentRadius = projected[i].radius;
-            // Track maximum radius seen across all views
-            if (currentRadius > maxRadii[gaussianIdx]) {
-                maxRadii[gaussianIdx] = currentRadius;
-            }
+    // Debug: Sample some radii values before accumulation
+    static int accumulateCallCount = 0;
+    accumulateCallCount++;
+    if (accumulateCallCount % 100 == 1) {
+        std::cout << "\n=== accumulateRadii Debug (call #" << accumulateCallCount << ") ===" << std::endl;
+        std::cout << "First 10 projected radii: ";
+        for (int i = 0; i < 10 && i < gaussianCount; i++) {
+            std::cout << projected[i].radius << " ";
         }
+        std::cout << std::endl;
+        std::cout << "First 10 maxRadii2D BEFORE: ";
+        for (int i = 0; i < 10 && i < gaussianCount; i++) {
+            std::cout << maxRadii[i] << " ";
+        }
+        std::cout << std::endl;
+    }
+    
+    // Update max radius for each Gaussian (official uses max across all training views)
+    // The projection kernel writes each Gaussian's results at index tid (thread ID),
+    // so projected[i] corresponds to Gaussian index i
+    for (size_t i = 0; i < gaussianCount; i++) {
+        float currentRadius = projected[i].radius;
+        // Track maximum radius seen across all views
+        if (currentRadius > maxRadii[i]) {
+            maxRadii[i] = currentRadius;
+        }
+    }
+    
+    // Debug: Show radii after accumulation
+    if (accumulateCallCount % 100 == 1) {
+        std::cout << "First 10 maxRadii2D AFTER: ";
+        for (int i = 0; i < 10 && i < gaussianCount; i++) {
+            std::cout << maxRadii[i] << " ";
+        }
+        std::cout << std::endl;
     }
 }
 
@@ -239,14 +272,68 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     uint32_t* counts = (uint32_t*)gradientCount->contents();
     simd_float3* posGradAccum = (simd_float3*)positionGradAccum->contents();
     
-    // Official: size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-    // Screen-based pruning only enabled AFTER first opacity reset (iter > 3000)
-    // Match official exactly: 20 pixels
-    const float maxScreenPixels = 20.0f;
-    const bool enableScreenPruning = (iteration > OPACITY_RESET_INTERVAL);
-    
     // Access max_radii2D buffer (actual screen radii from rasterizer)
     float* maxRadii = (float*)maxRadii2D->contents();
+    
+    // Fixed percentile-based screen pruning threshold (computed ONCE at iter 3001)
+    // Prevents death spiral from recalculating percentile every iteration
+    static float maxScreenPixels = -1.0f;
+    static bool thresholdComputed = false;
+    
+    const bool enableScreenPruning = (iteration > OPACITY_RESET_INTERVAL);
+    
+    // Compute threshold ONCE at first densification after opacity reset
+    if (enableScreenPruning && !thresholdComputed && gaussianCount > 100) {
+        // Copy radii to vector for percentile calculation
+        std::vector<float> radiiCopy(maxRadii, maxRadii + gaussianCount);
+        
+        // Find 95th percentile using nth_element (O(n) vs O(n log n) for sort)
+        size_t percentileIdx = size_t(gaussianCount * 0.95f);
+        std::nth_element(radiiCopy.begin(), radiiCopy.begin() + percentileIdx, radiiCopy.end());
+        maxScreenPixels = radiiCopy[percentileIdx];
+        
+        // Safety bounds: don't prune too aggressively or too loosely
+        maxScreenPixels = std::clamp(maxScreenPixels, 50.0f, 300.0f);
+        thresholdComputed = true;
+        
+        std::cout << "*** FIXED screen pruning threshold computed: " << maxScreenPixels << " pixels (will not change) ***" << std::endl;
+    }
+    
+    // ============================================
+    // DEBUG: maxRadii2D values
+    // ============================================
+    std::cout << "\n=== maxRadii2D Debug (iter " << iteration << ") ===" << std::endl;
+    std::cout << "Screen pruning enabled: " << (enableScreenPruning ? "YES" : "NO") << std::endl;
+    std::cout << "Threshold (95th percentile): " << maxScreenPixels << " pixels" << std::endl;
+    
+    // Count Gaussians with large radii
+    int largeCnt = 0;
+    for (size_t i = 0; i < std::min(gaussianCount, (size_t)1000); i++) {
+        if (maxRadii[i] > maxScreenPixels) largeCnt++;
+    }
+    std::cout << "Gaussians with radii > threshold: " << largeCnt << "/" << std::min(gaussianCount, (size_t)1000) << " sampled (~5% expected)" << std::endl;
+    
+    // Show first 10 values
+    std::cout << "First 10 maxRadii2D: ";
+    for (int i = 0; i < 10 && i < gaussianCount; i++) {
+        std::cout << maxRadii[i] << " ";
+    }
+    std::cout << std::endl;
+    
+    // Show stats
+    float maxVal = 0, avgVal = 0;
+    int nonZeroCount = 0;
+    for (size_t i = 0; i < gaussianCount; i++) {
+        if (maxRadii[i] > maxVal) maxVal = maxRadii[i];
+        if (maxRadii[i] > 0) {
+            avgVal += maxRadii[i];
+            nonZeroCount++;
+        }
+    }
+    if (nonZeroCount > 0) avgVal /= nonZeroCount;
+    std::cout << "Max radius: " << maxVal << ", Avg non-zero: " << avgVal 
+              << " (" << nonZeroCount << "/" << gaussianCount << " non-zero)" << std::endl;
+    std::cout << "=============================================\n" << std::endl;
     
     // Per-thread counters for parallel first pass
     static uint32_t threadPruned[NUM_THREADS];
@@ -308,17 +395,16 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             //   big_points_vs = self.max_radii2D > max_screen_size
             //   big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             //   prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-            if (enableScreenPruning) {
-                // Prune based on world-space scale (always, after iter 3000)
-                if (maxScaleVal > pruneThreshold) {
-                    shouldPrune = true;
-                }
-                
-                // Prune based on actual screen radius from rasterizer (official max_radii2D)
-                // This is EXACT, not an approximation
-                if (maxRadii[i] > maxScreenPixels) {
-                    shouldPrune = true;
-                }
+            
+            // Prune based on world-space scale during densification window (iter 3000-15000)
+            // After 15k, no more densification, so stop aggressive pruning
+            if (canDensify && iteration > OPACITY_RESET_INTERVAL && maxScaleVal > pruneThreshold) {
+                shouldPrune = true;
+            }
+            
+            // Optionally prune based on screen-space radius (adaptive percentile-based)
+            if (enableScreenPruning && maxRadii[i] > maxScreenPixels) {
+                shouldPrune = true;
             }
             
             // Mark accordingly and prune
