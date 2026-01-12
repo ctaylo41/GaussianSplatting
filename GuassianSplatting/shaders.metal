@@ -691,8 +691,12 @@ kernel void adamStep(
         gaussians[tid].opacity = clamp(gaussians[tid].opacity - lrs[3] * m_hat / (sqrt(v_hat) + epsilon), -8.0f, 8.0f);
     }
     
-    // SH update clamp to reasonable range
-    for (int i = 0; i < 12; i++) {
+    // SH update - only update DC terms (indices 0, 4, 8) since we only use degree 0
+    // The other 9 coefficients (degree 1 and 2) are not used in forward pass
+    // so updating them causes drift and explosion
+    int sh_indices[3] = {0, 4, 8};  // R, G, B DC terms
+    for (int j = 0; j < 3; j++) {
+        int i = sh_indices[j];
         // Clamp gradient
         float grad = clamp(g.sh[i], -clip, clip);
         uint idx = tid * 12 + i;

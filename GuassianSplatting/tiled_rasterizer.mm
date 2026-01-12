@@ -487,6 +487,10 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         sortedValuesBuffer = gpuRadixSort->getSortedValues();
         std::cout << "GPU sort complete. Keys buffer: " << sortedKeysBuffer 
                   << " Values buffer: " << sortedValuesBuffer << std::endl;
+        
+        // Store active sorted buffers for backward pass (GPU sort case)
+        activeSortedKeys = sortedKeysBuffer;
+        activeSortedValues = sortedValuesBuffer;
     } else {
         // CPU sort - slower, requires GPU->CPU->GPU copies
         // Get pointers to buffers
@@ -510,15 +514,16 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
             gpuKeys[i] = pairs[i].first;
             gpuValues[i] = pairs[i].second;
         }
+        
+        // CRITICAL FIX: CPU sort writes to gaussianKeys/gaussianValues, not sortedKeysBuffer/sortedValuesBuffer!
+        // Backward pass MUST use the correct buffers or gradients go to wrong Gaussians!
+        activeSortedKeys = gaussianKeys;
+        activeSortedValues = gaussianValues;
     }
     
-    // Store active sorted buffers for backward pass
-    activeSortedKeys = sortedKeysBuffer;
-    activeSortedValues = sortedValuesBuffer;
-    
-    // Get pointers for debug printing
-    uint64_t* gpuKeys = (uint64_t*)sortedKeysBuffer->contents();
-    uint32_t* gpuValues = (uint32_t*)sortedValuesBuffer->contents();
+    // Get pointers for debug printing - use the active sorted buffers
+    uint64_t* gpuKeys = (uint64_t*)activeSortedKeys->contents();
+    uint32_t* gpuValues = (uint32_t*)activeSortedValues->contents();
     
     auto t6 = std::chrono::high_resolution_clock::now();
     
@@ -530,7 +535,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         // Setup compute encoder and buffers - use sorted buffers
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
         enc->setComputePipelineState(buildTileRangesPSO);
-        enc->setBuffer(sortedKeysBuffer, 0, 0);  // Use sorted keys
+        enc->setBuffer(activeSortedKeys, 0, 0);  // Use active sorted keys
         enc->setBuffer(tileRanges, 0, 1);
         enc->setBytes(&pairCount, sizeof(uint32_t), 2);
         enc->setBytes(&maxTiles, sizeof(uint32_t), 3);
@@ -553,8 +558,8 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         enc->setComputePipelineState(tiledForwardPSO);
         enc->setBuffer(gaussianBuffer, 0, 0);
         enc->setBuffer(projectedGaussians, 0, 1);
-        // sortedIndices - use sorted values buffer
-        enc->setBuffer(sortedValuesBuffer, 0, 2);  
+        // sortedIndices - use active sorted values buffer (correct for both GPU and CPU sort)
+        enc->setBuffer(activeSortedValues, 0, 2);  
         enc->setBuffer(tileRanges, 0, 3);
         enc->setBuffer(uniformBuffer, 0, 4);
         enc->setBuffer(perPixelLastIdx, 0, 5);

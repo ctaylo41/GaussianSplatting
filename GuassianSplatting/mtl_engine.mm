@@ -9,6 +9,7 @@
 #include "mtl_engine.hpp"
 #include "gpu_sort.hpp"
 #include <iostream>
+#include <iomanip>
 #include "image_loader.hpp"
 #include "gradients.hpp"
 #include <chrono>
@@ -105,7 +106,7 @@ void MTLEngine::run(Camera& camera) {
             if (epochIterations % 10 == 0) {
                 std::cout << "\rEpoch " << currentEpoch
                           << " | Image " << currentImageIdx << "/" << trainingImages.size()
-                          << " | Loss: " << (epochLoss / epochIterations) << std::flush;
+                          << " | Loss: " << std::fixed << std::setprecision(6) << (epochLoss / epochIterations) << std::flush;
             }
             
             // Density control application
@@ -149,7 +150,7 @@ void MTLEngine::run(Camera& camera) {
             // New epoch
             if (currentImageIdx >= trainingImages.size()) {
                 std::cout << std::endl << "=== Epoch " << currentEpoch << " complete | Avg Loss: "
-                          << (epochLoss / epochIterations) << " ===" << std::endl;
+                          << std::fixed << std::setprecision(6) << (epochLoss / epochIterations) << " ===" << std::endl;
                 currentImageIdx = 0;
                 currentEpoch++;
                 epochLoss = 0.0f;
@@ -1012,8 +1013,67 @@ float MTLEngine::trainStep(size_t imageIndex,
                     lr_opacity,    // opacity lr (official: opacity_lr = 0.025)
                     lr_sh);        // sh lr (official: feature_lr = 0.0025)
     
-    // Periodic stats every 200 images
-    if (saveCounter % 200 == 0) {
+    // Check for NaN contamination and gradient health after optimizer step
+    if (saveCounter % 100 == 0) {
+        Gaussian* g = (Gaussian*)gaussianBuffer->contents();
+        GaussianGradients* grads = (GaussianGradients*)gaussianGradients->contents();
+        
+        int nanCount = 0;
+        int shNanCount = 0;
+        float maxSH = -1e10f;
+        float minSH = 1e10f;
+        float maxSHGrad = 0.0f;
+        float avgSHGrad = 0.0f;
+        int saturatedCount = 0;  // Colors near 0 or 1
+        
+        // Check first 1000 Gaussians for NaN and gradients
+        const int checkCount = std::min((size_t)1000, gaussianCount);
+        for (int i = 0; i < checkCount; i++) {
+            if (std::isnan(g[i].position.x) || std::isnan(g[i].position.y) || std::isnan(g[i].position.z)) {
+                nanCount++;
+            }
+            if (std::isnan(g[i].opacity)) {
+                nanCount++;
+            }
+            
+            // Check SH coefficients and gradients
+            for (int sh = 0; sh < 12; sh++) {
+                if (std::isnan(g[i].sh[sh])) {
+                    shNanCount++;
+                    break;  // Only count once per Gaussian
+                }
+                maxSH = fmaxf(maxSH, g[i].sh[sh]);
+                minSH = fminf(minSH, g[i].sh[sh]);
+                
+                // Check gradient magnitude for SH
+                float grad = grads[i].sh[sh];
+                maxSHGrad = fmaxf(maxSHGrad, fabsf(grad));
+                avgSHGrad += fabsf(grad);
+            }
+            
+            // Check if color is saturated (which would zero gradients)
+            float r = 0.28209479177387814f * g[i].sh[0] + 0.5f;
+            float gr = 0.28209479177387814f * g[i].sh[4] + 0.5f;
+            float b = 0.28209479177387814f * g[i].sh[8] + 0.5f;
+            if (r <= 0.01f || r >= 0.99f || gr <= 0.01f || gr >= 0.99f || b <= 0.01f || b >= 0.99f) {
+                saturatedCount++;
+            }
+        }
+        
+        avgSHGrad /= (checkCount * 12);
+        
+        if (nanCount > 0 || shNanCount > 0) {
+            printf("\n⚠️  WARNING: NaN DETECTED! %d position/opacity NaNs, %d SH NaNs (checked %d Gaussians)\n", 
+                   nanCount, shNanCount, checkCount);
+        }
+        
+        // Report SH value range and gradient health
+        printf("[SH] values: [%.4f, %.4f] | gradients: max=%.6f avg=%.6f | saturated: %d/%d\n", 
+               minSH, maxSH, maxSHGrad, avgSHGrad, saturatedCount, checkCount);
+    }
+    
+    // Periodic stats every 100 images
+    if (saveCounter % 100 == 0) {
         // Print average opacity and scale
         Gaussian* g = (Gaussian*)gaussianBuffer->contents();
         // Calculate average opacity and scale for a sample of Gaussians
@@ -1069,9 +1129,8 @@ void MTLEngine::train(size_t numEpochs) {
     // Back to official value - need Gaussians to shrink for sharpness
     const float SCALE_LR = 0.005f;  
     const float ROTATION_LR = 0.001f;
-    // Match official: opacity_lr = 0.025 (was 0.05, 2x too fast)
-    // Slower opacity recovery gives colors time to converge before becoming visible
-    const float OPACITY_LR = 0.025f;
+    // Increased from 0.025 to help opacity recovery after resets
+    const float OPACITY_LR = 0.05f;
     const float SH_LR = 0.0025f;
     
     // Total iterations for LR scheduling
@@ -1097,14 +1156,32 @@ void MTLEngine::train(size_t numEpochs) {
             float currentPositionLR = exponentialLRDecay(POSITION_LR_INIT, POSITION_LR_FINAL, 
                                                           totalIterations, totalExpectedIters);
             
-            float loss = trainStep(imgIdx, currentPositionLR, SCALE_LR, ROTATION_LR, OPACITY_LR, SH_LR);
+            // Boost opacity LR 3x for 1000 iterations after each opacity reset
+            float currentOpacityLR = OPACITY_LR;
+            size_t itersSinceReset = totalIterations % OPACITY_RESET_INTERVAL;
+            if (totalIterations >= OPACITY_RESET_INTERVAL && itersSinceReset < 1000) {
+                currentOpacityLR = OPACITY_LR * 3.0f;  // 3x boost for faster recovery
+            }
+            
+            float loss = trainStep(imgIdx, currentPositionLR, SCALE_LR, ROTATION_LR, currentOpacityLR, SH_LR);
             epochLoss += loss;
             totalIterations++;
             
             // Progress update every 20 images
             if (imgIdx % 20 == 0) {
                 std::cout << "\rEpoch " << epoch << " [" << imgIdx << "/" << trainingImages.size()
-                          << "] Loss: " << (epochLoss / (imgIdx + 1)) << std::flush;
+                          << "] Iter: " << totalIterations 
+                          << " | Loss: " << std::fixed << std::setprecision(4) << (epochLoss / (imgIdx + 1)) 
+                          << std::flush;
+            }
+            
+            // Detailed progress every 100 iterations
+            if (totalIterations % 100 == 0) {
+                std::cout << "\n[Iter " << totalIterations << "] "
+                          << "Loss: " << std::fixed << std::setprecision(4) << loss
+                          << " | Gaussians: " << gaussianCount 
+                          << " | Position LR: " << std::scientific << std::setprecision(2) << currentPositionLR
+                          << std::endl;
             }
             
             // ============================================

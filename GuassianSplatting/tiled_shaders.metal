@@ -322,16 +322,16 @@ kernel void tiledForward(
     uint tileIdx = tileY * uniforms.numTilesX + tileX;
     TileRange range = tileRanges[tileIdx];
     
-    // Use half precision for color accumulation to increase throughput
-    half3 color = half3(0);
-    half T = 1.0h;
+    // Use float precision to match backward pass - critical for gradient accuracy
+    float3 color = float3(0);
+    float T = 1.0f;
     float2 pixelPos = float2(gid) + 0.5;
     
     uint lastIdx = 0;
     bool hasContrib = false;
     
     // Rely purely on T termination instead of artificial cap
-    for (uint i = 0; i < range.count && T > 0.0001h; i++) {
+    for (uint i = 0; i < range.count && T > 0.0001f; i++) {
         uint sortIdx = range.start + i;
         uint gIdx = sortedIndices[sortIdx];
         
@@ -350,38 +350,38 @@ kernel void tiledForward(
         float conicMag = abs(p.conic.x) + abs(p.conic.y) + abs(p.conic.z);
         if (conicMag < 0.0001) continue;
         
-        // Gaussian evaluation in half precision
-        half power = half(-0.5 * (p.conic.x * d.x * d.x +
-                                   2.0 * p.conic.y * d.x * d.y +
-                                   p.conic.z * d.y * d.y));
+        // Gaussian evaluation in float precision to match backward pass
+        float power = -0.5f * (p.conic.x * d.x * d.x +
+                               2.0f * p.conic.y * d.x * d.y +
+                               p.conic.z * d.y * d.y);
         
         // Early skip for negligible contribution
-        if (power > 0.0h || power < -4.5h) continue;
+        if (power > 0.0f || power < -4.5f) continue;
         
         // Compute Gaussian weight and alpha
-        half G = exp(power);
-        half alpha = min(half(p.opacity) * G, 0.99h);
+        float G = exp(power);
+        float alpha = min(p.opacity * G, 0.99f);
         
         // Skip negligible alpha
-        if (alpha < half(1.0 / 255.0)) continue;
+        if (alpha < 1.0f / 255.0f) continue;
         
         // Accumulate color using alpha blending
-        color += half3(p.color) * alpha * T;
-        T *= (1.0h - alpha);
+        color += float3(p.color) * alpha * T;
+        T *= (1.0f - alpha);
         
         lastIdx = sortIdx;
         hasContrib = true;
     }
     
     // Blend with white background using remaining transmittance
-    half3 bgColor = half3(1.0h, 1.0h, 1.0h);
+    float3 bgColor = float3(1.0f, 1.0f, 1.0f);
     color = color + bgColor * T;
     
     // Store last contributing index for backward pass
     uint pixelIdx = gid.y * uint(uniforms.screenSize.x) + gid.x;
     lastContribIdx[pixelIdx] = hasContrib ? lastIdx : UINT_MAX;
     
-    output.write(float4(float3(color), 1.0), gid);
+    output.write(float4(color, 1.0), gid);
 }
 
 // Tiled backward rendering kernel
