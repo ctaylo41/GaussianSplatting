@@ -294,11 +294,14 @@ kernel void projectGaussians(
     proj.opacity = 1.0 / (1.0 + exp(-rawOpacity));
     
     // Color from SH DC terms
-    proj.color = clamp(float3(
+    // IMPORTANT: Only clamp lower bound (no negative light), NOT upper bound!
+    // This matches official 3DGS - allows HDR-ish values during training
+    // Final framebuffer clamp handles display, but gradients always flow
+    proj.color = max(float3(
         SH_C0 * g.sh[0] + 0.5f,
         SH_C0 * g.sh[4] + 0.5f,
         SH_C0 * g.sh[8] + 0.5f
-    ), 0.0f, 1.0f);
+    ), float3(0.0f));
     
     projected[tid] = proj;
 }
@@ -495,7 +498,9 @@ kernel void tiledBackward(
         if (alpha < 1.0 / 255.0) continue;
         
         // Recover T at this position by undoing the alpha blend
-        T = T / max(1.0 - alpha, 0.0001);
+        // Use larger epsilon (0.01) to match forward pass alpha cap of 0.99
+        // This prevents numerical instability from division by very small numbers
+        T = T / max(1.0 - alpha, 0.01);
         
         float weight = alpha * T;
         
@@ -692,36 +697,55 @@ kernel void tiledBackward(
                          2.0f * z_q * (dL_dMt_scaled[1][1] + dL_dMt_scaled[0][0]));
         
         // Atomic accumulation
+        // SH gradient: dL/dsh = dL/dcolor * dcolor/dsh = dL/dcolor * SH_C0
+        // Forward: color = max(SH_C0 * sh + 0.5, 0) - only lower clamp!
+        // (g_orig already fetched above at line 631)
+        float3 pre_clamp_color = float3(
+            SH_C0 * g_orig.sh[0] + 0.5f,
+            SH_C0 * g_orig.sh[4] + 0.5f,
+            SH_C0 * g_orig.sh[8] + 0.5f
+        );
+
+        float3 sh_grad = dL_dColor * SH_C0;
+
+        // Leaky gradient for clamped colors - allows black Gaussians to recover
+        // Instead of zeroing gradient completely, use small factor (like leaky ReLU)
+        if (pre_clamp_color.r <= 0.0f) sh_grad.r *= 0.01f;
+        if (pre_clamp_color.g <= 0.0f) sh_grad.g *= 0.01f;
+        if (pre_clamp_color.b <= 0.0f) sh_grad.b *= 0.01f;
+
+        // Atomic gradient accumulation - no per-pixel clamping needed
+        // Optimizer already clamps accumulated gradients before Adam update
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0],
-            dL_dColor.r * SH_C0, memory_order_relaxed);
+            sh_grad.r, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[4],
-            dL_dColor.g * SH_C0, memory_order_relaxed);
+            sh_grad.g, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[8],
-            dL_dColor.b * SH_C0, memory_order_relaxed);
-        
+            sh_grad.b, memory_order_relaxed);
+
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].opacity,
             dL_dRawOpacity, memory_order_relaxed);
-        
+
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_x,
             dL_dWorldPos.x, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_y,
             dL_dWorldPos.y, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_z,
             dL_dWorldPos.z, memory_order_relaxed);
-        
-        // Viewspace screen-space gradients for density control
+
+        // Viewspace gradients for density control
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_x,
             dL_dScreenPos.x, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_y,
             dL_dScreenPos.y, memory_order_relaxed);
-        
+
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_x,
             dL_dLogScale.x, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_y,
             dL_dLogScale.y, memory_order_relaxed);
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_z,
             dL_dLogScale.z, memory_order_relaxed);
-        
+
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 0,
             dL_dq.x, memory_order_relaxed);
         atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 1,

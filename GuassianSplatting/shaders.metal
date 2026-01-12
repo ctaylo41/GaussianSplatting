@@ -24,13 +24,15 @@ struct Gaussian {
 };
 
 // Uniforms passed to shaders
+// MUST match C++ Uniforms struct in mtl_engine.hpp exactly
 struct Uniforms {
     float4x4 viewMatrix;
     float4x4 projectionMatrix;
     float4x4 viewProjectionMatrix;
     float2 screenSize;
     float2 focalLength;
-    float3 cameraPos;       
+    float3 cameraPos;
+    float _pad;  // Match C++ struct padding
 };
 
 // Vertex output structure
@@ -55,9 +57,10 @@ constant float MAX_SCALE = 8.0f;
 constant float MAX_SCALE_TRAIN = 4.0f;
 
 // Evaluate Spherical Harmonics (only DC term used)
+// Only clamp lower bound - matches official 3DGS implementation
 float3 evalSH(float sh[12], float3 dir) {
     float3 result = float3(sh[0], sh[4], sh[8]) * SH_C0 + 0.5f;
-    return clamp(result, 0.0f, 1.0f);
+    return max(result, float3(0.0f));  // No upper clamp!
 }
 
 // Convert quaternion to rotation matrix
@@ -710,12 +713,14 @@ kernel void adamStep(
         float m_hat = m / bc1;
         float v_hat = v / bc2;
         float newSH = gaussians[tid].sh[i] - lrs[4] * m_hat / (sqrt(v_hat) + epsilon);
-        
-        // Clamp SH to reasonable range to prevent extreme values
-        // SH_C0 * sh + 0.5 should give colors in [0,1], so sh in [-1.77, 1.77]
-        // Using ±3.0 allows some overshoot for training dynamics
-        newSH = clamp(newSH, -3.0f, 3.0f);
-        
+
+        // Wide safety clamp for numerical stability
+        // With RGBA16Float render target, loss sees true HDR values and provides
+        // proper gradient feedback, so this clamp should rarely trigger
+        // Range: SH=-5 gives color≈-0.9 (will be clamped to 0 in forward)
+        //        SH=+5 gives color≈+1.9 (valid HDR)
+        newSH = clamp(newSH, -5.0f, 5.0f);
+
         gaussians[tid].sh[i] = newSH;
     }
 }

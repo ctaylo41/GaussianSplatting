@@ -117,8 +117,13 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
 {
     createPipelines(library);
     
+    // Static assert struct sizes - CRITICAL for Metal compatibility
+    static_assert(sizeof(ProjectedGaussian) == 88, "ProjectedGaussian must be 88 bytes!");
+    static_assert(sizeof(TiledUniforms) == 240, "TiledUniforms must be 240 bytes!");
+
     // Verify struct alignment should be 88 bytes
     printf("sizeof(ProjectedGaussian) = %zu bytes (expected 88)\n", sizeof(ProjectedGaussian));
+    printf("sizeof(TiledUniforms) = %zu bytes (expected 240)\n", sizeof(TiledUniforms));
     printf("  offsetof(screenPos) = %zu (expected 0)\n", offsetof(ProjectedGaussian, screenPos));
     printf("  offsetof(conic) = %zu (expected 8)\n", offsetof(ProjectedGaussian, conic));
     printf("  offsetof(depth) = %zu (expected 20)\n", offsetof(ProjectedGaussian, depth));

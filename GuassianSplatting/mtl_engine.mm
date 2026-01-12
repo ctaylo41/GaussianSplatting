@@ -16,18 +16,39 @@
 #include <fstream>
 #include <Foundation/NSAutoreleasePool.hpp>
 
+// Helper to convert half-float to float
+static float halfToFloat(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+
+    if (exp == 0) {
+        if (mant == 0) return sign ? -0.0f : 0.0f;
+        // Denormalized
+        float f = mant / 1024.0f;
+        return sign ? -f * powf(2.0f, -14.0f) : f * powf(2.0f, -14.0f);
+    } else if (exp == 31) {
+        return mant ? NAN : (sign ? -INFINITY : INFINITY);
+    }
+
+    float f = (1.0f + mant / 1024.0f) * powf(2.0f, (float)exp - 15.0f);
+    return sign ? -f : f;
+}
+
 // For debugging save a texture to PPM file
 void saveTextureToPPM(MTL::Texture* texture, MTL::Device* device, MTL::CommandQueue* queue, const char* filename) {
     uint32_t width = texture->width();
     uint32_t height = texture->height();
-    // RGBA
-    size_t bytesPerPixel = 4;  
+
+    // Detect texture format
+    bool isFloat16 = (texture->pixelFormat() == MTL::PixelFormatRGBA16Float);
+    size_t bytesPerPixel = isFloat16 ? 8 : 4;
     size_t bytesPerRow = width * bytesPerPixel;
     size_t totalBytes = bytesPerRow * height;
-    
+
     // Create a shared buffer to read back the texture
     MTL::Buffer* readbackBuffer = device->newBuffer(totalBytes, MTL::ResourceStorageModeShared);
-    
+
     // Copy texture to buffer
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
     MTL::BlitCommandEncoder* blit = cmdBuffer->blitCommandEncoder();
@@ -36,27 +57,39 @@ void saveTextureToPPM(MTL::Texture* texture, MTL::Device* device, MTL::CommandQu
     blit->endEncoding();
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
-    
+
     // Access buffer data
     uint8_t* data = (uint8_t*)readbackBuffer->contents();
-    
+
     // Write PPM file
     std::ofstream file(filename, std::ios::binary);
     file << "P6\n" << width << " " << height << "\n255\n";
-    
-    // Convert RGBA float to RGB bytes
+
+    // Convert to RGB bytes
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             size_t offset = y * bytesPerRow + x * bytesPerPixel;
-            // R
-            file.put(data[offset]);    
-            // G
-            file.put(data[offset + 1]); 
-            // B
-            file.put(data[offset + 2]); 
+
+            if (isFloat16) {
+                // RGBA16Float: 4 half-floats (2 bytes each)
+                uint16_t* halfData = (uint16_t*)(data + offset);
+                float r = halfToFloat(halfData[0]);
+                float g = halfToFloat(halfData[1]);
+                float b = halfToFloat(halfData[2]);
+
+                // Clamp and convert to 8-bit
+                file.put((uint8_t)(fminf(fmaxf(r, 0.0f), 1.0f) * 255.0f));
+                file.put((uint8_t)(fminf(fmaxf(g, 0.0f), 1.0f) * 255.0f));
+                file.put((uint8_t)(fminf(fmaxf(b, 0.0f), 1.0f) * 255.0f));
+            } else {
+                // RGBA8Unorm: 4 uint8_t
+                file.put(data[offset]);
+                file.put(data[offset + 1]);
+                file.put(data[offset + 2]);
+            }
         }
     }
-    
+
     // Cleanup
     file.close();
     readbackBuffer->release();
@@ -725,10 +758,12 @@ void MTLEngine::createRenderTarget(uint32_t width, uint32_t height) {
     if (renderTarget) renderTarget->release();
     
     // Create texture descriptor
+    // Use RGBA16Float to store actual HDR color values without clamping
+    // This allows the loss to see true color values and provide proper gradient feedback
     MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
     desc->setWidth(width);
     desc->setHeight(height);
-    desc->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+    desc->setPixelFormat(MTL::PixelFormatRGBA16Float);
     desc->setStorageMode(MTL::StorageModeShared);
     desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
     renderTarget = metalDevice->newTexture(desc);
@@ -1063,11 +1098,17 @@ float MTLEngine::trainStep(size_t imageIndex,
                 avgSHGrad += fabsf(grad);
             }
             
-            // Check if color is saturated (which would zero gradients)
-            float r = 0.28209479177387814f * g[i].sh[0] + 0.5f;
-            float gr = 0.28209479177387814f * g[i].sh[4] + 0.5f;
-            float b = 0.28209479177387814f * g[i].sh[8] + 0.5f;
-            if (r <= 0.01f || r >= 0.99f || gr <= 0.01f || gr >= 0.99f || b <= 0.01f || b >= 0.99f) {
+            // Check if color output would be clamped to 0 (black Gaussian)
+            // color = max(SH_C0 * sh + 0.5, 0), clamped when SH <= -0.5/SH_C0 ≈ -1.77
+            const float SH_C0 = 0.28209479177387814f;
+            const float BLACK_THRESHOLD = -0.5f / SH_C0;  // ≈ -1.77
+            bool isBlack = false;
+            if (g[i].sh[0] <= BLACK_THRESHOLD ||
+                g[i].sh[4] <= BLACK_THRESHOLD ||
+                g[i].sh[8] <= BLACK_THRESHOLD) {
+                isBlack = true;
+            }
+            if (isBlack) {
                 saturatedCount++;
             }
         }
@@ -1080,7 +1121,8 @@ float MTLEngine::trainStep(size_t imageIndex,
         }
         
         // Report SH value range and gradient health
-        printf("[SH] values: [%.4f, %.4f] | gradients: max=%.6f avg=%.6f | saturated: %d/%d\n", 
+        // "black" = Gaussians where at least one color channel is clamped to 0
+        printf("[SH] values: [%.4f, %.4f] | gradients: max=%.6f avg=%.6f | black: %d/%d\n",
                minSH, maxSH, maxSHGrad, avgSHGrad, saturatedCount, checkCount);
     }
     
