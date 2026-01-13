@@ -20,10 +20,15 @@ static const int NUM_THREADS = 8;
 // Paper's recommended thresholds (from official 3DGS)
 
 // densify_grad_threshold
-static constexpr float GRAD_THRESHOLD = 0.0002f;      
+static constexpr float GRAD_THRESHOLD = 0.0002f;
 // min_opacity - MUST be much lower than opacity reset value (sigmoid(-4.6) = 0.01)
 // Give plenty of margin for Gaussians to recover after reset!
 static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;  // Official uses 0.005
+// Prune Gaussians that are too dark (black) - minimum brightness threshold
+// Color = sigmoid(SH_C0 * dc + 0.5), so dc < -1.78 gives color < 0.01
+// Using max RGB brightness after sigmoid activation
+static constexpr float MIN_BRIGHTNESS_THRESHOLD = 0.02f;  // Prune if max(R,G,B) < this
+static constexpr float SH_C0 = 0.28209479177387814f;
 // percent_dense for clone vs split (MUST match official: 0.01)
 static constexpr float PERCENT_DENSE = 0.01f;  // Was 0.001 - FIXED to match official!         
 static constexpr size_t MAX_GAUSSIANS = 1000000;
@@ -36,8 +41,10 @@ static constexpr float MAX_SCALE_LOG = 4.0f;
 // Opacity reset interval - SKIP density control around these iterations! (3000, 6000, 9000, 12000)
 static constexpr size_t OPACITY_RESET_INTERVAL = 3000;
 // Warm-up iterations after opacity reset before resuming density control
-// Set to 0 to match official (they have no warmup)
-static constexpr size_t OPACITY_RESET_WARMUP = 0;          
+// Skip density control for 500 iters after reset to let opacities AND scales recover
+// 300 was too short - Gaussians still had large radii and got mass-pruned
+// This prevents the death spiral where reset → prune 400k → loss explodes
+static constexpr size_t OPACITY_RESET_WARMUP = 500;          
 
 // Scene extent set during initialization
 static float sceneExtent = 1.0f; 
@@ -280,7 +287,9 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     static float maxScreenPixels = -1.0f;
     static bool thresholdComputed = false;
     
-    const bool enableScreenPruning = (iteration > OPACITY_RESET_INTERVAL);
+    // Don't enable screen pruning until well after opacity reset + warmup
+    // This prevents mass-pruning of large Gaussians before they've adapted
+    const bool enableScreenPruning = (iteration > OPACITY_RESET_INTERVAL + OPACITY_RESET_WARMUP + 200);
     
     // Compute threshold ONCE at first densification after opacity reset
     if (enableScreenPruning && !thresholdComputed && gaussianCount > 100) {
@@ -339,11 +348,13 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     static uint32_t threadPruned[NUM_THREADS];
     static uint32_t threadCloned[NUM_THREADS];
     static uint32_t threadSplit[NUM_THREADS];
-    
+    static uint32_t threadPrunedBlack[NUM_THREADS];  // Track black Gaussian pruning
+
     // Reset per-thread counters
     memset(threadPruned, 0, sizeof(threadPruned));
     memset(threadCloned, 0, sizeof(threadCloned));
     memset(threadSplit, 0, sizeof(threadSplit));
+    memset(threadPrunedBlack, 0, sizeof(threadPrunedBlack));
     
     // Capture locals for block - now using correct PERCENT_DENSE = 0.01
     const float splitThreshold = PERCENT_DENSE * sceneExtent;
@@ -367,7 +378,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
         size_t start = t * chunkSize;
         size_t end = std::min(start + chunkSize, gaussianCount);
         
-        uint32_t localPruned = 0, localCloned = 0, localSplit = 0;
+        uint32_t localPruned = 0, localCloned = 0, localSplit = 0, localPrunedBlack = 0;
         
         // Process Gaussians in this chunk
         for (size_t i = start; i < end; i++) {
@@ -390,6 +401,15 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             // ============================================
             // Official: prune_mask = (self.get_opacity < min_opacity).squeeze()
             bool shouldPrune = (opacity < OPACITY_PRUNE_THRESHOLD);
+
+            // DISABLED: Black Gaussian pruning was causing white holes!
+            // Black + opaque Gaussians are USEFUL - they block the white background.
+            // When an area should be dark, Gaussians there get pushed dark by gradients.
+            // If we prune them, the white background shows through, creating holes.
+            // The holes then cause adjacent Gaussians to get pushed darker, which get
+            // pruned too - creating a death spiral of expanding white holes.
+            //
+            // Leave black Gaussians alone - they serve an important purpose!
             
             // Official (when max_screen_size is set, i.e., after iter 3000):
             //   big_points_vs = self.max_radii2D > max_screen_size
@@ -446,8 +466,9 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
         threadPruned[t] = localPruned;
         threadCloned[t] = localCloned;
         threadSplit[t] = localSplit;
+        threadPrunedBlack[t] = localPrunedBlack;
     });
-    
+
     // Sum up thread-local counters
     for (int t = 0; t < NUM_THREADS; t++) {
         stats.numPruned += threadPruned[t];

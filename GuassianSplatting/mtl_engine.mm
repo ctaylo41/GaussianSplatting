@@ -96,6 +96,75 @@ void saveTextureToPPM(MTL::Texture* texture, MTL::Device* device, MTL::CommandQu
     printf("Saved render to %s (%dx%d)\n", filename, width, height);
 }
 
+// Analyze rendered texture for brightness statistics (debug)
+void analyzeRenderBrightness(MTL::Texture* texture, MTL::Device* device, MTL::CommandQueue* queue) {
+    uint32_t width = texture->width();
+    uint32_t height = texture->height();
+
+    // Detect texture format
+    bool isFloat16 = (texture->pixelFormat() == MTL::PixelFormatRGBA16Float);
+    size_t bytesPerPixel = isFloat16 ? 8 : 4;
+    size_t bytesPerRow = width * bytesPerPixel;
+    size_t totalBytes = bytesPerRow * height;
+
+    // Create a shared buffer to read back the texture
+    MTL::Buffer* readbackBuffer = device->newBuffer(totalBytes, MTL::ResourceStorageModeShared);
+
+    // Copy texture to buffer
+    MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
+    MTL::BlitCommandEncoder* blit = cmdBuffer->blitCommandEncoder();
+    blit->copyFromTexture(texture, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(width, height, 1),
+                          readbackBuffer, 0, bytesPerRow, 0);
+    blit->endEncoding();
+    cmdBuffer->commit();
+    cmdBuffer->waitUntilCompleted();
+
+    uint8_t* data = (uint8_t*)readbackBuffer->contents();
+
+    // Analyze pixel brightness
+    int overBrightPixels = 0;      // Any channel > 1.0
+    int nearWhitePixels = 0;       // All channels > 0.95 (high background bleed)
+    int veryBrightPixels = 0;      // Max channel > 1.5
+    float maxBrightness = 0.0f;
+    float totalBrightness = 0.0f;
+    uint32_t totalPixels = width * height;
+
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            size_t offset = y * bytesPerRow + x * bytesPerPixel;
+            float r, g, b;
+
+            if (isFloat16) {
+                uint16_t* halfData = (uint16_t*)(data + offset);
+                r = halfToFloat(halfData[0]);
+                g = halfToFloat(halfData[1]);
+                b = halfToFloat(halfData[2]);
+            } else {
+                r = data[offset] / 255.0f;
+                g = data[offset + 1] / 255.0f;
+                b = data[offset + 2] / 255.0f;
+            }
+
+            float brightness = (r + g + b) / 3.0f;
+            float maxChannel = fmaxf(fmaxf(r, g), b);
+            totalBrightness += brightness;
+            if (maxChannel > maxBrightness) maxBrightness = maxChannel;
+
+            if (r > 1.0f || g > 1.0f || b > 1.0f) overBrightPixels++;
+            if (r > 0.95f && g > 0.95f && b > 0.95f) nearWhitePixels++;
+            if (maxChannel > 1.5f) veryBrightPixels++;
+        }
+    }
+
+    float avgBrightness = totalBrightness / totalPixels;
+    float nearWhitePct = 100.0f * nearWhitePixels / totalPixels;
+
+    printf("[Render] over-bright: %d | near-white(>0.95): %d (%.1f%%) | very-bright(>1.5): %d | max: %.2f | avg: %.3f\n",
+           overBrightPixels, nearWhitePixels, nearWhitePct, veryBrightPixels, maxBrightness, avgBrightness);
+
+    readbackBuffer->release();
+}
+
 // Initialize the Metal engine
 void MTLEngine::init() {
     initDevice();
@@ -1023,11 +1092,14 @@ float MTLEngine::trainStep(size_t imageIndex,
         char filename[64];
         snprintf(filename, sizeof(filename), "/tmp/train_render_%04d.ppm", saveCounter);
         saveTextureToPPM(renderTarget, metalDevice, commandQueue, filename);
-        
+
         // Also save ground truth for comparison
         char gtFilename[64];
         snprintf(gtFilename, sizeof(gtFilename), "/tmp/ground_truth_%04d.ppm", saveCounter);
         saveTextureToPPM(img.texture, metalDevice, commandQueue, gtFilename);
+
+        // Analyze render brightness for white spot debugging
+        analyzeRenderBrightness(renderTarget, metalDevice, commandQueue);
     }
     saveCounter++;
     
@@ -1124,22 +1196,54 @@ float MTLEngine::trainStep(size_t imageIndex,
         // "black" = Gaussians where at least one color channel is clamped to 0
         printf("[SH] values: [%.4f, %.4f] | gradients: max=%.6f avg=%.6f | black: %d/%d\n",
                minSH, maxSH, maxSHGrad, avgSHGrad, saturatedCount, checkCount);
+
+        // Count Gaussians at SH cap and over-bright
+        int atCapR = 0, atCapG = 0, atCapB = 0;
+        int overBrightR = 0, overBrightG = 0, overBrightB = 0;
+        int overBrightAny = 0;
+        for (int i = 0; i < checkCount; i++) {
+            // Check if at +5 cap
+            if (g[i].sh[0] >= 4.9f) atCapR++;
+            if (g[i].sh[4] >= 4.9f) atCapG++;
+            if (g[i].sh[8] >= 4.9f) atCapB++;
+            const float SH_C0 = 0.28209479177387814f;
+
+            // Check if computed color > 1.0 (over-bright)
+            float colorR = SH_C0 * g[i].sh[0] + 0.5f;
+            float colorG = SH_C0 * g[i].sh[4] + 0.5f;
+            float colorB = SH_C0 * g[i].sh[8] + 0.5f;
+            if (colorR > 1.0f) overBrightR++;
+            if (colorG > 1.0f) overBrightG++;
+            if (colorB > 1.0f) overBrightB++;
+            if (colorR > 1.0f || colorG > 1.0f || colorB > 1.0f) overBrightAny++;
+        }
+        printf("[SH] at_cap(R/G/B): %d/%d/%d | over-bright(R/G/B/any): %d/%d/%d/%d of %d\n",
+               atCapR, atCapG, atCapB, overBrightR, overBrightG, overBrightB, overBrightAny, checkCount);
     }
-    
+
     // Periodic stats every 100 images
     if (saveCounter % 100 == 0) {
         // Print average opacity and scale
         Gaussian* g = (Gaussian*)gaussianBuffer->contents();
         // Calculate average opacity and scale for a sample of Gaussians
         float avgOpacity = 0, avgScale = 0;
-        // Sample up to 100 Gaussians for stats
-        const int sampleCount = std::min((size_t)100, gaussianCount);
+        int opAbove90 = 0, opAbove95 = 0, opAbove99 = 0;
+        // Sample up to 1000 Gaussians for stats
+        const int sampleCount = std::min((size_t)1000, gaussianCount);
         for (int i = 0; i < sampleCount; i++) {
-            avgOpacity += 1.0f / (1.0f + exp(-g[i].opacity));
+            float sigOp = 1.0f / (1.0f + exp(-g[i].opacity));
+            avgOpacity += sigOp;
             avgScale += (exp(g[i].scale.x) + exp(g[i].scale.y) + exp(g[i].scale.z)) / 3.0f;
+
+            // Count opacity distribution
+            if (sigOp > 0.90f) opAbove90++;
+            if (sigOp > 0.95f) opAbove95++;
+            if (sigOp > 0.99f) opAbove99++;
         }
         printf("\n[iter %d] Gaussians: %zu | Avg opacity: %.3f | Avg scale: %.4f\n",
                saveCounter, gaussianCount, avgOpacity / sampleCount, avgScale / sampleCount);
+        printf("[Opacity] above 0.90: %d | above 0.95: %d | above 0.99: %d (of %d sampled)\n",
+               opAbove90, opAbove95, opAbove99, sampleCount);
     }
     
     return loss;

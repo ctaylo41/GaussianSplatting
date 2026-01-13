@@ -22,20 +22,20 @@ struct TileRange {
 // Use float arrays instead of simd_float3 to match Metal packed_float3 layout
 // simd_float2 has 8-byte alignment, so compiler adds 4 bytes padding after tileMaxY
 struct ProjectedGaussian {
-    simd_float2 screenPos;   
-    float conic[3];          
-    float depth;             
-    float opacity;           
-    float color[3];          
-    float radius;            
-    uint32_t tileMinX;       
-    uint32_t tileMinY;       
-    uint32_t tileMaxX;       
-    uint32_t tileMaxY;       
-    float _pad1;             
-    simd_float2 viewPos_xy;  
-    float cov2D[3];          
-    float _pad2;             
+    simd_float2 screenPos;
+    float conic[3];
+    float depth;
+    float opacity;
+    float color[3];
+    float radius;
+    uint32_t tileMinX;
+    uint32_t tileMinY;
+    uint32_t tileMaxX;
+    uint32_t tileMaxY;
+    float _pad1;
+    simd_float2 viewPos_xy;
+    float cov2D[3];
+    float viewDir[3];        // Cached view direction for backward pass (replaces _pad2)
 };
 
 // Uniforms for tiled rasterizer

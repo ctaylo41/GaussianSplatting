@@ -196,7 +196,7 @@ int main(int argc, char* argv[]) {
     std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4";
     std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
     // 30k Iterations for 194 images
-    size_t numEpochs = 155; 
+    size_t numEpochs = 286; 
     bool viewOnly = false;
     std::string viewPlyPath = "";
     

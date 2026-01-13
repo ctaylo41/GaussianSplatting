@@ -25,20 +25,20 @@ struct Gaussian {
 // Use packed_float3 to match C++ memory layout 12 bytes, not 16
 // Total 88 bytes
 struct ProjectedGaussian {
-    float2 screenPos;       
-    packed_float3 conic;    
-    float depth;            
-    float opacity;          
-    packed_float3 color;    
-    float radius;           
-    uint tileMinX;          
-    uint tileMinY;          
-    uint tileMaxX;          
-    uint tileMaxY;          
-    float _pad1;            
-    float2 viewPos_xy;      
-    packed_float3 cov2D;    
-    float _pad2;            
+    float2 screenPos;
+    packed_float3 conic;
+    float depth;
+    float opacity;
+    packed_float3 color;
+    float radius;
+    uint tileMinX;
+    uint tileMinY;
+    uint tileMaxX;
+    uint tileMaxY;
+    float _pad1;
+    float2 viewPos_xy;
+    packed_float3 cov2D;
+    packed_float3 viewDir;   // Cached view direction for backward pass
 };  
 
 // Tile range structure
@@ -81,6 +81,7 @@ struct GaussianGradients {
 
 // Constants
 constant float SH_C0 = 0.28209479177387814f;
+constant float SH_C1 = 0.4886025119029199f;
 constant uint TILE_SIZE = 16;
 constant float MAX_RADIUS = 512.0f;
 // exp(5) ≈ 148 reasonable max scale
@@ -292,17 +293,23 @@ kernel void projectGaussians(
     // Apply sigmoid to opacity
     float rawOpacity = clamp(g.opacity, -8.0f, 8.0f);
     proj.opacity = 1.0 / (1.0 + exp(-rawOpacity));
-    
-    // Color from SH DC terms
-    // IMPORTANT: Only clamp lower bound (no negative light), NOT upper bound!
-    // This matches official 3DGS - allows HDR-ish values during training
-    // Final framebuffer clamp handles display, but gradients always flow
-    proj.color = max(float3(
-        SH_C0 * g.sh[0] + 0.5f,
-        SH_C0 * g.sh[4] + 0.5f,
-        SH_C0 * g.sh[8] + 0.5f
-    ), float3(0.0f));
-    
+
+    // Compute view direction (from Gaussian to camera, normalized)
+    // Use fast::normalize - less precise but faster
+    float3 viewDir = fast::normalize(uniforms.cameraPos - float3(g.position));
+
+    // Cache viewDir for backward pass (avoids recomputing per-pixel)
+    proj.viewDir = viewDir;
+
+    // Color from degree-1 SH (DC + linear terms) using fma for speed
+    // SH layout: [0-3] = R (dc, x, y, z), [4-7] = G, [8-11] = B
+    float3 sh1_contrib = viewDir.x * float3(g.sh[1], g.sh[5], g.sh[9]) +
+                         viewDir.y * float3(g.sh[2], g.sh[6], g.sh[10]) +
+                         viewDir.z * float3(g.sh[3], g.sh[7], g.sh[11]);
+    float3 color = fma(float3(SH_C0), float3(g.sh[0], g.sh[4], g.sh[8]),
+                       fma(float3(SH_C1), sh1_contrib, float3(0.5f)));
+    proj.color = max(color, float3(0.0f));
+
     projected[tid] = proj;
 }
 
@@ -518,6 +525,10 @@ kernel void tiledBackward(
         float sig = p.opacity;
         float dAlpha_dRawOp = sig * (1.0 - sig) * G;
         float dL_dRawOpacity = dL_dAlpha * dAlpha_dRawOp;
+
+        // Clamp per-pixel opacity gradient
+        const float MAX_PIXEL_OPACITY_GRAD = 0.1f;
+        dL_dRawOpacity = clamp(dL_dRawOpacity, -MAX_PIXEL_OPACITY_GRAD, MAX_PIXEL_OPACITY_GRAD);
         
         // Gaussian gradient
         // For position/scale gradients, we need dL/dG
@@ -697,31 +708,56 @@ kernel void tiledBackward(
                          2.0f * z_q * (dL_dMt_scaled[1][1] + dL_dMt_scaled[0][0]));
         
         // Atomic accumulation
-        // SH gradient: dL/dsh = dL/dcolor * dcolor/dsh = dL/dcolor * SH_C0
-        // Forward: color = max(SH_C0 * sh + 0.5, 0) - only lower clamp!
-        // (g_orig already fetched above at line 631)
-        float3 pre_clamp_color = float3(
-            SH_C0 * g_orig.sh[0] + 0.5f,
-            SH_C0 * g_orig.sh[4] + 0.5f,
-            SH_C0 * g_orig.sh[8] + 0.5f
-        );
+        // Degree-1 SH gradient: dL/dsh = dL/dcolor * dcolor/dsh
+        // Forward: color = max(SH_C0 * dc + SH_C1 * (sh1*x + sh2*y + sh3*z) + 0.5, 0)
 
-        float3 sh_grad = dL_dColor * SH_C0;
+        // Use cached viewDir from forward pass (avoids expensive normalize per-pixel)
+        float3 viewDir = float3(p.viewDir);
+
+        // Use projected color directly for gradient dampening check (already clamped in forward)
+        float3 pre_clamp_color = float3(p.color);
+
+        // Base color gradient (will be scaled for each SH coefficient)
+        float3 dL_dColor_scaled = dL_dColor;
 
         // Leaky gradient for clamped colors - allows black Gaussians to recover
-        // Instead of zeroing gradient completely, use small factor (like leaky ReLU)
-        if (pre_clamp_color.r <= 0.0f) sh_grad.r *= 0.01f;
-        if (pre_clamp_color.g <= 0.0f) sh_grad.g *= 0.01f;
-        if (pre_clamp_color.b <= 0.0f) sh_grad.b *= 0.01f;
+        if (pre_clamp_color.r <= 0.0f) dL_dColor_scaled.r *= 0.01f;
+        if (pre_clamp_color.g <= 0.0f) dL_dColor_scaled.g *= 0.01f;
+        if (pre_clamp_color.b <= 0.0f) dL_dColor_scaled.b *= 0.01f;
 
-        // Atomic gradient accumulation - no per-pixel clamping needed
-        // Optimizer already clamps accumulated gradients before Adam update
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0],
-            sh_grad.r, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[4],
-            sh_grad.g, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[8],
-            sh_grad.b, memory_order_relaxed);
+        // Dampen gradient for over-bright colors - prevents white spot explosion
+        if (pre_clamp_color.r > 1.0f) dL_dColor_scaled.r *= 0.1f;
+        if (pre_clamp_color.g > 1.0f) dL_dColor_scaled.g *= 0.1f;
+        if (pre_clamp_color.b > 1.0f) dL_dColor_scaled.b *= 0.1f;
+
+        // Per-pixel gradient clamp
+        const float MAX_PIXEL_SH_GRAD = 1.0f;
+        dL_dColor_scaled = clamp(dL_dColor_scaled, -MAX_PIXEL_SH_GRAD, MAX_PIXEL_SH_GRAD);
+
+        // DC term gradients (indices 0, 4, 8)
+        float3 sh_dc_grad = dL_dColor_scaled * SH_C0;
+
+        // Degree-1 term gradients (indices 1,2,3 for R, 5,6,7 for G, 9,10,11 for B)
+        float3 sh_x_grad = dL_dColor_scaled * SH_C1 * viewDir.x;
+        float3 sh_y_grad = dL_dColor_scaled * SH_C1 * viewDir.y;
+        float3 sh_z_grad = dL_dColor_scaled * SH_C1 * viewDir.z;
+
+        // Atomic gradient accumulation for all 12 SH coefficients
+        // R channel: indices 0, 1, 2, 3
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0], sh_dc_grad.r, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[1], sh_x_grad.r, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[2], sh_y_grad.r, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[3], sh_z_grad.r, memory_order_relaxed);
+        // G channel: indices 4, 5, 6, 7
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[4], sh_dc_grad.g, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[5], sh_x_grad.g, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[6], sh_y_grad.g, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[7], sh_z_grad.g, memory_order_relaxed);
+        // B channel: indices 8, 9, 10, 11
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[8], sh_dc_grad.b, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[9], sh_x_grad.b, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[10], sh_y_grad.b, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[11], sh_z_grad.b, memory_order_relaxed);
 
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].opacity,
             dL_dRawOpacity, memory_order_relaxed);

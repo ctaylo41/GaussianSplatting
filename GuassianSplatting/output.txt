@@ -1,549 +1,462 @@
-=== Gaussian Splatting Training ===
-COLMAP path: /Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/sparse/0/
-Images path: /Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4
-Output PLY: /Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply
-Epochs: 155
+[Iter 3500] Loss: 0.2689 | Gaussians: 1000000 | Position LR: 1.20e-04
 
-Loading 1 cameras...
-Loading 194 images...
-Loading 54275 points...
-Camera centroid: (0.0503218, 0.0110655, 0.0495242)
-Camera extent (radius): 4.9829
-Scene extent (from cameras): 4.9829
-Using scene extent: 4.9829
-
-=== Camera Position Debug ===
-Camera 0 world pos: (-3.00268, 1.40077, -2.2284)
-  Raw translation: (0.00276713, -1.10244, 3.83779)
-Camera 1 world pos: (-3.04942, 1.68893, -2.21221)
-  Raw translation: (-0.129735, -0.037532, 4.12639)
-Camera 2 world pos: (-3.51986, 1.3155, -1.36722)
-  Raw translation: (0.0444128, -0.832855, 3.9107)
-Camera 3 world pos: (-3.59116, 1.49893, -1.35664)
-  Raw translation: (0.220618, 0.488876, 4.08607)
-Camera 4 world pos: (-3.70678, 1.06912, -0.211559)
-  Raw translation: (0.183196, -1.00512, 3.72615)
-Computing initial scales from nearest neighbor distances...
-Using median nearest neighbor distance: 0.0544843
-Created 54275 Gaussians from COLMAP points
-Scale stats (log): min=-2.90984 max=-2.90984 avg=-2.90785
-Scale stats (world): min=0.0544843 max=0.0544843 avg=0.0545929
-=== Struct Layout ===
-sizeof(Gaussian): 112
-offsetof position: 0
-offsetof scale: 16
-offsetof rotation: 32
-offsetof opacity: 48
-offsetof sh: 52
-
-=== Sample Gaussian SH values ===
-SH[0] (R DC): -0.7715
-SH[4] (G DC): -0.7715
-SH[8] (B DC): -0.9801
-Recovered color: (0.2824, 0.2824, 0.2235)
-
-=== Scene Bounds ===
-Bounding box: (-71.015, -28.412, -78.733) to (50.470, 15.779, 75.840)
-Center: (-10.273, -6.317, -1.446)
-Diagonal: 201.505
-
-=== Camera Setup ===
-Camera position: (-10.273, 83.006, 287.311)
-Target: (-10.273, -6.317, -1.446)
-Distance: 302.257
-Using Metal device: Apple M1
-Loss pipelines created (L1 + D-SSIM with lambda=0.2)
-Loaded 194 training images
-Loaded 194 training images
-Density control using scene extent: 4.9829
-Density control scene extent set to: 4.9829
-  Split threshold: 0.049829 world units
-  Prune threshold (world): 0.49829 world units
-sizeof(ProjectedGaussian) = 88 bytes (expected 88)
-sizeof(TiledUniforms) = 240 bytes (expected 240)
-  offsetof(screenPos) = 0 (expected 0)
-  offsetof(conic) = 8 (expected 8)
-  offsetof(depth) = 20 (expected 20)
-  offsetof(opacity) = 24 (expected 24)
-  offsetof(color) = 28 (expected 28)
-  offsetof(radius) = 40 (expected 40)
-  offsetof(tileMinX) = 44 (expected 44)
-  offsetof(tileMinY) = 48 (expected 48)
-  offsetof(tileMaxX) = 52 (expected 52)
-  offsetof(tileMaxY) = 56 (expected 56)
-  offsetof(viewPos_xy) = 64 (expected 64)
-  offsetof(cov2D) = 72 (expected 72)
-Loaded 54275 Gaussians
-
-=== Starting Training ===
-Starting training for 155 epochs...
-Gaussians: 54275 | Images: 194
-Learning rate decay: position 0.00016 -> 1.6e-06 over 30070 iterations
-=== Training Uniforms Debug ===
-COLMAP camera size: 4946x3286
-Actual texture size: 1237x822
-Scale factor: 0.250101x0.250152
-Original focal: fx=4649.51 fy=4627.3
-Scaled focal: fx=1162.85 fy=1157.53
-Original principal: cx=2473 cy=1643
-Scaled principal: cx=618.5 cy=411
-
-=== CPU Projection Debug ===
-uniforms.viewMatrix:
-  [0.6357 0.1589 -0.7554 0.0028]
-  [-0.0380 0.9838 0.1750 -1.1024]
-  [0.7710 -0.0825 0.6315 3.8378]
-  [0.0000 0.0000 0.0000 1.0000]
-uniforms.projectionMatrix:
-  [1.8801 0.0000 0.0000 0.0000]
-  [0.0000 2.8164 0.0000 0.0000]
-  [0.0000 0.0000 1.0001 -0.1000]
-  [0.0000 0.0000 1.0000 0.0000]
-screenSize: (1237, 822)
-focalLength: (1162.85, 1157.53)
-
-First 5 Gaussians:
-  [0] world=(-0.03,0.31,0.66) view=(-0.47,-0.68,4.21) clip.w=4.21
-       ndc=(-0.209,-0.455) in frustum: YES
-  [1] world=(-0.03,0.31,0.66) view=(-0.47,-0.68,4.21) clip.w=4.21
-       ndc=(-0.210,-0.455) in frustum: YES
-  [2] world=(0.00,0.15,0.72) view=(-0.52,-0.83,4.29) clip.w=4.29
-       ndc=(-0.227,-0.547) in frustum: YES
-  [3] world=(-0.07,0.63,0.73) view=(-0.50,-0.36,4.19) clip.w=4.19
-       ndc=(-0.224,-0.239) in frustum: YES
-  [4] world=(-0.09,0.57,0.78) view=(-0.55,-0.41,4.21) clip.w=4.21
-       ndc=(-0.246,-0.271) in frustum: YES
-=== Input Gaussian Debug ===
-Gaussian 0: pos=(-0.029486,0.31051,0.663575) scale(log)=(-2.90984,-2.90984,-2.90984) rot=(1,0,0,0) opacity=0
-Gaussian 1: pos=(-0.0304687,0.31028,0.664535) scale(log)=(-2.90984,-2.90984,-2.90984) rot=(1,0,0,0) opacity=0
-Gaussian 2: pos=(0.00490888,0.14659,0.722276) scale(log)=(-2.90984,-2.90984,-2.90984) rot=(1,0,0,0) opacity=0
-
-=== Radius & Tile Debug ===
-Gaussian 0:
-  World scale (exp): (0.0544843,0.0544843,0.0544843) max=0.0544843
-  Screen pos: (489.215,224.046) depth=4.20846
-  Screen radius (pixels): 46 (should be ~3*sqrt(eigenvalue) of 2D cov)
-  Cov2D: (229.743,4.05117,230.732)
-  Tile bounds: (27,11) to (33,16) = 42 tiles
-  Expected tiles: (27,11) to (33,16) = 42 tiles
-  Rough screen scale (worldMax/depth): 0.0129464
-Gaussian 1:
-  World scale (exp): (0.0544843,0.0544843,0.0544843) max=0.0544843
-  Screen pos: (488.827,224.034) depth=4.20833
-  Screen radius (pixels): 46 (should be ~3*sqrt(eigenvalue) of 2D cov)
-  Cov2D: (229.775,4.06381,230.747)
-  Tile bounds: (27,11) to (33,16) = 42 tiles
-  Expected tiles: (27,11) to (33,16) = 42 tiles
-  Rough screen scale (worldMax/depth): 0.0129468
-Gaussian 2:
-  World scale (exp): (0.0544843,0.0544843,0.0544843) max=0.0544843
-  Screen pos: (478.372,186.272) depth=4.28557
-  Screen radius (pixels): 46 (should be ~3*sqrt(eigenvalue) of 2D cov)
-  Cov2D: (222.033,5.08988,225.028)
-  Tile bounds: (27,8) to (32,14) = 42 tiles
-  Expected tiles: (27,8) to (32,14) = 42 tiles
-  Rough screen scale (worldMax/depth): 0.0127134
-Gaussian 3:
-  World scale (exp): (0.0544843,0.0544843,0.0544843) max=0.0544843
-  Screen pos: (480.021,312.922) depth=4.19381
-  Screen radius (pixels): 46 (should be ~3*sqrt(eigenvalue) of 2D cov)
-  Cov2D: (231.765,2.29234,228.069)
-  Tile bounds: (27,16) to (32,22) = 42 tiles
-  Expected tiles: (27,16) to (32,22) = 42 tiles
-  Rough screen scale (worldMax/depth): 0.0129916
-Gaussian 4:
-  World scale (exp): (0.0544843,0.0544843,0.0544843) max=0.0544843
-  Screen pos: (466.13,299.446) depth=4.21337
-  Screen radius (pixels): 46 (should be ~3*sqrt(eigenvalue) of 2D cov)
-  Cov2D: (230.296,2.84228,226.432)
-  Tile bounds: (26,15) to (32,21) = 49 tiles
-  Expected tiles: (26,15) to (32,21) = 49 tiles
-  Rough screen scale (worldMax/depth): 0.0129313
-
-Summary (first 100 Gaussians):
-  Valid: 39
-  Radius range: 13 to 50 pixels (avg=42)
-  Depth range: 3.9063 to 16.6195
-=== End Radius Debug ===
-
-
-=== Tile Range Debug ===
-Total pairs: 960790, Total tiles: 4056
-Tile 11: start=0 count=4
-Tile 12: start=4 count=9
-Tile 13: start=13 count=10
-Tile 14: start=23 count=11
-Tile 15: start=34 count=5
-
-First 10 pairs (tileIdx, gaussianIdx):
-  [0] tile=11 gaussian=10074 depthKey=0xc1188930
-  [1] tile=11 gaussian=32838 depthKey=0xc11953b0
-  [2] tile=11 gaussian=32461 depthKey=0xc11a9622
-  [3] tile=11 gaussian=8995 depthKey=0xc11ce085
-  [4] tile=12 gaussian=10074 depthKey=0xc1188930
-  [5] tile=12 gaussian=32838 depthKey=0xc11953b0
-  [6] tile=12 gaussian=32461 depthKey=0xc11a9622
-  [7] tile=12 gaussian=10077 depthKey=0xc11babe3
-  [8] tile=12 gaussian=10078 depthKey=0xc11bcdc1
-  [9] tile=12 gaussian=16280 depthKey=0xc11c6c64
-
-Summary:
-  Tiles with Gaussians: 3865/4056
-  Total coverage: 960790 (should equal pairCount=960790)
-  Max Gaussians per tile: 1191
-=== End Tile Range Debug ===
-
-Saved render to /tmp/train_render_0000.ppm (1237x822)
-Saved render to /tmp/ground_truth_0000.ppm (1237x822)
-
-=== accumulateRadii Debug (call #1) ===
-First 10 projected radii: 46 46 46 46 46 0 0 0 0 0 
-First 10 maxRadii2D BEFORE: 0 0 0 0 0 0 0 0 0 0 
-First 10 maxRadii2D AFTER: 46 46 46 46 46 0 0 0 0 0 
-
-Epoch 0 [0/194] Iter: 1 | Loss: 0.2790
-Epoch 0 [20/194] Iter: 21 | Loss: 0.3670
-Epoch 0 [40/194] Iter: 41 | Loss: 0.3205
-Epoch 0 [60/194] Iter: 61 | Loss: 0.3122
-Epoch 0 [80/194] Iter: 81 | Loss: 0.3041
-=== Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    2.54 ms
-  Sort (CPU):               52.68 ms
-  Range+Render (GPU):       7.92 ms
-  TOTAL:                   63.40 ms
-  Pairs/frame:            ~575994
-[SH] values: [-5.0000, 5.0000] | gradients: max=135.304947 avg=0.103687 | black: 397/1000
-
-[iter 100] Gaussians: 54275 | Avg opacity: 0.676 | Avg scale: 1.3558
-
-[Iter 100] Loss: 0.2809 | Gaussians: 54275 | Position LR: 1.58e-04
-
-=== accumulateRadii Debug (call #101) ===
-First 10 projected radii: 6.70e+01 6.70e+01 5.60e+01 6.10e+01 6.20e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
-First 10 maxRadii2D BEFORE: 7.00e+01 6.80e+01 6.10e+01 6.30e+01 6.60e+01 3.30e+01 1.60e+01 1.90e+01 3.50e+01 5.70e+01 
-First 10 maxRadii2D AFTER: 7.00e+01 6.80e+01 6.10e+01 6.30e+01 6.60e+01 3.30e+01 1.60e+01 1.90e+01 3.50e+01 5.70e+01 
-
-Epoch 0 [100/194] Iter: 101 | Loss: 0.2925
-Epoch 0 [120/194] Iter: 121 | Loss: 0.2860
-Epoch 0 [140/194] Iter: 141 | Loss: 0.2793
-Epoch 0 [160/194] Iter: 161 | Loss: 0.2766
-Epoch 0 [180/194] Iter: 181 | Loss: 0.2723
-=== Epoch 0 | Loss: 0.2656 | Gaussians: 54275 | pos_lr: 0.0002 | Time: 171s ===
-
-Epoch 1 [0/194] Iter: 195 | Loss: 0.2239
-=== Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    2.63 ms
-  Sort (CPU):               46.68 ms
-  Range+Render (GPU):       8.18 ms
-  TOTAL:                   57.73 ms
-  Pairs/frame:            ~251603
-[SH] values: [-5.0000, 5.0000] | gradients: max=105.817184 avg=0.129063 | black: 420/1000
-
-[iter 200] Gaussians: 54275 | Avg opacity: 0.684 | Avg scale: 1.5769
-
-[Iter 200] Loss: 0.3658 | Gaussians: 54275 | Position LR: 1.55e-04
-
-=== accumulateRadii Debug (call #201) ===
-First 10 projected radii: 5.60e+01 6.20e+01 5.90e+01 5.70e+01 5.90e+01 2.70e+01 0.00e+00 0.00e+00 3.60e+01 3.90e+01 
-First 10 maxRadii2D BEFORE: 7.30e+01 8.10e+01 8.90e+01 6.90e+01 7.10e+01 3.70e+01 1.60e+01 2.30e+01 4.80e+01 5.70e+01 
-First 10 maxRadii2D AFTER: 7.30e+01 8.10e+01 8.90e+01 6.90e+01 7.10e+01 3.70e+01 1.60e+01 2.30e+01 4.80e+01 5.70e+01 
-
-Epoch 1 [20/194] Iter: 215 | Loss: 0.2971
-Epoch 1 [40/194] Iter: 235 | Loss: 0.2646
-Epoch 1 [60/194] Iter: 255 | Loss: 0.2620
-Epoch 1 [80/194] Iter: 275 | Loss: 0.2557
-Epoch 1 [100/194] Iter: 295 | Loss: 0.2501
-=== Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    1.95 ms
-  Sort (CPU):               41.04 ms
-  Range+Render (GPU):       7.86 ms
-  TOTAL:                   51.11 ms
-  Pairs/frame:            ~920913
-[SH] values: [-5.0000, 5.0000] | gradients: max=245.729904 avg=0.264147 | black: 436/1000
-
-[iter 300] Gaussians: 54275 | Avg opacity: 0.727 | Avg scale: 1.8822
-
-[Iter 300] Loss: 0.2704 | Gaussians: 54275 | Position LR: 1.53e-04
-
-=== accumulateRadii Debug (call #301) ===
-First 10 projected radii: 8.00e+01 7.70e+01 6.20e+01 6.10e+01 6.80e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
-First 10 maxRadii2D BEFORE: 8.30e+01 8.10e+01 8.90e+01 6.90e+01 7.30e+01 3.70e+01 1.70e+01 2.30e+01 5.00e+01 8.60e+01 
-First 10 maxRadii2D AFTER: 8.30e+01 8.10e+01 8.90e+01 6.90e+01 7.30e+01 3.70e+01 1.70e+01 2.30e+01 5.00e+01 8.60e+01 
-
-Epoch 1 [120/194] Iter: 315 | Loss: 0.2460
-Epoch 1 [140/194] Iter: 335 | Loss: 0.2425
-Epoch 1 [160/194] Iter: 355 | Loss: 0.2420
-Epoch 1 [180/194] Iter: 375 | Loss: 0.2402
-=== Epoch 1 | Loss: 0.2354 | Gaussians: 54275 | pos_lr: 0.0002 | Time: 175s ===
-
-Epoch 2 [0/194] Iter: 389 | Loss: 0.2195
-=== Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    2.34 ms
-  Sort (CPU):               45.58 ms
-  Range+Render (GPU):       7.41 ms
-  TOTAL:                   55.53 ms
-  Pairs/frame:            ~81288
-[SH] values: [-5.0000, 5.0000] | gradients: max=97.641830 avg=0.156398 | black: 451/1000
-
-[iter 400] Gaussians: 54275 | Avg opacity: 0.727 | Avg scale: 2.6425
-
-[Iter 400] Loss: 0.4703 | Gaussians: 54275 | Position LR: 1.51e-04
-
-=== accumulateRadii Debug (call #401) ===
-First 10 projected radii: 5.70e+01 6.50e+01 6.40e+01 6.00e+01 5.20e+01 0.00e+00 0.00e+00 2.40e+01 4.00e+01 0.00e+00 
-First 10 maxRadii2D BEFORE: 8.40e+01 8.20e+01 8.90e+01 7.10e+01 8.10e+01 4.00e+01 1.70e+01 2.90e+01 6.10e+01 9.90e+01 
-First 10 maxRadii2D AFTER: 8.40e+01 8.20e+01 8.90e+01 7.10e+01 8.10e+01 4.00e+01 1.70e+01 2.90e+01 6.10e+01 9.90e+01 
-
-Epoch 2 [20/194] Iter: 409 | Loss: 0.2897
-Epoch 2 [40/194] Iter: 429 | Loss: 0.2586
-Epoch 2 [60/194] Iter: 449 | Loss: 0.2551
-Epoch 2 [80/194] Iter: 469 | Loss: 0.2487
-Epoch 2 [100/194] Iter: 489 | Loss: 0.2425
-=== Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    2.18 ms
-  Sort (CPU):               49.69 ms
-  Range+Render (GPU):       7.78 ms
-  TOTAL:                   59.87 ms
-  Pairs/frame:            ~763800
-[SH] values: [-5.0000, 5.0000] | gradients: max=1074.773438 avg=0.657582 | black: 463/1000
-
-[iter 500] Gaussians: 54275 | Avg opacity: 0.738 | Avg scale: 3.8007
-
-[Iter 500] Loss: 0.2451 | Gaussians: 54275 | Position LR: 1.48e-04
-Saved render to /tmp/train_render_0500.ppm (1237x822)
-Saved render to /tmp/ground_truth_0500.ppm (1237x822)
-
-=== accumulateRadii Debug (call #501) ===
-First 10 projected radii: 6.10e+01 7.50e+01 7.10e+01 6.00e+01 6.20e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
-First 10 maxRadii2D BEFORE: 8.80e+01 8.60e+01 8.90e+01 7.20e+01 8.20e+01 4.50e+01 1.70e+01 3.80e+01 6.40e+01 1.28e+02 
-First 10 maxRadii2D AFTER: 8.80e+01 8.60e+01 8.90e+01 7.20e+01 8.20e+01 4.50e+01 1.70e+01 3.80e+01 6.40e+01 1.28e+02 
-
-Epoch 2 [120/194] Iter: 509 | Loss: 0.2367
-Epoch 2 [140/194] Iter: 529 | Loss: 0.2322
-Epoch 2 [160/194] Iter: 549 | Loss: 0.2296
-Epoch 2 [180/194] Iter: 569 | Loss: 0.2268
-=== Epoch 2 | Loss: 0.2223 | Gaussians: 54275 | pos_lr: 0.0001 | Time: 174s ===
-
-Epoch 3 [0/194] Iter: 583 | Loss: 0.2083
-=== Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    2.27 ms
-  Sort (CPU):               45.60 ms
-  Range+Render (GPU):       8.30 ms
-  TOTAL:                   56.39 ms
-  Pairs/frame:            ~90253
-[SH] values: [-5.0000, 5.0000] | gradients: max=1383.537720 avg=0.470870 | black: 471/1000
-
-[iter 600] Gaussians: 54275 | Avg opacity: 0.737 | Avg scale: 4.2893
-
-[Iter 600] Loss: 0.2427 | Gaussians: 54275 | Position LR: 1.46e-04
-
-=== maxRadii2D Debug (iter 600) ===
+=== maxRadii2D Debug (iter 3500) ===
 Screen pruning enabled: NO
 Threshold (95th percentile): -1.00e+00 pixels
 Gaussians with radii > threshold: 1000/1000 sampled (~5% expected)
-First 10 maxRadii2D: 8.80e+01 9.00e+01 9.70e+01 7.20e+01 8.30e+01 4.50e+01 1.70e+01 4.00e+01 7.90e+01 1.58e+02 
-Max radius: 3.40e+02, Avg non-zero: 7.04e+01 (53705/54275 non-zero)
+First 10 maxRadii2D: 7.30e+01 4.90e+01 5.10e+01 5.40e+01 5.60e+01 5.50e+01 5.40e+01 5.60e+01 5.40e+01 5.00e+01 
+Max radius: 3.48e+02, Avg non-zero: 2.95e+01 (978594/1000000 non-zero)
 =============================================
 
-  SPLIT: maxScale=6.76e-02 > thresh=4.98e-02 scales=(3.61e-02,  SPLIT: maxScale=  SPLIT: maxScale=5.91e-02 > thresh=  SPLIT: maxScale=5.85e-02 > thresh=  SPLIT: maxScale=  SPLIT: maxScale=  SPLIT: maxScale=4.98e-02 scales=(6.39e-02 > thresh=4.98e-02 scales=(5.90e-025.91e-02 > thresh=5.58e-024.98e-02 > thresh= scales=(5.90e-02  SPLIT: maxScale=4.38e-02,,5.46e-02,4.98e-025.62e-02)1.05e-016.76e-02 > thresh=, scales=(4.98e-02 scales=(4.98e-025.03e-02,4.38e-02,5.58e-02)
-5.59e-02  SPLIT: maxScale=
-6.15e-02,  SPLIT: maxScale=,8.80e-025.19e-02,5.85e-02 scales=(1.05e-01,7.33e-02 > thresh=5.58e-026.15e-02, > thresh=6.39e-02)
-  SPLIT: maxScale=6.43e-02 > thresh=4.98e-02)4.98e-02,4.61e-029.46e-02)
-  SPLIT: maxScale=1.36e-01 > thresh=4.98e-02 scales=( > thresh=4.98e-02 scales=(8.20e-02,7.69e-02,9.46e-02)
-4.98e-02 scales=(5.22e-02,5.40e-02,6.43e-02)
- scales=(4.90e-02,7.33e-02,5.40e-02)
- scales=(8.61e-02,8.80e-02
-,7.58e-02)
-1.36e-01,1.20e-01,8.38e-021.83e-02)
-),7.81e-02)
+  CLONE: maxScale=3.68e-02 <= thresh=4.98e-02 scales=(3.68e-02,3.46e-02,1.85e-02)
+  SPLIT: maxScale=8.84e-02 > thresh=4.98e-02 scales=(8.84e-02,1.87e-02,2.31e-02)
+  SPLIT: maxScale=1.51e-01 > thresh=4.98e-02 scales=(1.51e-01  CLONE: maxScale=2.68e-02 <= thresh=  CLONE: maxScale=  SPLIT: maxScale=5.02e-02 > thresh=4.98e-02 scales=(  CLONE: maxScale=2.98e-02  SPLIT: maxScale=8.92e-02 > thresh=4.98e-02 scales=(5.02e-022.48e-02, <= thresh=4.28e-02,4.99e-02)
+  SPLIT: maxScale=4.98e-026.15e-02  SPLIT: maxScale=8.92e-02,1.83e-02 > thresh=4.98e-02 scales=(4.98e-02 scales=(4.94e-02,1.83e-02,2.61e-02  CLONE: maxScale=,4.34e-022.71e-02 <= thresh=)4.98e-02
+ scales=(1.87e-02,,6.15e-02,5.32e-02) scales=(1.83e-026.93e-02 <= thresh=4.98e-02 scales=()
 
-Density control: pruned=3447 cloned=3606 split=46305 total=100739
-Reset Adam state for 1945725 new Gaussians starting at 54275
+2.36e-024.34e-021.99e-02,,,3.47e-02)
+2.98e-02,2.92e-02)
+2.28e-02,2.48e-02)
+,2.68e-02,2.02e-02)
+ > thresh=4.98e-02 scales=(1.83e-02,6.93e-02,4.34e-02)
+Density control: pruned=349701 cloned=117065 split=232636 total=1000000
+Saved render to /tmp/train_render_3500.ppm (1237x822)
+Saved render to /tmp/ground_truth_3500.ppm (1237x822)
 
-=== accumulateRadii Debug (call #601) ===
-First 10 projected radii: 2.50e+01 2.60e+01 4.30e+01 4.20e+01 4.10e+01 4.00e+01 3.00e+01 3.00e+01 2.90e+01 2.90e+01 
+=== accumulateRadii Debug (call #3501) ===
+First 10 projected radii: 3.00e+01 3.80e+01 4.00e+01 4.00e+01 3.90e+01 3.90e+01 1.40e+01 1.40e+01 2.50e+01 2.60e+01 
 First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
-First 10 maxRadii2D AFTER: 2.50e+01 2.60e+01 4.30e+01 4.20e+01 4.10e+01 4.00e+01 3.00e+01 3.00e+01 2.90e+01 2.90e+01 
+First 10 maxRadii2D AFTER: 3.00e+01 3.80e+01 4.00e+01 4.00e+01 3.90e+01 3.90e+01 1.40e+01 1.40e+01 2.50e+01 2.60e+01 
 
-Epoch 3 [20/194] Iter: 603 | Loss: 0.2703
-Epoch 3 [40/194] Iter: 623 | Loss: 0.2522
-Epoch 3 [60/194] Iter: 643 | Loss: 0.2495
-Epoch 3 [80/194] Iter: 663 | Loss: 0.2422
-Epoch 3 [100/194] Iter: 683 | Loss: 0.2358
+Epoch 18 [20/194] Iter: 3513 | Loss: 0.2015
+Epoch 18 [40/194] Iter: 3533 | Loss: 0.1952
+Epoch 18 [60/194] Iter: 3553 | Loss: 0.1882
+Epoch 18 [80/194] Iter: 3573 | Loss: 0.1834
+Epoch 18 [100/194] Iter: 3593 | Loss: 0.1791
 === Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    7.08 ms
-  Sort (CPU):               44.18 ms
-  Range+Render (GPU):       8.79 ms
-  TOTAL:                   60.30 ms
-  Pairs/frame:            ~672696
-[SH] values: [-5.0000, 5.0000] | gradients: max=156.077011 avg=0.162302 | black: 578/1000
+  Project+PairGen (GPU):    6.30 ms
+  Sort (CPU):              174.70 ms
+  Range+Render (GPU):      21.96 ms
+  TOTAL:                  203.20 ms
+  Pairs/frame:            ~3019348
+[SH] values: [-5.0000, 5.0000] | gradients: max=8.000000 avg=0.116931 | black: 685/1000
 
-[iter 700] Gaussians: 100739 | Avg opacity: 0.705 | Avg scale: 1.6148
+[iter 3600] Gaussians: 1000000 | Avg opacity: 0.812 | Avg scale: 0.0425
 
-[Iter 700] Loss: 0.2072 | Gaussians: 100739 | Position LR: 1.44e-04
+[Iter 3600] Loss: 0.1583 | Gaussians: 1000000 | Position LR: 1.19e-04
 
-=== maxRadii2D Debug (iter 700) ===
+=== maxRadii2D Debug (iter 3600) ===
 Screen pruning enabled: NO
 Threshold (95th percentile): -1.00e+00 pixels
 Gaussians with radii > threshold: 1000/1000 sampled (~5% expected)
-First 10 maxRadii2D: 5.20e+01 4.90e+01 6.10e+01 5.20e+01 5.00e+01 5.20e+01 4.90e+01 4.60e+01 5.70e+01 5.60e+01 
-Max radius: 3.31e+02, Avg non-zero: 3.94e+01 (92875/100739 non-zero)
+First 10 maxRadii2D: 4.00e+01 7.30e+01 4.60e+01 4.70e+01 4.60e+01 4.50e+01 1.90e+01 1.90e+01 3.90e+01 4.00e+01 
+Max radius: 3.24e+02, Avg non-zero: 2.24e+01 (997729/1000000 non-zero)
 =============================================
 
-  CLONE: maxScale=4.27e-02 <= thresh=4.98e-02 scales=(2.29e-02,2.39e-02,4.27e-02)
-  CLONE: maxScale=4.13e-02 <= thresh=4.98e-02 scales=(2.23e-02,2.75e-02,4.13e-02)
-  SPLIT: maxScale=5.15e-02 > thresh=4.98e-02 scales=(2.90e-02,5.15e-02,2.95e-02)
-  CLONE: maxScale=4.37e-02 <= thresh=4.98e-02 scales=(3.10e-02,4.37e-02,3.54e-02)
-  CLONE: maxScale=4.18e-02 <= thresh=4.98e-02 scales=(4.18e-02,2.70e-02,3.51e-02)
-Density control: pruned=3176 cloned=39757 split=47640 total=184960
-Reset Adam state for 1899261 new Gaussians starting at 100739
+  SPLIT: maxScale=6.35e-02  SPLIT: maxScale=6.75e-02 > thresh=4.98e-02 scales=(3.47e-02,2.36e-02,6.75e-02)
+  CLONE: maxScale=4.27e-02 <= thresh=4.98e-02 scales=(4.27e-02,  CLONE: maxScale=4.88e-02 <= thresh=  CLONE: maxScale=  CLONE: maxScale= > thresh=  CLONE: maxScale=4.98e-02 scales=(1.83e-02,  CLONE: maxScale=3.96e-02 <= thresh=4.98e-02 scales=(2.59e-02,3.68e-02)
+3.87e-02  CLONE: maxScale=3.34e-02 <= thresh=4.78e-02 <= thresh=  SPLIT: maxScale= <= thresh=5.30e-024.98e-02 > thresh=3.16e-021.96e-02 <= thresh=4.98e-02 scales=(4.98e-02 scales=(,4.98e-02 scales=(4.98e-02 scales=( scales=(4.98e-02 scales=(2.23e-02,2.89e-023.95e-021.93e-02,,2.55e-024.78e-02,4.33e-02)
+,2.72e-02,3.96e-02)
+  CLONE: maxScale=4.27e-02 <= thresh=4.98e-02 scales=(2.35e-02,2.83e-02,4.27e-02)
+3.85e-02,3.87e-02,6.35e-02,5.30e-023.16e-02,4.09e-02)
+2.55e-023.34e-02),
+,2.01e-02,2.58e-02)
+1.99e-02)
+4.88e-02)
+  CLONE: maxScale=4.55e-02 <= thresh=4.98e-02 scales=(4.10e-02,4.55e-02,4.21e-02)
+,1.83e-02)
+Density control: pruned=41342 cloned=0 split=41342 total=1000000
 
-=== accumulateRadii Debug (call #701) ===
-First 10 projected radii: 3.40e+01 3.40e+01 3.40e+01 3.40e+01 3.30e+01 3.30e+01 4.30e+01 4.30e+01 4.10e+01 4.10e+01 
+=== accumulateRadii Debug (call #3601) ===
+First 10 projected radii: 6.40e+01 4.40e+01 4.50e+01 4.40e+01 4.30e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
 First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
-First 10 maxRadii2D AFTER: 3.40e+01 3.40e+01 3.40e+01 3.40e+01 3.30e+01 3.30e+01 4.30e+01 4.30e+01 4.10e+01 4.10e+01 
+First 10 maxRadii2D AFTER: 6.40e+01 4.40e+01 4.50e+01 4.40e+01 4.30e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
 
-Epoch 3 [120/194] Iter: 703 | Loss: 0.2291
-Epoch 3 [140/194] Iter: 723 | Loss: 0.2259
-Epoch 3 [160/194] Iter: 743 | Loss: 0.2235
-Epoch 3 [180/194] Iter: 763 | Loss: 0.2208
-=== Epoch 3 | Loss: 0.2166 | Gaussians: 184960 | pos_lr: 0.0001 | Time: 311s ===
+Epoch 18 [120/194] Iter: 3613 | Loss: 0.1736
+Epoch 18 [140/194] Iter: 3633 | Loss: 0.1703
+Epoch 18 [160/194] Iter: 3653 | Loss: 0.1660
+Epoch 18 [180/194] Iter: 3673 | Loss: 0.1630
+=== Epoch 18 | Loss: 0.1616 | Gaussians: 1000000 | pos_lr: 0.0001 | Time: 221s ===
 
-Epoch 4 [0/194] Iter: 777 | Loss: 0.2093
-Epoch 4 [20/194] Iter: 797 | Loss: 0.2637
+Epoch 19 [0/194] Iter: 3687 | Loss: 0.1850
 === Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    7.66 ms
-  Sort (CPU):               66.60 ms
-  Range+Render (GPU):      12.19 ms
-  TOTAL:                   86.67 ms
-  Pairs/frame:            ~359315
-[SH] values: [-5.0000, 5.0000] | gradients: max=66.240585 avg=0.119430 | black: 614/1000
+  Project+PairGen (GPU):    7.45 ms
+  Sort (CPU):              159.48 ms
+  Range+Render (GPU):      24.15 ms
+  TOTAL:                  191.34 ms
+  Pairs/frame:            ~751349
+[SH] values: [-5.0000, 5.0000] | gradients: max=475.295868 avg=0.468787 | black: 690/1000
 
-[iter 800] Gaussians: 184960 | Avg opacity: 0.795 | Avg scale: 0.3761
+[iter 3700] Gaussians: 1000000 | Avg opacity: 0.766 | Avg scale: 0.0431
 
-[Iter 800] Loss: 0.2391 | Gaussians: 184960 | Position LR: 1.42e-04
+[Iter 3700] Loss: 0.2307 | Gaussians: 1000000 | Position LR: 1.18e-04
 
-=== maxRadii2D Debug (iter 800) ===
+=== maxRadii2D Debug (iter 3700) ===
 Screen pruning enabled: NO
 Threshold (95th percentile): -1.00e+00 pixels
 Gaussians with radii > threshold: 1000/1000 sampled (~5% expected)
-First 10 maxRadii2D: 4.80e+01 5.00e+01 5.30e+01 5.20e+01 4.30e+01 3.90e+01 5.20e+01 5.20e+01 5.90e+01 5.80e+01 
-Max radius: 3.33e+02, Avg non-zero: 3.27e+01 (175034/184960 non-zero)
+First 10 maxRadii2D: 6.70e+01 6.10e+01 5.50e+01 5.50e+01 5.40e+01 2.50e+01 2.50e+01 4.30e+01 5.00e+01 4.20e+01 
+Max radius: 3.22e+02, Avg non-zero: 2.13e+01 (995907/1000000 non-zero)
 =============================================
 
-  CLONE: maxScale=3.81e-02 <= thresh=4.98e-02 scales=(2.03e-02,2.41e-02,3.81e-02)
-  CLONE: maxScale=  CLONE: maxScale=4.85e-02 <= thresh=4.98e-02 scales=(4.01e-02,4.16e-02,4.85e-02  SPLIT: maxScale=1.86e+01 > thresh=4.00e-02 <= thresh=  SPLIT: maxScale=  CLONE: maxScale=)  CLONE: maxScale=  SPLIT: maxScale=4.98e-02 scales=(4.98e-02  CLONE: maxScale=3.60e-02 <= thresh=4.98e-02 scales=(3.27e-02,2.92e-02,1.33e+00
-3.69e-02 <= thresh=4.98e-02 > thresh=4.98e-02 scales=(2.86e-02 <= thresh=4.98e-02 scales=(2.82e-02,5.03e-023.60e-02)
-  CLONE: maxScale=  CLONE: maxScale= scales=(2.21e-02, > thresh=2.39e-023.53e-02 <= thresh=1.83e-02,1.83e-02 scales=(4.98e-02, scales=(1.83e-02,5.03e-02,2.32e-02,3.22e-02,3.69e-02)
-1.86e+013.93e-02 <= thresh=4.98e-02 scales=(3.75e-02,3.93e-02,3.16e-02)
-2.86e-02,2.74e-02)
-  CLONE: maxScale=3.28e-02 <= thresh=4.98e-02 scales=(3.28e-02,2.61e-02,3.03e-02)
-,1.91e-02,2.52e-01)
+  CLONE: maxScale=4.95e-02 <= thresh=4.98e-02 scales=(3.37e-02,4.95e-02,2.20e-02)
+  SPLIT: maxScale=5.53e-02 > thresh=4.98e-02 scales=(  CLONE: maxScale=  CLONE: maxScale=5.53e-024.00e-02  CLONE: maxScale=3.92e-02 <= thresh=  SPLIT: maxScale=4.98e-025.07e-02 > thresh=  CLONE: maxScale=,4.98e-021.83e-02, scales=(3.22e-02 <= thresh=  SPLIT: maxScale=  CLONE: maxScale=6.85e-023.68e-02 > thresh= <= thresh= scales=(5.07e-023.19e-02 <= thresh=4.98e-024.98e-02 scales=( scales=(,4.98e-024.98e-02 scales=(1.84e-02,3.19e-02,1.83e-02)
+  CLONE: maxScale=3.96e-02 <= thresh=4.98e-02 scales=(1.97e-02,3.96e-02,1.83e-02)
+  CLONE: maxScale=3.87e-02 <= thresh=4.98e-02 scales=(2.86e-023.22e-022.09e-02 scales=(4.19e-02,3.37e-02)1.83e-02,,3.87e-02, <= thresh=3.68e-021.86e-02,,
+2.37e-02,2.05e-02)
+  CLONE: maxScale=1.83e-02)
+3.32e-02 <= thresh=4.98e-02 scales=(2.53e-02,2.09e-02,3.32e-02)
+,3.65e-02,1.84e-02)
+6.85e-02)1.83e-02,1.89e-02,
 4.00e-02)
-4.98e-02 scales=(3.26e-02,3.00e-02,3.53e-02)
-3.04e-02)
-,1.33e+00)
-Density control: pruned=3685 cloned=102401 split=63237 total=346913
-Reset Adam state for 1815040 new Gaussians starting at 184960
-
-=== accumulateRadii Debug (call #801) ===
-First 10 projected radii: 3.30e+01 3.30e+01 3.50e+01 3.50e+01 3.80e+01 3.80e+01 3.80e+01 3.40e+01 3.40e+01 3.20e+01 
-First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
-First 10 maxRadii2D AFTER: 3.30e+01 3.30e+01 3.50e+01 3.50e+01 3.80e+01 3.80e+01 3.80e+01 3.40e+01 3.40e+01 3.20e+01 
-
-Epoch 4 [40/194] Iter: 817 | Loss: 0.2477
-Epoch 4 [60/194] Iter: 837 | Loss: 0.2427
-Epoch 4 [80/194] Iter: 857 | Loss: 0.2346
-Epoch 4 [100/194] Iter: 877 | Loss: 0.2285
-Epoch 4 [120/194] Iter: 897 | Loss: 0.2209
-=== Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    8.10 ms
-  Sort (CPU):              107.00 ms
-  Range+Render (GPU):      17.46 ms
-  TOTAL:                  132.76 ms
-  Pairs/frame:            ~1619857
-[SH] values: [-5.0000, 5.0000] | gradients: max=35.514481 avg=0.015529 | black: 684/1000
-
-[iter 900] Gaussians: 346913 | Avg opacity: 0.637 | Avg scale: 0.0381
-
-[Iter 900] Loss: 0.2335 | Gaussians: 346913 | Position LR: 1.39e-04
-
-=== maxRadii2D Debug (iter 900) ===
-Screen pruning enabled: NO
-Threshold (95th percentile): -1.00e+00 pixels
-Gaussians with radii > threshold: 1000/1000 sampled (~5% expected)
-First 10 maxRadii2D: 4.80e+01 4.70e+01 4.80e+01 4.80e+01 4.90e+01 5.00e+01 4.90e+01 4.50e+01 4.50e+01 3.90e+01 
-Max radius: 3.31e+02, Avg non-zero: 2.95e+01 (336285/346913 non-zero)
-=============================================
-
-  CLONE: maxScale=3.92e-02 <= thresh=4.98e-02 scales=(2.02e-02,2.39e-02,3.92e-02)
-  CLONE: maxScale=3.89e-02 <= thresh=4.98e-02 scales=(2.02e-02,  CLONE: maxScale=  CLONE: maxScale=2.84e-02  CLONE: maxScale=  SPLIT: maxScale=2.37e-02,4.04e-02 <= thresh=2.65e-02 <= thresh=  CLONE: maxScale= <= thresh=3.89e-02)
-4.98e-02  CLONE: maxScale= scales=(3.71e-023.45e-02 <= thresh=,4.04e-02,2.91e-02)
-  CLONE: maxScale=4.98e-02 scales=(4.98e-02 scales=(1.83e-022.57e-02,  CLONE: maxScale=  SPLIT: maxScale=4.24e-025.35e-02 > thresh=4.98e-02,3.71e-02,1.97e-02)
-6.85e-024.54e-02 <= thresh= scales=(1.98e-022.43e-02,1.83e-02,3.60e-02 <= thresh=4.98e-02 scales=(3.60e-02,,2.65e-02)
- > thresh=4.98e-02 scales=(5.84e-02,5.40e-02,6.85e-02)
-5.35e-02)
-4.98e-02 scales=(4.54e-02,4.18e-02,2.62e-02)
-4.98e-02 scales=(2.69e-02,2.59e-02,2.84e-02)
-  CLONE: maxScale=3.68e-02 <= thresh=4.98e-02 scales=(1.83e-02,3.68e-02,1.95e-02)
-2.50e-02,1.88e-02)
- <= thresh=4.98e-02 scales=(4.24e-02,3.34e-02,3.24e-02)
-Density control: pruned=5934 cloned=209977 split=85494 total=636450
-Reset Adam state for 1653087 new Gaussians starting at 346913
-
-=== accumulateRadii Debug (call #901) ===
-First 10 projected radii: 3.10e+01 3.10e+01 3.10e+01 3.10e+01 3.20e+01 3.20e+01 3.40e+01 3.40e+01 3.30e+01 3.10e+01 
-First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
-First 10 maxRadii2D AFTER: 3.10e+01 3.10e+01 3.10e+01 3.10e+01 3.20e+01 3.20e+01 3.40e+01 3.40e+01 3.30e+01 3.10e+01 
-
-Epoch 4 [140/194] Iter: 917 | Loss: 0.2165
-Epoch 4 [160/194] Iter: 937 | Loss: 0.2123
-Epoch 4 [180/194] Iter: 957 | Loss: 0.2086
-=== Epoch 4 | Loss: 0.2050 | Gaussians: 636450 | pos_lr: 0.0001 | Time: 293s ===
-
-Epoch 5 [0/194] Iter: 971 | Loss: 0.2075
-Epoch 5 [20/194] Iter: 991 | Loss: 0.2565
-=== Forward Pass Timing (avg over 100 frames) ===
-  Project+PairGen (GPU):    7.51 ms
-  Sort (CPU):              155.00 ms
-  Range+Render (GPU):      23.92 ms
-  TOTAL:                  186.62 ms
-  Pairs/frame:            ~1708076
-[SH] values: [-5.0000, 5.0000] | gradients: max=5.956540 avg=0.003521 | black: 712/1000
-
-[iter 1000] Gaussians: 636450 | Avg opacity: 0.601 | Avg scale: 0.0322
-
-[Iter 1000] Loss: 0.2597 | Gaussians: 636450 | Position LR: 1.37e-04
-Density params: fx=1.16e+03 width=1.24e+03 avgDepth=1.99e+01 sceneExtent=4.98e+00 screenPrune=OFF
-
-=== maxRadii2D Debug (iter 1000) ===
-Screen pruning enabled: NO
-Threshold (95th percentile): -1.00e+00 pixels
-Gaussians with radii > threshold: 1000/1000 sampled (~5% expected)
-First 10 maxRadii2D: 4.80e+01 4.80e+01 4.70e+01 4.70e+01 5.00e+01 5.00e+01 5.30e+01 5.30e+01 5.20e+01 4.50e+01 
-Max radius: 3.45e+02, Avg non-zero: 2.75e+01 (624512/636450 non-zero)
-=============================================
-
-  CLONE: maxScale=3.83e-02 <= thresh=4.98e-02 scales=(  CLONE: maxScale=3.20e-02 <= thresh=4.98e-02 scales=(2.14e-02,2.19e-02,  CLONE: maxScale=  CLONE: maxScale=  CLONE: maxScale=1.98e-02  CLONE: maxScale=,3.20e-022.43e-02,3.83e-02  SPLIT: maxScale=1.61e+014.63e-02 <= thresh=3.09e-02 <= thresh=3.37e-02 <= thresh=2.23e-02 <= thresh=)4.98e-02 scales=(1.99e-024.98e-024.98e-02 scales=(4.98e-02 scales=(2.71e-02
-  CLONE: maxScale=3.79e-02 <= thresh=2.16e-02,2.60e-02  CLONE: maxScale= scales=(3.20e-02 <= thresh=4.98e-02 scales=(2.30e-02,3.20e-02,2.53e-02)
-,3.09e-02)
-  CLONE: maxScale=3.26e-02 <= thresh=4.98e-02 > thresh=2.43e-02,4.63e-02,3.76e-02)
-  CLONE: maxScale=4.64e-02 <= thresh=4.98e-02 scales=(2.43e-02,4.64e-02,3.76e-02)
-,1.91e-02,3.37e-02)
- scales=(3.03e-02,2.75e-02,3.79e-02)
-4.98e-02 scales=(2.25e-02,2.85e-02,3.26e-02)
-,2.23e-02,1.83e-02)
+4.98e-02 scales=(3.92e-02,3.34e-02,2.89e-02)
 )
-  CLONE: maxScale=4.98e-02 scales=(3.20e-02 <= thresh=4.98e-02 scales=(2.30e-02,3.20e-02,2.53e-02)
-1.83e-02,1.83e-02,1.61e+01)
-Density control: pruned=14192 cloned=236425 split=141317 total=1000000
-Reset Adam state for 1363550 new Gaussians starting at 636450
-Saved render to /tmp/train_render_1000.ppm (1237x822)
-Saved render to /tmp/ground_truth_1000.ppm (1237x822)
+Density control: pruned=31596 cloned=0 split=31596 total=1000000
 
-=== accumulateRadii Debug (call #1001) ===
-First 10 projected radii: 3.20e+01 3.20e+01 3.20e+01 3.20e+01 3.40e+01 3.40e+01 3.50e+01 3.50e+01 3.50e+01 3.20e+01 
+=== accumulateRadii Debug (call #3701) ===
+First 10 projected radii: 4.20e+01 4.60e+01 4.10e+01 4.10e+01 4.10e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
 First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
-First 10 maxRadii2D AFTER: 3.20e+01 3.20e+01 3.20e+01 3.20e+01 3.40e+01 3.40e+01 3.50e+01 3.50e+01 3.50e+01 3.20e+01 
+First 10 maxRadii2D AFTER: 4.20e+01 4.60e+01 4.10e+01 4.10e+01 4.10e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
 
-Epoch 5 [40/194] Iter: 1011 | Loss: 0.2441
+Epoch 19 [20/194] Iter: 3707 | Loss: 0.2025
+Epoch 19 [40/194] Iter: 3727 | Loss: 0.1896
+Epoch 19 [60/194] Iter: 3747 | Loss: 0.1814
+Epoch 19 [80/194] Iter: 3767 | Loss: 0.1765
+Epoch 19 [100/194] Iter: 3787 | Loss: 0.1724
+=== Forward Pass Timing (avg over 100 frames) ===
+  Project+PairGen (GPU):    6.07 ms
+  Sort (CPU):              163.67 ms
+  Range+Render (GPU):      21.43 ms
+  TOTAL:                  191.43 ms
+  Pairs/frame:            ~3192681
+[SH] values: [-5.0000, 5.0000] | gradients: max=8.000000 avg=0.117710 | black: 683/1000
+
+[iter 3800] Gaussians: 1000000 | Avg opacity: 0.736 | Avg scale: 0.0432
+
+[Iter 3800] Loss: 0.1324 | Gaussians: 1000000 | Position LR: 1.17e-04
+*** FIXED screen pruning threshold computed: 6.80e+01 pixels (will not change) ***
+
+=== maxRadii2D Debug (iter 3800) ===
+Screen pruning enabled: YES
+Threshold (95th percentile): 6.80e+01 pixels
+Gaussians with radii > threshold: 30/1000 sampled (~5% expected)
+First 10 maxRadii2D: 5.30e+01 5.50e+01 4.90e+01 4.90e+01 4.80e+01 1.90e+01 2.00e+01 4.00e+01 3.80e+01 3.60e+01 
+Max radius: 3.32e+02, Avg non-zero: 2.17e+01 (997817/1000000 non-zero)
+=============================================
+
+  CLONE: maxScale=4.71e-02 <= thresh=4.98e-02 scales=(3.01e-02,4.71e-02,1.90e-02)  SPLIT: maxScale=
+  CLONE: maxScale=4.44e-02  CLONE: maxScale=3.72e-02 <= thresh=5.89e-02 > thresh=4.98e-02  SPLIT: maxScale=  SPLIT: maxScale=  SPLIT: maxScale=1.42e-016.79e-02 > thresh= > thresh=4.98e-02 scales=(1.42e-01,2.13e-02,2.65e-02)  CLONE: maxScale=4.98e-02  CLONE: maxScale=2.72e-02 <= thresh= <= thresh=4.98e-024.98e-021.00e-014.98e-02 > thresh= scales=(2.72e-02, scales=(4.44e-02,3.11e-02,1.92e-024.31e-02,)
+  SPLIT: maxScale=5.50e-02 > thresh=2.28e-02)
+  CLONE: maxScale=3.06e-02 <= thresh= scales=(3.54e-02 scales=(4.98e-02 scales=(
+4.98e-02 scales=(4.98e-02 scales=(3.09e-022.32e-02,,2.52e-023.06e-02,3.72e-02)
+,1.83e-02)
+6.79e-02 scales=(1.88e-025.50e-02  CLONE: maxScale=,5.89e-022.97e-02 <= thresh=1.83e-02,, <= thresh=4.98e-02 scales=(3.54e-02,3.32e-02,1.84e-02)
+1.83e-02,1.83e-02)
+,1.98e-02)
+,3.98e-02,1.00e-01)
+1.84e-02,1.83e-02)
+4.98e-02 scales=(1.90e-02,1.86e-02,2.97e-02)
+Density control: pruned=69386 cloned=0 split=69386 total=1000000
+
+=== accumulateRadii Debug (call #3801) ===
+First 10 projected radii: 4.80e+01 5.10e+01 4.40e+01 4.50e+01 4.40e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D AFTER: 4.80e+01 5.10e+01 4.40e+01 4.50e+01 4.40e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+
+Epoch 19 [120/194] Iter: 3807 | Loss: 0.1686
+Epoch 19 [140/194] Iter: 3827 | Loss: 0.1681
+Epoch 19 [160/194] Iter: 3847 | Loss: 0.1666
+Epoch 19 [180/194] Iter: 3867 | Loss: 0.1643
+=== Epoch 19 | Loss: 0.1626 | Gaussians: 1000000 | pos_lr: 0.0001 | Time: 206s ===
+
+Epoch 20 [0/194] Iter: 3881 | Loss: 0.1758
+=== Forward Pass Timing (avg over 100 frames) ===
+  Project+PairGen (GPU):    6.10 ms
+  Sort (CPU):              106.14 ms
+  Range+Render (GPU):      19.41 ms
+  TOTAL:                  131.86 ms
+  Pairs/frame:            ~114777
+[SH] values: [-5.0000, 5.0000] | gradients: max=92.989738 avg=0.098149 | black: 678/1000
+
+[iter 3900] Gaussians: 1000000 | Avg opacity: 0.739 | Avg scale: 0.0392
+
+[Iter 3900] Loss: 0.1616 | Gaussians: 1000000 | Position LR: 1.16e-04
+
+=== maxRadii2D Debug (iter 3900) ===
+Screen pruning enabled: YES
+Threshold (95th percentile): 6.80e+01 pixels
+Gaussians with radii > threshold: 12/1000 sampled (~5% expected)
+First 10 maxRadii2D: 5.80e+01 7.40e+01 5.50e+01 5.50e+01 5.40e+01 2.40e+01 2.90e+01 4.70e+01 4.40e+01 3.90e+01 
+Max radius: 3.02e+02, Avg non-zero: 1.69e+01 (996978/1000000 non-zero)
+=============================================
+
+  CLONE: maxScale=  CLONE: maxScale=4.38e-02 <= thresh=4.98e-02 scales=(3.96e-02,3.65e-02,4.38e-02)
+  CLONE: maxScale=4.75e-02 <= thresh=4.98e-02 scales=(3.76e-02,3.80e-02,4.75e-02)
+  SPLIT: maxScale=5.02e-02 > thresh=4.98e-02 scales=(3.82e-02,4.52e-02 <= thresh=  SPLIT: maxScale=4.98e-02 scales=(  SPLIT: maxScale=5.70e-02 > thresh=2.83e-02  CLONE: maxScale=  CLONE: maxScale=4.17e-024.01e-02,3.76e-02 <= thresh=  CLONE: maxScale=4.02e-02 <= thresh=4.98e-02 scales=(6.90e-024.98e-02  SPLIT: maxScale=1.83e-02,2.11e-025.02e-02 scales=( <= thresh=4.98e-02),4.52e-02,5.49e-02 > thresh=4.98e-02 scales=(3.97e-02,,4.87e-024.02e-02 > thresh=)4.98e-02 scales=(4.98e-02
+ scales=( scales=(1.83e-02,3.63e-02,3.10e-02,5.49e-02
+  CLONE: maxScale=4.55e-02 <= thresh=4.98e-02 scales=(4.10e-02,3.82e-02,4.55e-02)
+6.70e-02,4.17e-02)
+2.39e-02,6.90e-02)
+3.76e-02,1.83e-02)
+,  CLONE: maxScale=4.03e-02 <= thresh=4.98e-02 scales=(2.09e-02,2.07e-02,4.03e-02)
+5.06e-02,5.70e-02)
+2.05e-02)
+,4.04e-02)
+Density control: pruned=50292 cloned=0 split=50292 total=1000000
+
+=== accumulateRadii Debug (call #3901) ===
+First 10 projected radii: 4.10e+01 3.80e+01 3.70e+01 3.70e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D AFTER: 4.10e+01 3.80e+01 3.70e+01 3.70e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+
+Epoch 20 [20/194] Iter: 3901 | Loss: 0.2282
+Epoch 20 [40/194] Iter: 3921 | Loss: 0.2033
+Epoch 20 [60/194] Iter: 3941 | Loss: 0.1978
+Epoch 20 [80/194] Iter: 3961 | Loss: 0.1926
+Epoch 20 [100/194] Iter: 3981 | Loss: 0.1860
+=== Forward Pass Timing (avg over 100 frames) ===
+  Project+PairGen (GPU):    5.56 ms
+  Sort (CPU):              101.94 ms
+  Range+Render (GPU):      18.67 ms
+  TOTAL:                  126.40 ms
+  Pairs/frame:            ~2009775
+[SH] values: [-5.0000, 4.9992] | gradients: max=1.570920 avg=0.084360 | black: 685/1000
+
+[iter 4000] Gaussians: 1000000 | Avg opacity: 0.741 | Avg scale: 0.0376
+
+[Iter 4000] Loss: 0.1492 | Gaussians: 1000000 | Position LR: 1.15e-04
+Density params: fx=1.16e+03 width=1.24e+03 avgDepth=1.99e+01 sceneExtent=4.98e+00 screenPrune=ON
+
+=== maxRadii2D Debug (iter 4000) ===
+Screen pruning enabled: YES
+Threshold (95th percentile): 6.80e+01 pixels
+Gaussians with radii > threshold: 12/1000 sampled (~5% expected)
+First 10 maxRadii2D: 5.30e+01 4.70e+01 4.80e+01 4.80e+01 1.70e+01 1.80e+01 3.20e+01 3.60e+01 3.40e+01 2.50e+01 
+Max radius: 3.13e+02, Avg non-zero: 1.58e+01 (998057/1000000 non-zero)
+=============================================
+
+  CLONE: maxScale=4.74e-02 <= thresh=4.98e-02 scales=(  SPLIT: maxScale=9.28e-02  CLONE: maxScale=  CLONE: maxScale=4.46e-02 <= thresh=4.98e-02 scales=(4.46e-02 > thresh=4.98e-02 scales=(4.88e-02,4.54e-02,9.28e-02)
+,  CLONE: maxScale=3.48e-02 <= thresh=4.98e-02 scales=(1.83e-02,4.55e-02 <= thresh=4.98e-02 scales=(4.06e-02,3.92e-02  SPLIT: maxScale=7.26e-02 > thresh=  CLONE: maxScale=  CLONE: maxScale=2.96e-024.98e-02 scales=(4.74e-02,2.06e-02,4.72e-02 <= thresh=4.98e-02 scales=(4.72e-02,1.83e-02,1.83e-02)
+  CLONE: maxScale=4.89e-023.48e-02  SPLIT: maxScale=6.07e-02 > thresh=,)1.83e-02)
+  CLONE: maxScale=2.77e-02 <= thresh=4.98e-024.98e-022.67e-02 <= thresh=,4.55e-021.83e-02) <= thresh=,1.96e-02,
+
+  CLONE: maxScale=2.88e-02 <= thresh=4.98e-02 scales=(4.98e-021.83e-02 scales=( scales=(2.60e-027.26e-02),
+,1.83e-022.77e-02,,2.00e-022.32e-022.67e-02, scales=(4.98e-02 scales=(1.99e-026.07e-02,4.89e-02,,1.83e-02,1.83e-02)
+2.20e-02)
+2.88e-02)2.38e-02,2.77e-02)
+)
+,2.21e-02)
+
+Density control: pruned=32106 cloned=0 split=32106 total=1000000
+Saved render to /tmp/train_render_4000.ppm (1237x822)
+Saved render to /tmp/ground_truth_4000.ppm (1237x822)
+
+=== accumulateRadii Debug (call #4001) ===
+First 10 projected radii: 4.10e+01 4.10e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D AFTER: 4.10e+01 4.10e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+
+Epoch 20 [120/194] Iter: 4001 | Loss: 0.1793
+Epoch 20 [140/194] Iter: 4021 | Loss: 0.1758
+Epoch 20 [160/194] Iter: 4041 | Loss: 0.1719
+Epoch 20 [180/194] Iter: 4061 | Loss: 0.1683
+=== Epoch 20 | Loss: 0.1662 | Gaussians: 1000000 | pos_lr: 0.0001 | Time: 181s ===
+
+Epoch 21 [0/194] Iter: 4075 | Loss: 0.1750
+Epoch 21 [20/194] Iter: 4095 | Loss: 0.2262
+=== Forward Pass Timing (avg over 100 frames) ===
+  Project+PairGen (GPU):    5.54 ms
+  Sort (CPU):               86.52 ms
+  Range+Render (GPU):      17.58 ms
+  TOTAL:                  109.85 ms
+  Pairs/frame:            ~61870
+[SH] values: [-5.0000, 4.9984] | gradients: max=0.000000 avg=0.000000 | black: 662/1000
+
+[iter 4100] Gaussians: 1000000 | Avg opacity: 0.786 | Avg scale: 0.0397
+
+[Iter 4100] Loss: 0.1434 | Gaussians: 1000000 | Position LR: 1.14e-04
+
+=== maxRadii2D Debug (iter 4100) ===
+Screen pruning enabled: YES
+Threshold (95th percentile): 6.80e+01 pixels
+Gaussians with radii > threshold: 6/1000 sampled (~5% expected)
+First 10 maxRadii2D: 5.50e+01 5.40e+01 2.10e+01 2.00e+01 4.50e+01 4.40e+01 3.40e+01 3.00e+01 6.10e+01 3.00e+01 
+Max radius: 2.78e+02, Avg non-zero: 1.50e+01 (997326/1000000 non-zero)
+=============================================
+
+Density control: pruned=10784 cloned=0 split=10784 total=1000000
+
+=== accumulateRadii Debug (call #4101) ===
+First 10 projected radii: 3.50e+01 3.60e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D AFTER: 3.50e+01 3.60e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+
+Epoch 21 [40/194] Iter: 4115 | Loss: 0.2016
+Epoch 21 [60/194] Iter: 4135 | Loss: 0.1962
+Epoch 21 [80/194] Iter: 4155 | Loss: 0.1912
+Epoch 21 [100/194] Iter: 4175 | Loss: 0.1847
+Epoch 21 [120/194] Iter: 4195 | Loss: 0.1782
+=== Forward Pass Timing (avg over 100 frames) ===
+  Project+PairGen (GPU):    5.48 ms
+  Sort (CPU):               89.77 ms
+  Range+Render (GPU):      18.05 ms
+  TOTAL:                  113.53 ms
+  Pairs/frame:            ~1094634
+[SH] values: [-5.0000, 4.9983] | gradients: max=8.000000 avg=0.084692 | black: 662/1000
+
+[iter 4200] Gaussians: 1000000 | Avg opacity: 0.778 | Avg scale: 0.0410
+
+[Iter 4200] Loss: 0.1856 | Gaussians: 1000000 | Position LR: 1.13e-04
+
+=== maxRadii2D Debug (iter 4200) ===
+Screen pruning enabled: YES
+Threshold (95th percentile): 6.80e+01 pixels
+Gaussians with radii > threshold: 18/1000 sampled (~5% expected)
+First 10 maxRadii2D: 4.60e+01 4.70e+01 1.60e+01 1.70e+01 4.20e+01 3.60e+01 2.30e+01 2.30e+01 5.60e+01 2.20e+01 
+Max radius: 2.35e+02, Avg non-zero: 1.47e+01 (998159/1000000 non-zero)
+=============================================
+
+Density control: pruned=8766 cloned=0 split=8766 total=1000000
+
+=== accumulateRadii Debug (call #4201) ===
+First 10 projected radii: 2.70e+01 2.80e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D AFTER: 2.70e+01 2.80e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+
+Epoch 21 [140/194] Iter: 4215 | Loss: 0.1745
+Epoch 21 [160/194] Iter: 4235 | Loss: 0.1708
+Epoch 21 [180/194] Iter: 4255 | Loss: 0.1677
+=== Epoch 21 | Loss: 0.1659 | Gaussians: 1000000 | pos_lr: 0.0001 | Time: 179s ===
+
+Epoch 22 [0/194] Iter: 4269 | Loss: 0.1804
+Epoch 22 [20/194] Iter: 4289 | Loss: 0.2292
+=== Forward Pass Timing (avg over 100 frames) ===
+  Project+PairGen (GPU):    5.54 ms
+  Sort (CPU):               81.25 ms
+  Range+Render (GPU):      17.30 ms
+  TOTAL:                  104.36 ms
+  Pairs/frame:            ~884577
+[SH] values: [-5.0000, 4.9983] | gradients: max=54.652687 avg=0.013730 | black: 673/1000
+
+[iter 4300] Gaussians: 1000000 | Avg opacity: 0.769 | Avg scale: 0.0390
+
+[Iter 4300] Loss: 0.2328 | Gaussians: 1000000 | Position LR: 1.12e-04
+
+=== maxRadii2D Debug (iter 4300) ===
+Screen pruning enabled: YES
+Threshold (95th percentile): 6.80e+01 pixels
+Gaussians with radii > threshold: 14/1000 sampled (~5% expected)
+First 10 maxRadii2D: 5.30e+01 5.40e+01 1.90e+01 2.10e+01 4.90e+01 4.30e+01 2.80e+01 2.70e+01 6.00e+01 3.10e+01 
+Max radius: 2.81e+02, Avg non-zero: 1.44e+01 (997461/1000000 non-zero)
+=============================================
+
+Density control: pruned=9776 cloned=0 split=9776 total=1000000
+
+=== accumulateRadii Debug (call #4301) ===
+First 10 projected radii: 3.00e+01 3.00e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D AFTER: 3.00e+01 3.00e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+
+Epoch 22 [40/194] Iter: 4309 | Loss: 0.2027
+Epoch 22 [60/194] Iter: 4329 | Loss: 0.1970
+Epoch 22 [80/194] Iter: 4349 | Loss: 0.1921
+Epoch 22 [100/194] Iter: 4369 | Loss: 0.1863
+Epoch 22 [120/194] Iter: 4389 | Loss: 0.1798
+=== Forward Pass Timing (avg over 100 frames) ===
+  Project+PairGen (GPU):    7.30 ms
+  Sort (CPU):              131.11 ms
+  Range+Render (GPU):      19.98 ms
+  TOTAL:                  158.62 ms
+  Pairs/frame:            ~1660026
+[SH] values: [-5.0000, 4.9983] | gradients: max=8.000000 avg=0.084439 | black: 681/1000
+
+[iter 4400] Gaussians: 1000000 | Avg opacity: 0.788 | Avg scale: 0.0414
+
+[Iter 4400] Loss: 0.1243 | Gaussians: 1000000 | Position LR: 1.11e-04
+
+=== maxRadii2D Debug (iter 4400) ===
+Screen pruning enabled: YES
+Threshold (95th percentile): 6.80e+01 pixels
+Gaussians with radii > threshold: 15/1000 sampled (~5% expected)
+First 10 maxRadii2D: 4.60e+01 4.70e+01 1.50e+01 2.20e+01 4.70e+01 3.30e+01 2.20e+01 2.00e+01 5.80e+01 2.70e+01 
+Max radius: 1.86e+02, Avg non-zero: 1.41e+01 (998258/1000000 non-zero)
+=============================================
+
+Density control: pruned=7691 cloned=0 split=7691 total=1000000
+
+=== accumulateRadii Debug (call #4401) ===
+First 10 projected radii: 3.40e+01 3.40e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D AFTER: 3.40e+01 3.40e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+
+Epoch 22 [140/194] Iter: 4409 | Loss: 0.1760
+Epoch 22 [160/194] Iter: 4429 | Loss: 0.1726
+Epoch 22 [180/194] Iter: 4449 | Loss: 0.1702
+=== Epoch 22 | Loss: 0.1687 | Gaussians: 1000000 | pos_lr: 0.0001 | Time: 484s ===
+
+Epoch 23 [0/194] Iter: 4463 | Loss: 0.1848
+Epoch 23 [20/194] Iter: 4483 | Loss: 0.2324
+=== Forward Pass Timing (avg over 100 frames) ===
+  Project+PairGen (GPU):  988.34 ms
+  Sort (CPU):              194.00 ms
+  Range+Render (GPU):     101.14 ms
+  TOTAL:                  1283.76 ms
+  Pairs/frame:            ~497520
+[SH] values: [-5.0000, 4.9983] | gradients: max=0.418597 avg=0.000104 | black: 679/1000
+
+[iter 4500] Gaussians: 1000000 | Avg opacity: 0.764 | Avg scale: 0.0415
+
+[Iter 4500] Loss: 0.1391 | Gaussians: 1000000 | Position LR: 1.10e-04
+
+=== maxRadii2D Debug (iter 4500) ===
+Screen pruning enabled: YES
+Threshold (95th percentile): 6.80e+01 pixels
+Gaussians with radii > threshold: 10/1000 sampled (~5% expected)
+First 10 maxRadii2D: 5.30e+01 5.40e+01 1.90e+01 2.60e+01 5.30e+01 4.70e+01 2.70e+01 2.30e+01 6.40e+01 3.20e+01 
+Max radius: 2.65e+02, Avg non-zero: 1.40e+01 (998832/1000000 non-zero)
+=============================================
+
+Density control: pruned=8586 cloned=0 split=8586 total=1000000
+Saved render to /tmp/train_render_4500.ppm (1237x822)
+Saved render to /tmp/ground_truth_4500.ppm (1237x822)
+
+=== accumulateRadii Debug (call #4501) ===
+First 10 projected radii: 2.80e+01 2.90e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D AFTER: 2.80e+01 2.90e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+
+Epoch 23 [40/194] Iter: 4503 | Loss: 0.2040
+Epoch 23 [60/194] Iter: 4523 | Loss: 0.1991
+Epoch 23 [80/194] Iter: 4543 | Loss: 0.1944
+Epoch 23 [100/194] Iter: 4563 | Loss: 0.1895
+Epoch 23 [120/194] Iter: 4583 | Loss: 0.1834
+=== Forward Pass Timing (avg over 100 frames) ===
+  Project+PairGen (GPU):  430.20 ms
+  Sort (CPU):              170.71 ms
+  Range+Render (GPU):      22.02 ms
+  TOTAL:                  623.19 ms
+  Pairs/frame:            ~2240056
+[SH] values: [-5.0000, 4.9986] | gradients: max=8.000000 avg=0.088877 | black: 685/1000
+
+[iter 4600] Gaussians: 1000000 | Avg opacity: 0.777 | Avg scale: 0.0434
+
+[Iter 4600] Loss: 0.1522 | Gaussians: 1000000 | Position LR: 1.09e-04
+
+=== maxRadii2D Debug (iter 4600) ===
+Screen pruning enabled: YES
+Threshold (95th percentile): 6.80e+01 pixels
+Gaussians with radii > threshold: 17/1000 sampled (~5% expected)
+First 10 maxRadii2D: 4.60e+01 4.70e+01 1.50e+01 2.70e+01 5.60e+01 3.90e+01 2.30e+01 2.00e+01 7.30e+01 2.90e+01 
+Max radius: 2.53e+02, Avg non-zero: 1.37e+01 (998271/1000000 non-zero)
+=============================================
+
+Density control: pruned=6517 cloned=0 split=6517 total=1000000
+
+=== accumulateRadii Debug (call #4601) ===
+First 10 projected radii: 3.80e+01 3.90e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D BEFORE: 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+First 10 maxRadii2D AFTER: 3.80e+01 3.90e+01 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 0.00e+00 
+
+Epoch 23 [140/194] Iter: 4603 | Loss: 0.1794
+Epoch 23 [160/194] Iter: 4623 | Loss: 0.1765
+Epoch 23 [180/194] Iter: 4643 | Loss: 0.1745x

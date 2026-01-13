@@ -56,10 +56,17 @@ constant float MAX_SCALE = 8.0f;
 // MAX_SCALE = 4.0 gives exp(4) ≈ 54.6 world units max, allows initial scales like -2.9
 constant float MAX_SCALE_TRAIN = 4.0f;
 
-// Evaluate Spherical Harmonics (only DC term used)
+// Evaluate degree-1 Spherical Harmonics (vectorized with fma)
+// dir = normalized view direction (from Gaussian to camera)
 // Only clamp lower bound - matches official 3DGS implementation
 float3 evalSH(float sh[12], float3 dir) {
-    float3 result = float3(sh[0], sh[4], sh[8]) * SH_C0 + 0.5f;
+    // DC terms + degree-1 terms using fma for speed
+    // Layout: [0-3] = R (dc, x, y, z), [4-7] = G, [8-11] = B
+    float3 sh1_contrib = dir.x * float3(sh[1], sh[5], sh[9]) +
+                         dir.y * float3(sh[2], sh[6], sh[10]) +
+                         dir.z * float3(sh[3], sh[7], sh[11]);
+    float3 result = fma(float3(SH_C0), float3(sh[0], sh[4], sh[8]),
+                        fma(float3(SH_C1), sh1_contrib, float3(0.5f)));
     return max(result, float3(0.0f));  // No upper clamp!
 }
 
@@ -679,47 +686,65 @@ kernel void adamStep(
     
     // Opacity update stays in raw space
     {
-        // Clamp gradient
-        float grad = clamp(g.opacity, -clip, clip);
+        // Opacity regularization: penalize very high opacities to prevent blocking
+        // This helps gradients flow through the scene and prevents death spirals
+        float rawOp = gaussians[tid].opacity;
+        float sigOp = 1.0 / (1.0 + exp(-rawOp));  // sigmoid(rawOp)
+
+        // Add regularization gradient when opacity > 0.95 (pushes towards lower opacity)
+        // The regularization strength scales with how far above 0.95 we are
+        // Raised from 0.85 to allow Gaussians to become more opaque and block white background
+        float opacityRegGrad = 0.0f;
+        if (sigOp > 0.95f) {
+            // Gradient of sigmoid is sig * (1 - sig), so dL/dRaw = dL/dSig * sig * (1-sig)
+            // We want to push opacity down, so positive gradient on raw opacity
+            float excess = sigOp - 0.95f;  // How much above threshold
+            opacityRegGrad = 0.1f * excess * sigOp * (1.0f - sigOp);  // Soft penalty
+        }
+
+        // Clamp gradient and add regularization
+        float grad = clamp(g.opacity, -clip, clip) + opacityRegGrad;
+
         // Adam moment updates
         float m = beta1 * m_opacity[tid] + (1.0 - beta1) * grad;
         float v = beta2 * v_opacity[tid] + (1.0 - beta2) * grad * grad;
         // Write back
         m_opacity[tid] = m;
         v_opacity[tid] = v;
-        
+
         // Compute bias-corrected estimates
         float m_hat = m / bc1;
         float v_hat = v / bc2;
         gaussians[tid].opacity = clamp(gaussians[tid].opacity - lrs[3] * m_hat / (sqrt(v_hat) + epsilon), -8.0f, 8.0f);
     }
     
-    // SH update - only update DC terms (indices 0, 4, 8) since we only use degree 0
-    // The other 9 coefficients (degree 1 and 2) are not used in forward pass
-    // so updating them causes drift and explosion
-    int sh_indices[3] = {0, 4, 8};  // R, G, B DC terms
-    for (int j = 0; j < 3; j++) {
-        int i = sh_indices[j];
+    // SH update - all 12 coefficients for degree-1 SH
+    // Layout: [0-3] = R (dc, x, y, z), [4-7] = G, [8-11] = B
+    for (int i = 0; i < 12; i++) {
         // Clamp gradient
         float grad = clamp(g.sh[i], -clip, clip);
         uint idx = tid * 12 + i;
-        
+
         // Adam moment updates
         float m = beta1 * m_sh[idx] + (1.0 - beta1) * grad;
         float v = beta2 * v_sh[idx] + (1.0 - beta2) * grad * grad;
         m_sh[idx] = m;
         v_sh[idx] = v;
+
         // Compute bias-corrected estimates
         float m_hat = m / bc1;
         float v_hat = v / bc2;
         float newSH = gaussians[tid].sh[i] - lrs[4] * m_hat / (sqrt(v_hat) + epsilon);
 
-        // Wide safety clamp for numerical stability
-        // With RGBA16Float render target, loss sees true HDR values and provides
-        // proper gradient feedback, so this clamp should rarely trigger
-        // Range: SH=-5 gives color≈-0.9 (will be clamped to 0 in forward)
-        //        SH=+5 gives color≈+1.9 (valid HDR)
-        newSH = clamp(newSH, -5.0f, 5.0f);
+        // DC terms (0, 4, 8) need full range for dark/bright areas
+        // Degree-1 terms (1,2,3,5,6,7,9,10,11) are for view-dependence, smaller range
+        bool isDC = (i == 0 || i == 4 || i == 8);
+        if (isDC) {
+            newSH = clamp(newSH, -5.0f, 5.0f);
+        } else {
+            // View-dependent terms don't need extreme values
+            newSH = clamp(newSH, -2.5f, 2.5f);
+        }
 
         gaussians[tid].sh[i] = newSH;
     }
