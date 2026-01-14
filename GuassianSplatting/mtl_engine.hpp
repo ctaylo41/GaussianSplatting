@@ -143,7 +143,8 @@ private:
     MTL::Buffer* ssimBuffer = nullptr;
     MTL::Buffer* combinedLossBuffer = nullptr;
     MTL::Buffer* totalLossBuffer = nullptr;
-    // Paper: 0.2 weight for D-SSIM
+    
+    // 0.2 weight for D-SSIM
     float lambdaDSSIM = 0.2f;  
     void createLossPipeline();
     float computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth);
@@ -165,7 +166,7 @@ private:
     AdamOptimizer* optimizer = nullptr;
     DensityController* densityController = nullptr;
     size_t densityControlInterval = 100;
-    float sceneExtent = 1.0f;  // Scene extent for density control thresholds
+    float sceneExtent = 1.0f;
     
     // Training state
     bool isTraining = false;

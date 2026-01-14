@@ -4,15 +4,6 @@
 //
 //  Created by Colin Taylor Taylor on 2025-12-31.
 //
-// GPU Radix Sort Implementation for Gaussian Splatting
-//
-// FIXED BUGS (Jan 10, 2026):
-// 1. scatter32Simple: Now uses separate digitCounters buffer to avoid corrupting
-//    prefixSums across multiple passes
-// 2. Added computeLocalRanks64 kernel for scatter64Simple to compute position
-//    within digit buckets
-// 3. Fixed scatterOptimized32 to use localDigits array and proper local position
-//    calculation instead of O(n²) loop through localSortedKeys
 
 #include <metal_stdlib>
 using namespace metal;
@@ -22,7 +13,7 @@ constant uint RADIX_BITS = 8;
 constant uint RADIX_SIZE = 256;
 constant uint THREADGROUP_SIZE = 256;
 
-// 32-BIT Radix Sort for depth sorting in viewer
+// 32 bit Radix Sort for depth sorting in viewer
 
 // Convert float to sortable uint to handle negative floats correctly
 inline uint floatToSortable(float f) {
@@ -61,7 +52,7 @@ kernel void computeDepths(
     
     // Handle edge cases
     if (isnan(depth) || isinf(depth) || depth < 0.0f) {
-        keys[id] = 0xFFFFFFFF;  // Put invalid at end
+        keys[id] = 0xFFFFFFFF;
         values[id] = id;
         return;
     }
@@ -171,7 +162,7 @@ kernel void prefixSum256(
     }
 }
 
-// Scatter32 Simple - Fixed to not corrupt prefix sums
+// Scatter32 Simple Fixed to not corrupt prefix sums
 // Uses digitCounters for atomic increments, prefixSums for base offsets
 
 kernel void scatter32Simple(
@@ -214,11 +205,7 @@ kernel void clearHistogram(
     }
 }
 
-// REMOVED: computeLocalRanks64 - replaced with atomic scatter
-// The O(n²) loop was the performance bottleneck
-
-// 64-BIT RADIX SORT for tile + depth compound keys
-
+// 64 bit raddix sort for tile + depth compound keys
 kernel void histogram64(
     device const ulong* keys [[buffer(0)]],
     device atomic_uint* globalHistogram [[buffer(1)]],
@@ -236,10 +223,8 @@ kernel void histogram64(
     }
 }
 
-// Atomic-based Scatter64 - O(1) per element instead of O(n²)
-// Uses atomic counters to compute local rank without loops
-// Stable Scatter64 - Uses deterministic local ranks within threadgroups
-// This ensures radix sort stability by preserving relative order of elements with same digit
+// Atomic-based Scatter64 Stable
+// Uses threadgroup memory to compute local ranks for stability
 kernel void scatter64Stable(
     device const ulong* keysIn [[buffer(0)]],
     device const uint* valuesIn [[buffer(1)]],
@@ -255,7 +240,7 @@ kernel void scatter64Stable(
 {
     // Shared memory for this threadgroup
     threadgroup uint localDigits[THREADGROUP_SIZE];
-    threadgroup uint localCounts[256];  // Count per digit in this threadgroup
+    threadgroup uint localCounts[256];
     threadgroup uint globalBaseForDigit[256];
     
     // Initialize counts
@@ -270,6 +255,7 @@ kernel void scatter64Stable(
     uint value = 0;
     uint digit = 0;
     
+    // Load keys and values
     if (valid) {
         key = keysIn[id];
         value = valuesIn[id];
@@ -279,7 +265,8 @@ kernel void scatter64Stable(
         // Count digits in this threadgroup
         atomic_fetch_add_explicit((threadgroup atomic_uint*)&localCounts[digit], 1, memory_order_relaxed);
     } else {
-        localDigits[tid] = 0xFFFFFFFF;  // Invalid marker
+          // Invalid marker
+        localDigits[tid] = 0xFFFFFFFF;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
@@ -295,8 +282,8 @@ kernel void scatter64Stable(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Compute local rank DETERMINISTICALLY (count same-digit elements with lower tid)
-    // This preserves input order = stability!
+    // Compute local rank dermenistricly count same-digit elements with lower tid
+    // Preserves input order
     if (valid) {
         uint localRank = 0;
         for (uint i = 0; i < tid; i++) {
@@ -314,7 +301,8 @@ kernel void scatter64Stable(
     }
 }
 
-// OLD Non-stable version (kept for reference, but don't use)
+// Non-stable version scatter64 Using Atomic Counters
+// Uses atomic increments to get local rank
 kernel void scatter64WithAtomicRank(
     device const ulong* keysIn [[buffer(0)]],
     device const uint* valuesIn [[buffer(1)]],
@@ -332,10 +320,7 @@ kernel void scatter64WithAtomicRank(
     uint value = valuesIn[id];
     uint digit = (key >> bitOffset) & 0xFF;
     
-    // Atomically get local rank (O(1) per element!)
-    // atomic_fetch_add returns the OLD value, which is exactly the count
-    // of same-digit elements that came before
-    // NOTE: This is NOT stable - thread execution order is non-deterministic!
+    // Atomically get local rank (O(1) per element
     uint localRank = atomic_fetch_add_explicit(&digitCounters[digit], 1, memory_order_relaxed);
     
     // Final position = prefix sum + local rank
@@ -429,7 +414,7 @@ kernel void scatterOptimized32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Write to global memory - use the sorted local arrays
+    // Write to global memory use the sorted local arrays
     // The localSortedKeys/Values were already placed in correct order by atomic localOffsets
     if (tid < tgSize && tid < numElements) {
         // Check if this position has valid data
@@ -522,7 +507,7 @@ kernel void scatter64Optimized(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Write to global memory - use sorted local arrays directly
+    // Write to global memory use sorted local arrays directly
     // The localSortedKeys/Values were already placed in correct order by atomic localOffsets
     if (tid < tgSize && tid < numElements) {
         // Check if this position has valid data

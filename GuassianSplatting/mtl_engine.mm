@@ -16,7 +16,7 @@
 #include <fstream>
 #include <Foundation/NSAutoreleasePool.hpp>
 
-// Helper to convert half-float to float
+// Helper to convert half float to float
 static float halfToFloat(uint16_t h) {
     uint32_t sign = (h >> 15) & 0x1;
     uint32_t exp = (h >> 10) & 0x1F;
@@ -878,7 +878,7 @@ void MTLEngine::createLossPipeline() {
     std::cout << "Loss pipelines created (L1 + D-SSIM with lambda=" << lambdaDSSIM << ")" << std::endl;
 }
 
-// Compute combined loss (L1 + D-SSIM) between rendered and ground truth textures
+// Compute combined loss L1 and D-SSIM between rendered and ground truth textures
 float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) {
     uint32_t width = rendered->width();
     uint32_t height = rendered->height();
@@ -918,21 +918,21 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
     MTL::Size gridSize = MTL::Size(width, height, 1);
     MTL::Size threadGroupSize = MTL::Size(16, 16, 1);
     
-    // Step 1: Compute L1 loss per pixel
+    // Compute L1 loss per pixel
     encoder->setComputePipelineState(lossComputePSO);
     encoder->setTexture(rendered, 0);
     encoder->setTexture(groundTruth, 1);
     encoder->setBuffer(lossBuffer, 0, 0);
     encoder->dispatchThreads(gridSize, threadGroupSize);
     
-    // Step 2: Compute SSIM (D-SSIM) per pixel
+    // Compute SSIM (D-SSIM) per pixel
     encoder->setComputePipelineState(ssimComputePSO);
     encoder->setTexture(rendered, 0);
     encoder->setTexture(groundTruth, 1);
     encoder->setBuffer(ssimBuffer, 0, 0);
     encoder->dispatchThreads(gridSize, threadGroupSize);
     
-    // Step 3: Combine losses: (1-lambda)*L1 + lambda*D-SSIM
+    // Combine losses: (1-lambda)*L1 + lambda*D-SSIM
     encoder->setComputePipelineState(combinedLossPSO);
     encoder->setTexture(rendered, 0);
     encoder->setTexture(groundTruth, 1);
@@ -945,7 +945,7 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
     encoder->setBytes(&lambdaDSSIM, sizeof(float), 3);
     encoder->dispatchThreads(gridSize, threadGroupSize);
     
-    // Step 4: Reduce combined loss to single value
+    // Reduce combined loss to single value
     encoder->setComputePipelineState(reductionPSO);
     encoder->setBuffer(combinedLossBuffer, 0, 0);
     encoder->setBuffer(totalLossBuffer, 0, 1);
@@ -993,7 +993,7 @@ float MTLEngine::trainStep(size_t imageIndex,
     float scaledCx = cam.cx * scaleX;
     float scaledCy = cam.cy * scaleY;
     
-    // DEBUG: Print uniforms once
+    // Print uniforms once
     static bool uniformsDebugPrinted = false;
     if (!uniformsDebugPrinted) {
         std::cout << "=== Training Uniforms Debug ===" << std::endl;
@@ -1036,7 +1036,7 @@ float MTLEngine::trainStep(size_t imageIndex,
     R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
     uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
     
-    // DEBUG Check view-space coordinates for first few Gaussians on CPU side
+    // Print view-space coordinates for first few Gaussians on CPU side
     static bool projectionDebugPrinted = false;
     if (!projectionDebugPrinted) {
         Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
@@ -1118,13 +1118,13 @@ float MTLEngine::trainStep(size_t imageIndex,
     
     // Optimizer step with decayed learning rates
     optimizer->step(commandQueue, gaussianBuffer, gaussianGradients,
-                    lr_position,   // decayed position lr
-                    lr_scale,      // scale lr (official: scaling_lr = 0.005)
-                    lr_rotation,   // rotation lr (official: rotation_lr = 0.001)
-                    lr_opacity,    // opacity lr (official: opacity_lr = 0.025)
-                    lr_sh);        // sh lr (official: feature_lr = 0.0025)
+                    lr_position,
+                    lr_scale,
+                    lr_rotation,
+                    lr_opacity,
+                    lr_sh);
     
-    // Check for NaN contamination and gradient health after optimizer step
+    // Check for NAN contamination and gradient health after optimizer step
     if (saveCounter % 100 == 0) {
         Gaussian* g = (Gaussian*)gaussianBuffer->contents();
         GaussianGradients* grads = (GaussianGradients*)gaussianGradients->contents();
@@ -1137,7 +1137,7 @@ float MTLEngine::trainStep(size_t imageIndex,
         int minSHIdx = -1;
         float maxSHGrad = 0.0f;
         float avgSHGrad = 0.0f;
-        int saturatedCount = 0;  // Colors near 0 or 1
+        int saturatedCount = 0;
         
         // Check first 1000 Gaussians for NaN and gradients
         const int checkCount = std::min((size_t)1000, gaussianCount);
@@ -1153,7 +1153,8 @@ float MTLEngine::trainStep(size_t imageIndex,
             for (int sh = 0; sh < 12; sh++) {
                 if (std::isnan(g[i].sh[sh])) {
                     shNanCount++;
-                    break;  // Only count once per Gaussian
+                    // Only Count once per Gaussian
+                    break;  
                 }
                 if (g[i].sh[sh] > maxSH) {
                     maxSH = g[i].sh[sh];
@@ -1170,17 +1171,15 @@ float MTLEngine::trainStep(size_t imageIndex,
                 avgSHGrad += fabsf(grad);
             }
             
-            // Check if color output would be clamped to 0 (black Gaussian)
-            // color = max(SH_C0 * sh + 0.5, 0), clamped when SH <= -0.5/SH_C0 ≈ -1.77
-            const float SH_C0 = 0.28209479177387814f;
-            const float BLACK_THRESHOLD = -0.5f / SH_C0;  // ≈ -1.77
-            bool isBlack = false;
-            if (g[i].sh[0] <= BLACK_THRESHOLD ||
-                g[i].sh[4] <= BLACK_THRESHOLD ||
-                g[i].sh[8] <= BLACK_THRESHOLD) {
-                isBlack = true;
+            // Check if color output is very dark sigmoid activation
+            const float DARK_THRESHOLD = -4.0f;
+            bool isDark = false;
+            if (g[i].sh[0] <= DARK_THRESHOLD ||
+                g[i].sh[4] <= DARK_THRESHOLD ||
+                g[i].sh[8] <= DARK_THRESHOLD) {
+                isDark = true;
             }
-            if (isBlack) {
+            if (isDark) {
                 saturatedCount++;
             }
         }
@@ -1188,37 +1187,28 @@ float MTLEngine::trainStep(size_t imageIndex,
         avgSHGrad /= (checkCount * 12);
         
         if (nanCount > 0 || shNanCount > 0) {
-            printf("\n⚠️  WARNING: NaN DETECTED! %d position/opacity NaNs, %d SH NaNs (checked %d Gaussians)\n", 
+            printf("\n WARNING: NaN DETECTED! %d position/opacity NaNs, %d SH NaNs (checked %d Gaussians)\n", 
                    nanCount, shNanCount, checkCount);
         }
         
         // Report SH value range and gradient health
-        // "black" = Gaussians where at least one color channel is clamped to 0
         printf("[SH] values: [%.4f, %.4f] | gradients: max=%.6f avg=%.6f | black: %d/%d\n",
                minSH, maxSH, maxSHGrad, avgSHGrad, saturatedCount, checkCount);
 
-        // Count Gaussians at SH cap and over-bright
-        int atCapR = 0, atCapG = 0, atCapB = 0;
-        int overBrightR = 0, overBrightG = 0, overBrightB = 0;
-        int overBrightAny = 0;
+        // Count Gaussians at SH caps and with saturated colors sigmoid activation
+        int atCapHigh = 0, atCapLow = 0;
+        int saturatedHigh = 0, saturatedLow = 0;
         for (int i = 0; i < checkCount; i++) {
-            // Check if at +5 cap
-            if (g[i].sh[0] >= 4.9f) atCapR++;
-            if (g[i].sh[4] >= 4.9f) atCapG++;
-            if (g[i].sh[8] >= 4.9f) atCapB++;
-            const float SH_C0 = 0.28209479177387814f;
+            // Check if at +-5 cap
+            if (g[i].sh[0] >= 4.9f || g[i].sh[4] >= 4.9f || g[i].sh[8] >= 4.9f) atCapHigh++;
+            if (g[i].sh[0] <= -4.9f || g[i].sh[4] <= -4.9f || g[i].sh[8] <= -4.9f) atCapLow++;
 
-            // Check if computed color > 1.0 (over-bright)
-            float colorR = SH_C0 * g[i].sh[0] + 0.5f;
-            float colorG = SH_C0 * g[i].sh[4] + 0.5f;
-            float colorB = SH_C0 * g[i].sh[8] + 0.5f;
-            if (colorR > 1.0f) overBrightR++;
-            if (colorG > 1.0f) overBrightG++;
-            if (colorB > 1.0f) overBrightB++;
-            if (colorR > 1.0f || colorG > 1.0f || colorB > 1.0f) overBrightAny++;
+            // Check if any color channel is saturated near 0 or 1 with sigmoid
+            if (g[i].sh[0] >= 4.0f || g[i].sh[4] >= 4.0f || g[i].sh[8] >= 4.0f) saturatedHigh++;
+            if (g[i].sh[0] <= -4.0f || g[i].sh[4] <= -4.0f || g[i].sh[8] <= -4.0f) saturatedLow++;
         }
-        printf("[SH] at_cap(R/G/B): %d/%d/%d | over-bright(R/G/B/any): %d/%d/%d/%d of %d\n",
-               atCapR, atCapG, atCapB, overBrightR, overBrightG, overBrightB, overBrightAny, checkCount);
+        printf("[SH] at_cap(high/low): %d/%d | saturated(high/low): %d/%d of %d\n",
+               atCapHigh, atCapLow, saturatedHigh, saturatedLow, checkCount);
     }
 
     // Periodic stats every 100 images
@@ -1278,13 +1268,13 @@ void MTLEngine::train(size_t numEpochs) {
     const size_t OPACITY_RESET_INTERVAL = 3000;
     const size_t DENSIFY_FROM_ITER = 500;
     const size_t DENSIFY_UNTIL_ITER = 15000;
-    const float OPACITY_RESET_VALUE = -4.6f;  // sigmoid^-1(0.01) ≈ -4.6
+    const float OPACITY_RESET_VALUE = -4.6f;
     
     // Position LR decays exponentially from init to final
     const float POSITION_LR_INIT = 0.00016f;
     // 100x smaller at end
     const float POSITION_LR_FINAL = 0.0000016f;  
-    // Back to official value - need Gaussians to shrink for sharpness
+    // Back to official value need Gaussians to shrink for sharpness
     const float SCALE_LR = 0.005f;  
     const float ROTATION_LR = 0.001f;
     // Increased from 0.025 to help opacity recovery after resets
@@ -1342,15 +1332,10 @@ void MTLEngine::train(size_t numEpochs) {
                           << std::endl;
             }
             
-            // ============================================
-            // DENSITY CONTROL (must happen BEFORE opacity reset - matching official order!)
-            // ============================================
-            // Official logic: size_threshold = 20 if iteration > opacity_reset_interval else None
-            // Note: uses > not >= so at iter 3000, size_threshold is still None
+            // Enable screen-space pruning after OPACITY_RESET_INTERVAL iterations
             bool enableScreenPruning = (totalIterations > OPACITY_RESET_INTERVAL);
             
-            // Density control condition (matching official train.py)
-            // Official: if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0
+            // Density control condition
             bool shouldDensify = (totalIterations > DENSIFY_FROM_ITER &&
                                   totalIterations < DENSIFY_UNTIL_ITER &&
                                   totalIterations % densityControlInterval == 0);
@@ -1365,9 +1350,7 @@ void MTLEngine::train(size_t numEpochs) {
                 float scaleX = (float)actualWidth / (float)cam.width;
                 float focalLength = cam.fx * scaleX;
                 float imageWidth = (float)actualWidth;
-                // Approximate average scene depth from camera distance to scene center
-                // Official uses max_radii2D from rasterizer; we approximate with typical camera distance
-                // Typical camera is ~3-5x scene extent away (orbital cameras looking at scene center)
+                // Approximate scene extent from camera positions
                 float avgDepth = 4.0f * sceneExtent;
 
                 if (totalIterations % 1000 == 0) {
@@ -1378,7 +1361,7 @@ void MTLEngine::train(size_t numEpochs) {
                             << " screenPrune=" << (enableScreenPruning ? "ON" : "OFF") << std::endl;
                 }
                 
-                // Save count BEFORE density control to detect new Gaussians
+                // Save count before density control to detect new Gaussians
                 size_t oldCount = gaussianCount;
                 
                 // Pass enableScreenPruning to density controller
@@ -1386,7 +1369,7 @@ void MTLEngine::train(size_t numEpochs) {
                 densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
                                          nullptr, gaussianCount, totalIterations,
                                          0.0002f,
-                                         0.005f,  // min_opacity: official uses 0.005
+                                         0.005f,
                                          0.1f * sceneExtent,
                                          focalLength,
                                          imageWidth,
@@ -1403,7 +1386,7 @@ void MTLEngine::train(size_t numEpochs) {
                 if (optimizer) {
                     optimizer->resizeIfNeeded(gaussianCount);
                     
-                    // Reset Adam state for new Gaussians (split/clone)
+                    // Reset Adam state for new Gaussians split/clone
                     // New Gaussians should start with zeroed momentum
                     if (gaussianCount > oldCount) {
                         optimizer->resetStateForNewGaussians(oldCount);
@@ -1411,9 +1394,7 @@ void MTLEngine::train(size_t numEpochs) {
                 }
             }
             
-            // ============================================
-            // OPACITY RESET (must happen AFTER density control - matching official order!)
-            // ============================================
+            // Opacity reset condition
             if (totalIterations % OPACITY_RESET_INTERVAL == 0 && 
                 totalIterations > 0 && 
                 totalIterations < DENSIFY_UNTIL_ITER) {
@@ -1422,7 +1403,7 @@ void MTLEngine::train(size_t numEpochs) {
                 // Clamp opacities in Gaussian buffer
                 Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
                 for (size_t i = 0; i < gaussianCount; i++) {
-                    // Clamp opacity to max 0.01: min(current, sigmoid^-1(0.01))
+                    // Clamp opacity to max 0.01
                     if (gaussians[i].opacity > OPACITY_RESET_VALUE) {
                         gaussians[i].opacity = OPACITY_RESET_VALUE;
                     }
@@ -1486,44 +1467,52 @@ void MTLEngine::exportTrainingViews(const std::string& outputFolder) {
         const TrainingImage& img = trainingImages[imgIdx];
         const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
         
-        // Create render target matching the original image size
-        if (!renderTarget || renderTarget->width() != cam.width || renderTarget->height() != cam.height) {
-            createRenderTarget(cam.width, cam.height);
+        // Get actual image texture size (matching training behavior)
+        uint32_t actualWidth = img.texture->width();
+        uint32_t actualHeight = img.texture->height();
+
+        // Scale factor from COLMAP resolution to actual image resolution
+        float scaleX = (float)actualWidth / (float)cam.width;
+        float scaleY = (float)actualHeight / (float)cam.height;
+
+        // Scale camera intrinsics to match actual image size (matching training)
+        float scaledFx = cam.fx * scaleX;
+        float scaledFy = cam.fy * scaleY;
+        float scaledCx = cam.cx * scaleX;
+        float scaledCy = cam.cy * scaleY;
+
+        // Create render target matching the actual image size
+        if (!renderTarget || renderTarget->width() != actualWidth || renderTarget->height() != actualHeight) {
+            createRenderTarget(actualWidth, actualHeight);
         }
+
+        // Create scaled camera for projection
+        ColmapCamera scaledCam = cam;
+        scaledCam.width = actualWidth;
+        scaledCam.height = actualHeight;
+        scaledCam.fx = scaledFx;
+        scaledCam.fy = scaledFy;
+        scaledCam.cx = scaledCx;
+        scaledCam.cy = scaledCy;
         
-        // Set up uniforms for this view (TiledUniforms for tiled rasterizer)
+        // Set up uniforms for this view
         TiledUniforms uniforms;
         uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
-        
-        float near = 0.1f;
-        float far = 1000.0f;
-        
-        // Projection matching training
-        simd_float4x4 proj = {0};
-        proj.columns[0][0] = 2.0f * cam.fx / cam.width;
-        proj.columns[1][1] = 2.0f * cam.fy / cam.height;
-        proj.columns[2][0] = 2.0f * cam.cx / cam.width - 1.0f;
-        proj.columns[2][1] = 2.0f * cam.cy / cam.height - 1.0f;
-        proj.columns[2][2] = far / (far - near);
-        proj.columns[2][3] = 1.0f;
-        proj.columns[3][2] = -(far * near) / (far - near);
-        uniforms.projectionMatrix = proj;
-        
-        // Compute view-projection matrix
+        uniforms.projectionMatrix = projectionFromColmap(scaledCam, 0.1f, 1000.0f);
         uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
-        uniforms.screenSize = simd_make_float2((float)cam.width, (float)cam.height);
-        uniforms.focalLength = simd_make_float2(cam.fx, cam.fy);
-        
+        uniforms.screenSize = simd_make_float2((float)actualWidth, (float)actualHeight);
+        uniforms.focalLength = simd_make_float2(scaledFx, scaledFy);
+
         // Compute camera position from view matrix
         simd_float3x3 R;
         R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
         R.columns[1] = uniforms.viewMatrix.columns[1].xyz;
         R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
         uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
-        
-        // Set tile info
-        uniforms.numTilesX = (cam.width + 15) / 16;
-        uniforms.numTilesY = (cam.height + 15) / 16;
+
+        // Set tile info using actual image dimensions
+        uniforms.numTilesX = (actualWidth + 15) / 16;
+        uniforms.numTilesY = (actualHeight + 15) / 16;
         uniforms.numGaussians = (uint32_t)gaussianCount;
         
         // Render

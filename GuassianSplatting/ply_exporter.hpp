@@ -45,7 +45,7 @@ public:
         file << "property float y\n";
         file << "property float z\n";
         
-        // Normals (unused but expected)
+        // Normals
         file << "property float nx\n";
         file << "property float ny\n";
         file << "property float nz\n";
@@ -60,15 +60,15 @@ public:
             file << "property float f_rest_" << i << "\n";
         }
         
-        // Opacity (raw)
+        // Opacity
         file << "property float opacity\n";
         
-        // Scale (log)
+        // Scale
         file << "property float scale_0\n";
         file << "property float scale_1\n";
         file << "property float scale_2\n";
         
-        // Rotation (quaternion w,x,y,z)
+        // Rotation quaternion w,x,y,z
         file << "property float rot_0\n";
         file << "property float rot_1\n";
         file << "property float rot_2\n";
@@ -96,7 +96,7 @@ public:
             file.write(reinterpret_cast<const char*>(&pos_y), sizeof(float));
             file.write(reinterpret_cast<const char*>(&pos_z), sizeof(float));
             
-            // Normals (zeros)
+            // Normals zeros
             file.write(reinterpret_cast<const char*>(&zero), sizeof(float));
             file.write(reinterpret_cast<const char*>(&zero), sizeof(float));
             file.write(reinterpret_cast<const char*>(&zero), sizeof(float));
@@ -134,7 +134,7 @@ public:
             file.write(reinterpret_cast<const char*>(&scale_y), sizeof(float));
             file.write(reinterpret_cast<const char*>(&scale_z), sizeof(float));
             
-            // Rotation: internal (.x=w, .y=x, .z=y, .w=z) -> PLY (rot_0=w, rot_1=x, rot_2=y, rot_3=z)
+            // Rotation quaternion w,x,y,z
             float rot_w = g.rotation.x; 
             float rot_x = g.rotation.y; 
             float rot_y = g.rotation.z;

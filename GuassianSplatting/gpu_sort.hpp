@@ -16,7 +16,7 @@ public:
     GPURadixSort32(MTL::Device* device, MTL::Library* library, size_t maxElements);
     ~GPURadixSort32();
     
-    // Sort Gaussians by depth, returns buffer of sorted indices
+    // Sort Gaussians by depth returns buffer of sorted indices
     // Uses 4 passes of 8-bit radix sort
     MTL::Buffer* sort(MTL::CommandQueue* queue,
                       MTL::Buffer* positionBuffer,
@@ -27,6 +27,7 @@ public:
     MTL::Buffer* getSortedIndices() { return valuesBuffers[currentBuffer]; }
     
 private:
+    // Constants
     static constexpr size_t RADIX_SIZE = 256;
     static constexpr size_t THREADGROUP_SIZE = 256;
     static constexpr size_t NUM_PASSES = 4;  
@@ -43,7 +44,7 @@ private:
     MTL::ComputePipelineState* scatter32OptimizedPSO;
     MTL::ComputePipelineState* clearHistogramPSO;
     
-    // Double-buffered key/value arrays
+    // Double buffered key/value arrays
     MTL::Buffer* keysBuffers[2];
     MTL::Buffer* valuesBuffers[2];
     
@@ -59,8 +60,7 @@ private:
     void ensureCapacity(size_t numElements);
 };
 
-// 64-bit GPU Radix Sort for tile + depth compound keys
-
+// 64-bit GPU Radix Sort for tile and depth compound keys
 class GPURadixSort64 {
 public:
     GPURadixSort64(MTL::Device* device, MTL::Library* library, size_t maxElements);
@@ -77,6 +77,7 @@ public:
     MTL::Buffer* getSortedValues() { return valuesBuffers[currentBuffer]; }
     
 private:
+    // Constants    
     static constexpr size_t RADIX_SIZE = 256;
     static constexpr size_t THREADGROUP_SIZE = 256;
     static constexpr size_t NUM_PASSES = 8;
@@ -88,8 +89,8 @@ private:
     // Compute pipelines
     MTL::ComputePipelineState* histogram64PSO;
     MTL::ComputePipelineState* prefixSum256PSO;
-    MTL::ComputePipelineState* scatter64StablePSO;  // NEW: Stable scatter with deterministic ranks
-    MTL::ComputePipelineState* scatter64WithAtomicRankPSO;  // OLD: Non-stable atomic scatter
+    MTL::ComputePipelineState* scatter64StablePSO;
+    MTL::ComputePipelineState* scatter64WithAtomicRankPSO;
     MTL::ComputePipelineState* scatter64OptimizedPSO;
     MTL::ComputePipelineState* clearHistogramPSO;
     
@@ -100,14 +101,13 @@ private:
     // Histogram
     MTL::Buffer* histogramBuffer;
     MTL::Buffer* digitCountersBuffer;
-    // REMOVED: localRanksBuffer - no longer needed with atomic scatter
     
+    // Helper methods
     void createPipelines(MTL::Library* library);
     void ensureCapacity(size_t numElements);
 };
 
-// GPU Tile Sorter combines projection counting, key generation, and sorting
-
+// GPU Tile Sorter combines projection counting key generation and sorting
 class GPUTileSorter {
 public:
     GPUTileSorter(MTL::Device* device, MTL::Library* library,

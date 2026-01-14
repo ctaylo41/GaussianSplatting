@@ -156,11 +156,17 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
             g.sh[j] = 0.0f;
         }
         
-        // Set DC terms (indices 0, 4, 8)
-        // color = SH_C0 * sh_dc + 0.5, so sh_dc = (color - 0.5) / SH_C0
-        g.sh[0] = (pt.color.x - 0.5f) / SH_C0;  // R DC
-        g.sh[4] = (pt.color.y - 0.5f) / SH_C0;  // G DC
-        g.sh[8] = (pt.color.z - 0.5f) / SH_C0;  // B DC
+        // Set DC terms indices 0, 4, 8 using logit inverse sigmoid
+        // Forward color = sigmoid(sh) 
+        // so sh = logit(color) = log(color / (1 - color))
+        // Clamp colors to avoid infinity at 0 and 1
+        auto safeLogit = [](float c) -> float {
+            c = fmaxf(0.001f, fminf(0.999f, c));
+            return logf(c / (1.0f - c));
+        };
+        g.sh[0] = safeLogit(pt.color.x);
+        g.sh[4] = safeLogit(pt.color.y);
+        g.sh[8] = safeLogit(pt.color.z);
         
         gaussians.push_back(g);
     }
@@ -196,7 +202,7 @@ int main(int argc, char* argv[]) {
     std::string imagePath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/scenes/images_4";
     std::string outputPath = "/Users/colintaylortaylor/Documents/GuassianSplatting/GuassianSplatting/output.ply";
     // 30k Iterations for 194 images
-    size_t numEpochs = 286; 
+    size_t numEpochs = 155;
     bool viewOnly = false;
     std::string viewPlyPath = "";
     
@@ -227,7 +233,7 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    // View-only mode
+    // View only mode
     if (viewOnly) {
         std::cout << "=== View Mode ===" << std::endl;
         std::cout << "Loading: " << viewPlyPath << std::endl;
@@ -307,7 +313,7 @@ int main(int argc, char* argv[]) {
     // Load COLMAP data
     ColmapData colmap = loadColmap(colmapPath);
     
-    // Compute scene extent from camera positions BEFORE creating gaussians
+    // Compute scene extent from camera positions before creating gaussians
     float sceneExtent = computeSceneExtent(colmap);
     std::cout << "Scene extent (from cameras): " << sceneExtent << std::endl;
 
@@ -330,12 +336,12 @@ int main(int argc, char* argv[]) {
         printf("SH[4] (G DC): %.4f\n", gaussians[0].sh[4]);
         printf("SH[8] (B DC): %.4f\n", gaussians[0].sh[8]);
         
-        // Verify color recovery
-        const float SH_C0 = 0.28209479177387814f;
-        float r = SH_C0 * gaussians[0].sh[0] + 0.5f;
-        float g = SH_C0 * gaussians[0].sh[4] + 0.5f;
-        float b = SH_C0 * gaussians[0].sh[8] + 0.5f;
-        printf("Recovered color: (%.4f, %.4f, %.4f)\n", r, g, b);
+        // Verify color recovery using sigmoid activation
+        auto sigmoid = [](float x) { return 1.0f / (1.0f + expf(-x)); };
+        float r = sigmoid(gaussians[0].sh[0]);
+        float g = sigmoid(gaussians[0].sh[4]);
+        float b = sigmoid(gaussians[0].sh[8]);
+        printf("Recovered color (sigmoid): (%.4f, %.4f, %.4f)\n", r, g, b);
     }
 
     // Compute bounding box
@@ -360,6 +366,7 @@ int main(int argc, char* argv[]) {
         (min_y + max_y) / 2.0f,
         (min_z + max_z) / 2.0f
     );
+
     float diagonal = simd_length(simd_make_float3(max_x - min_x, max_y - min_y, max_z - min_z));
     
     printf("\n=== Scene Bounds ===\n");
@@ -393,7 +400,7 @@ int main(int argc, char* argv[]) {
     
     // Export rendered views from each training camera
     std::string rendersFolder = outputPath;
-    // Replace filename with 'renders' folder
+    // Replace filename with renders folder
     size_t lastSlash = rendersFolder.rfind('/');
     if (lastSlash != std::string::npos) {
         rendersFolder = rendersFolder.substr(0, lastSlash) + "/renders";

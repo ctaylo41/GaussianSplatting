@@ -19,10 +19,10 @@
 // Number of threads for parallel operations
 static const int NUM_THREADS = 8;
 
-// Enable GPU sorting (set to false to use CPU radix sort)
+// Enable GPU sorting set to false to use CPU radix sort
 static constexpr bool USE_GPU_SORT = false;
 
-// FAST parallel radix sort using GCD
+// Fast parallel radix sort using GCD
 // Optimized with parallel histogram and parallel scatter
 static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs) {
     const size_t n = pairs.size();
@@ -54,7 +54,7 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
         int shift = pass * 8;
         size_t chunkSize = (n + NUM_THREADS - 1) / NUM_THREADS;
         
-        // Step 1: Parallel histogram each thread computes its own histogram
+        // Parallel histogram each thread computes its own histogram
         dispatch_apply(NUM_THREADS, queue, ^(size_t t) {
             memset(threadHist[t], 0, 256 * sizeof(uint32_t));
             size_t start = t * chunkSize;
@@ -66,7 +66,7 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
             }
         });
         
-        // Step 2: Compute global prefix sums and per-thread offsets
+        // Compute global prefix sums and per-thread offsets
         uint32_t sum = 0;
         for (int d = 0; d < 256; d++) {
             globalPrefix[d] = sum;
@@ -77,7 +77,7 @@ static void parallelRadixSort(std::vector<std::pair<uint64_t, uint32_t>>& pairs)
             }
         }
         
-        // Step 3: Parallel scatter (each thread writes its chunk)
+        // Parallel scatter each thread writes its chunk
         dispatch_apply(NUM_THREADS, queue, ^(size_t t) {
             uint32_t localOffset[256];
             memcpy(localOffset, threadOffset[t], 256 * sizeof(uint32_t));
@@ -117,12 +117,12 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
 {
     createPipelines(library);
     
-    // Static assert struct sizes - CRITICAL for Metal compatibility
-    //static_assert(sizeof(ProjectedGaussian) == 88, "ProjectedGaussian must be 88 bytes!");
+    // Static assert struct sizes
+    static_assert(sizeof(ProjectedGaussian) == 96, "ProjectedGaussian must be 96 bytes!");
     static_assert(sizeof(TiledUniforms) == 240, "TiledUniforms must be 240 bytes!");
 
-    // Verify struct alignment should be 88 bytes
-    printf("sizeof(ProjectedGaussian) = %zu bytes (expected 88)\n", sizeof(ProjectedGaussian));
+    // Verify struct alignment 96 bytes total
+    printf("sizeof(ProjectedGaussian) = %zu bytes (expected 96)\n", sizeof(ProjectedGaussian));
     printf("sizeof(TiledUniforms) = %zu bytes (expected 240)\n", sizeof(TiledUniforms));
     printf("  offsetof(screenPos) = %zu (expected 0)\n", offsetof(ProjectedGaussian, screenPos));
     printf("  offsetof(conic) = %zu (expected 8)\n", offsetof(ProjectedGaussian, conic));
@@ -136,6 +136,7 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
     printf("  offsetof(tileMaxY) = %zu (expected 56)\n", offsetof(ProjectedGaussian, tileMaxY));
     printf("  offsetof(viewPos_xy) = %zu (expected 64)\n", offsetof(ProjectedGaussian, viewPos_xy));
     printf("  offsetof(cov2D) = %zu (expected 72)\n", offsetof(ProjectedGaussian, cov2D));
+    printf("  offsetof(viewDir) = %zu (expected 84)\n", offsetof(ProjectedGaussian, viewDir));
     
     // Allocate projection buffer
     projectedGaussians = device->newBuffer(maxGaussians * sizeof(ProjectedGaussian),
@@ -330,10 +331,10 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     uint32_t estimatedPairs = (uint32_t)(gaussianCount * AVG_TILES_PER_GAUSSIAN);
     ensurePairsCapacity(estimatedPairs);
     
-    // Project + Pair Generation in single command buffer
+    // Project Pair Generation in single command buffer
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
     
-    // Step 1: Project all Gaussians
+    // Project all Gaussians
     {
         // Project Gaussians to screen space
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
@@ -353,7 +354,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         enc->endEncoding();
     }
     
-    // Step 2: GPU Pair Generation same command buffer so no sync needed
+    // GPU Pair Generation same command buffer so no sync needed
     {
         // Generate pairs on GPU
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
@@ -384,10 +385,10 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
     
-    // Timing after projection + pair generation
+    // Timing after projection pair generation
     auto t2 = std::chrono::high_resolution_clock::now();
     
-    // Step 2: CPU-side tile binning and sorting
+    // CPU-side tile binning and sorting
     ProjectedGaussian* projPtr = (ProjectedGaussian*)projectedGaussians->contents();
     
     // DEBUG Print some projected Gaussian info
@@ -434,7 +435,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
                     std::cout << "  Tile bounds: (" << p.tileMinX << "," << p.tileMinY << ") to (" << p.tileMaxX << "," << p.tileMaxY << ") = " << actualTiles << " tiles" << std::endl;
                     std::cout << "  Expected tiles: (" << expectedMinTileX << "," << expectedMinTileY << ") to (" << expectedMaxTileX << "," << expectedMaxTileY << ") = " << expectedTiles << " tiles" << std::endl;
                     
-                    // Radius should be related to depth (closer = bigger)
+                    // Radius should be related to depth
                     float roughScreenScale = worldScaleMax / p.depth;
                     std::cout << "  Rough screen scale (worldMax/depth): " << roughScreenScale << std::endl;
                 }
@@ -485,7 +486,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     
     if (USE_GPU_SORT) {
         std::cout << "Using GPU sort for " << totalPairs << " pairs" << std::endl;
-        // GPU sort - much faster, entirely on GPU
+        // GPU sort much faster, entirely on GPU
         gpuRadixSort->sort(queue, gaussianKeys, gaussianValues, totalPairs);
         // Use the GPU's internal sorted buffers directly
         sortedKeysBuffer = gpuRadixSort->getSortedKeys();
@@ -493,11 +494,11 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         std::cout << "GPU sort complete. Keys buffer: " << sortedKeysBuffer 
                   << " Values buffer: " << sortedValuesBuffer << std::endl;
         
-        // Store active sorted buffers for backward pass (GPU sort case)
+        // Store active sorted buffers for backward pass GPU sort case
         activeSortedKeys = sortedKeysBuffer;
         activeSortedValues = sortedValuesBuffer;
     } else {
-        // CPU sort - slower, requires GPU->CPU->GPU copies
+        // CPU sort slower, requires GPU->CPU->GPU copies
         // Get pointers to buffers
         uint64_t* gpuKeys = (uint64_t*)gaussianKeys->contents();
         uint32_t* gpuValues = (uint32_t*)gaussianValues->contents();
@@ -520,27 +521,26 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
             gpuValues[i] = pairs[i].second;
         }
         
-        // CRITICAL FIX: CPU sort writes to gaussianKeys/gaussianValues, not sortedKeysBuffer/sortedValuesBuffer!
-        // Backward pass MUST use the correct buffers or gradients go to wrong Gaussians!
+        // Use the original buffers as sorted buffers
         activeSortedKeys = gaussianKeys;
         activeSortedValues = gaussianValues;
     }
     
-    // Get pointers for debug printing - use the active sorted buffers
+    // Get pointers for debug printing use the active sorted buffers
     uint64_t* gpuKeys = (uint64_t*)activeSortedKeys->contents();
     uint32_t* gpuValues = (uint32_t*)activeSortedValues->contents();
     
     auto t6 = std::chrono::high_resolution_clock::now();
     
-    // Build tile ranges + Render in single command buffer
+    // Build tile ranges and render in single command buffer
     cmdBuffer = queue->commandBuffer();
     
     // Build tile ranges on GPU using parallel binary search
     {
-        // Setup compute encoder and buffers - use sorted buffers
+        // Setup compute encoder and buffers use sorted buffers
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
         enc->setComputePipelineState(buildTileRangesPSO);
-        enc->setBuffer(activeSortedKeys, 0, 0);  // Use active sorted keys
+        enc->setBuffer(activeSortedKeys, 0, 0);
         enc->setBuffer(tileRanges, 0, 1);
         enc->setBytes(&pairCount, sizeof(uint32_t), 2);
         enc->setBytes(&maxTiles, sizeof(uint32_t), 3);
@@ -563,7 +563,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
         enc->setComputePipelineState(tiledForwardPSO);
         enc->setBuffer(gaussianBuffer, 0, 0);
         enc->setBuffer(projectedGaussians, 0, 1);
-        // sortedIndices - use active sorted values buffer (correct for both GPU and CPU sort)
+        // sortedIndices use active sorted values buffer correct for both GPU and CPU sort
         enc->setBuffer(activeSortedValues, 0, 2);  
         enc->setBuffer(tileRanges, 0, 3);
         enc->setBuffer(uniformBuffer, 0, 4);
@@ -605,7 +605,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
                 totalCoverage += ranges[tile].count;
                 maxCount = std::max(maxCount, ranges[tile].count);
                 
-                // Check for gaps (non-contiguous ranges)
+                // Check for gaps non-contiguous ranges
                 if (tilesWithData > 1 && ranges[tile].start != lastEnd) {
                     if (!foundGap) {
                         std::cout << "WARNING: Gap/overlap at tile " << tile 
@@ -712,7 +712,7 @@ void TiledRasterizer::backward(MTL::CommandQueue* queue,
         enc->setBuffer(gaussianBuffer, 0, 0);
         enc->setBuffer(gradientBuffer, 0, 1);
         enc->setBuffer(projectedGaussians, 0, 2);
-        // sortedIndices - use active sorted values buffer
+        // sortedIndices use active sorted values buffer
         enc->setBuffer(activeSortedValues, 0, 3);  
         enc->setBuffer(tileRanges, 0, 4);
         enc->setBuffer(uniformBuffer, 0, 5);

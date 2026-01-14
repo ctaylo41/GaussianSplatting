@@ -9,21 +9,19 @@
 using namespace metal;
 
 struct Gaussian {
-    packed_float3 position; // offset 0, 12 bytes
-    float _pad0;            // offset 12, 4 bytes padding (to align scale to 16)
-    packed_float3 scale;    // offset 16, LOG scale, 12 bytes
-    float _pad1;            // offset 28, 4 bytes padding (to align rotation to 32)
-    float4 rotation;        // offset 32, (w,x,y,z) as (.x=w, .y=x, .z=y, .w=z)
-    float opacity;          // offset 48, RAW pre-sigmoid
-    float sh[12];           // offset 52, 48 bytes -> ends at 100
-    float _pad2;            // offset 100, 4 bytes
-    float _pad3;            // offset 104, 4 bytes
-    float _pad4;            // offset 108, 4 bytes
+    packed_float3 position;
+    float _pad0;
+    packed_float3 scale;
+    float _pad1;
+    float4 rotation;
+    float opacity;
+    float sh[12];
+    float _pad2;
+    float _pad3;
+    float _pad4;
 };
 
 // Projected Gaussian data for tiled rendering
-// Use packed_float3 to match C++ memory layout 12 bytes, not 16
-// Total 88 bytes
 struct ProjectedGaussian {
     float2 screenPos;
     packed_float3 conic;
@@ -38,7 +36,7 @@ struct ProjectedGaussian {
     float _pad1;
     float2 viewPos_xy;
     packed_float3 cov2D;
-    packed_float3 viewDir;   // Cached view direction for backward pass
+    packed_float3 viewDir;
 };  
 
 // Tile range structure
@@ -84,7 +82,7 @@ constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
 constant uint TILE_SIZE = 16;
 constant float MAX_RADIUS = 512.0f;
-// exp(5) ≈ 148 reasonable max scale
+// exp(5), 148 reasonable max scale
 constant float MAX_SCALE = 5.0f;  
 
 // Quaternion to rotation matrix
@@ -132,7 +130,6 @@ kernel void projectGaussians(
     
     // COLMAP uses opencv convention camera looks down +z axis
     // Objects in front of camera have positive view z
-    // clipPos.w = viewZ with our projection, so should be positive for visible objects
     if (clipPos.w <= 0.1 || viewPos.z <= 0.1) {
         projected[tid] = proj;
         return;
@@ -161,7 +158,7 @@ kernel void projectGaussians(
     float3 logScale = clamp(g.scale, -MAX_SCALE, MAX_SCALE);
     float3 scale = exp(logScale);
     
-    // Prevent extremely elongated Gaussians (max 20:1 aspect ratio)
+    // Prevent extremely elongated Gaussians max 20:1 aspect ratio
     float maxScale = max(max(scale.x, scale.y), scale.z);
     float minScale = min(min(scale.x, scale.y), scale.z);
     if (maxScale > 20.0f * minScale) {
@@ -177,7 +174,6 @@ kernel void projectGaussians(
     
     // Build 3D covariance using official 3DGS convention:
     // M = S * R, Sigma = M^T * M = R^T * S^2 * R
-    // This is mathematically equivalent to R * S^2 * R^T but matches official backward pass
     float3x3 R = quatToMat(q);
     // Diagonal scale matrix
     float3x3 S = float3x3(
@@ -220,9 +216,9 @@ kernel void projectGaussians(
                           uniforms.viewMatrix[1].xyz,
                           uniforms.viewMatrix[2].xyz);
     
-    // Combined transform T = J * W (matches paper and viewer)
+    // Combined transform T = J * W
     float3x3 T = J * W;
-    // Project 3D covariance to 2D cov2D = T * Sigma3D * T^T (matches paper and viewer)
+    // Project 3D covariance to 2D cov2D = T * Sigma3D * T^T
     float3x3 cov2D_mat = T * Sigma3D * transpose(T);
     
     // Extract 2D covariance components
@@ -294,21 +290,15 @@ kernel void projectGaussians(
     float rawOpacity = clamp(g.opacity, -8.0f, 8.0f);
     proj.opacity = 1.0 / (1.0 + exp(-rawOpacity));
 
-    // Compute view direction (from Gaussian to camera, normalized)
-    // Use fast::normalize - less precise but faster
-    float3 viewDir = fast::normalize(uniforms.cameraPos - float3(g.position));
-
-    // Cache viewDir for backward pass (avoids recomputing per-pixel)
-    proj.viewDir = viewDir;
-
-    // Color from degree-1 SH (DC + linear terms) using fma for speed
-    // SH layout: [0-3] = R (dc, x, y, z), [4-7] = G, [8-11] = B
-    float3 sh1_contrib = viewDir.x * float3(g.sh[1], g.sh[5], g.sh[9]) +
-                         viewDir.y * float3(g.sh[2], g.sh[6], g.sh[10]) +
-                         viewDir.z * float3(g.sh[3], g.sh[7], g.sh[11]);
-    float3 color = fma(float3(SH_C0), float3(g.sh[0], g.sh[4], g.sh[8]),
-                       fma(float3(SH_C1), sh1_contrib, float3(0.5f)));
-    proj.color = max(color, float3(0.0f));
+    // Color from DC terms using sigmoid activation (like nerfstudio splatfacto)
+    // Sigmoid naturally bounds colors to (0, 1) no clamping needed
+    // This prevents RGB channel divergence that causes saturated color artifacts
+    float3 rawColor = float3(g.sh[0], g.sh[4], g.sh[8]);
+    proj.color = float3(
+        1.0f / (1.0f + exp(-rawColor.x)),
+        1.0f / (1.0f + exp(-rawColor.y)),
+        1.0f / (1.0f + exp(-rawColor.z))
+    );
 
     projected[tid] = proj;
 }
@@ -332,7 +322,7 @@ kernel void tiledForward(
     uint tileIdx = tileY * uniforms.numTilesX + tileX;
     TileRange range = tileRanges[tileIdx];
     
-    // Use float precision to match backward pass - critical for gradient accuracy
+    // Use float precision to match backward pass critical for gradient accuracy
     float3 color = float3(0);
     float T = 1.0f;
     float2 pixelPos = float2(gid) + 0.5;
@@ -608,14 +598,14 @@ kernel void tiledBackward(
                                           + cov_a * cov_b * dL_dConic.z);
         
         // Cov3D gradient
-        // Forward: cov2D = T * Sigma3D * T^T where T = J * W
-        // Gradient: for Y = A * X * A^T, dL/dX = A^T * dL/dY * A
-        // So: dL/dSigma3D = T^T * dL/dCov2D * T
+        // Forward cov2D = T * Sigma3D * T^T where T = J * W
+        // Gradient for Y = A * X * A^T, dL/dX = A^T * dL/dY * A
+        // So dL/dSigma3D = T^T * dL/dCov2D * T
         float3 t_cam = float3(p.viewPos_xy, p.depth);
         txtz = t_cam.x / t_cam.z;
         tytz = t_cam.y / t_cam.z;
         
-        // Jacobian of projection (must match forward pass exactly!)
+        // Jacobian of projection
         float J00 = fx / t_cam.z;
         float J02 = -fx * txtz / t_cam.z;
         float J11 = fy / t_cam.z;
@@ -628,7 +618,7 @@ kernel void tiledBackward(
             float3(J02, J12, 0)
         );
         
-        // T = J * viewRot (matches paper and viewer)
+        // T = J * viewRot
         float3x3 T_mat = J * viewRot;
         
         // dL/dCov2D as 2x2 matrix embedded in 3x3
@@ -657,7 +647,6 @@ kernel void tiledBackward(
         // Build rotation matrix
         float3x3 R = quatToMat(q);
         
-        // Viewer/paper convention: M = R * S
         // S is diagonal scale matrix
         float3x3 S = float3x3(
             float3(scale.x, 0, 0),
@@ -666,7 +655,7 @@ kernel void tiledBackward(
         );
         float3x3 M = R * S;
         
-        // For Sigma = M * M^T, correct gradient is dL/dM = 2 * dL/dSigma * M
+        // For Sigma = M * M^T correct gradient is dL/dM = 2 * dL/dSigma * M
         float3x3 dL_dM = 2.0f * dL_dCov3D * M;
         
         // For M = R * S: dL/dS = R^T * dL/dM, extract diagonal
@@ -686,7 +675,7 @@ kernel void tiledBackward(
         // Transpose for quaternion gradient formula compatibility
         float3x3 dL_dMt_scaled = transpose(dL_dR);
         
-        // Quaternion gradient using 3DGS formulas
+        // Quaternion gradient
         float4 dL_dq;
         dL_dq.x = 2.0f * (z_q * (dL_dMt_scaled[0][1] - dL_dMt_scaled[1][0]) +
                          y_q * (dL_dMt_scaled[2][0] - dL_dMt_scaled[0][2]) +
@@ -707,57 +696,20 @@ kernel void tiledBackward(
                          y_q * (dL_dMt_scaled[1][2] + dL_dMt_scaled[2][1]) -
                          2.0f * z_q * (dL_dMt_scaled[1][1] + dL_dMt_scaled[0][0]));
         
-        // Atomic accumulation
-        // Degree-1 SH gradient: dL/dsh = dL/dcolor * dcolor/dsh
-        // Forward: color = max(SH_C0 * dc + SH_C1 * (sh1*x + sh2*y + sh3*z) + 0.5, 0)
+        // Atomic accumulation DC SH gradients only (indices 0, 4, 8)
+        // Forward color = sigmoid(sh)
+        // Backward dL/dsh = dL/dcolor * dcolor/dsh = dL/dcolor * color * (1 - color)
+        float3 color = float3(p.color);
+        float3 sigmoid_grad = color * (1.0f - color);
+        float3 sh_grad = dL_dColor * sigmoid_grad;
 
-        // Use cached viewDir from forward pass (avoids expensive normalize per-pixel)
-        float3 viewDir = float3(p.viewDir);
+        // Per-pixel gradient clamp sigmoid grad is naturally bounded, but clamp for safety
+        sh_grad = clamp(sh_grad, -1.0f, 1.0f);
 
-        // Use projected color directly for gradient dampening check (already clamped in forward)
-        float3 pre_clamp_color = float3(p.color);
-
-        // Base color gradient (will be scaled for each SH coefficient)
-        float3 dL_dColor_scaled = dL_dColor;
-
-        // Leaky gradient for clamped colors - allows black Gaussians to recover
-        if (pre_clamp_color.r <= 0.0f) dL_dColor_scaled.r *= 0.01f;
-        if (pre_clamp_color.g <= 0.0f) dL_dColor_scaled.g *= 0.01f;
-        if (pre_clamp_color.b <= 0.0f) dL_dColor_scaled.b *= 0.01f;
-
-        // Dampen gradient for over-bright colors - prevents white spot explosion
-        if (pre_clamp_color.r > 1.0f) dL_dColor_scaled.r *= 0.1f;
-        if (pre_clamp_color.g > 1.0f) dL_dColor_scaled.g *= 0.1f;
-        if (pre_clamp_color.b > 1.0f) dL_dColor_scaled.b *= 0.1f;
-
-        // Per-pixel gradient clamp
-        const float MAX_PIXEL_SH_GRAD = 1.0f;
-        dL_dColor_scaled = clamp(dL_dColor_scaled, -MAX_PIXEL_SH_GRAD, MAX_PIXEL_SH_GRAD);
-
-        // DC term gradients (indices 0, 4, 8)
-        float3 sh_dc_grad = dL_dColor_scaled * SH_C0;
-
-        // Degree-1 term gradients (indices 1,2,3 for R, 5,6,7 for G, 9,10,11 for B)
-        float3 sh_x_grad = dL_dColor_scaled * SH_C1 * viewDir.x;
-        float3 sh_y_grad = dL_dColor_scaled * SH_C1 * viewDir.y;
-        float3 sh_z_grad = dL_dColor_scaled * SH_C1 * viewDir.z;
-
-        // Atomic gradient accumulation for all 12 SH coefficients
-        // R channel: indices 0, 1, 2, 3
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0], sh_dc_grad.r, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[1], sh_x_grad.r, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[2], sh_y_grad.r, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[3], sh_z_grad.r, memory_order_relaxed);
-        // G channel: indices 4, 5, 6, 7
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[4], sh_dc_grad.g, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[5], sh_x_grad.g, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[6], sh_y_grad.g, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[7], sh_z_grad.g, memory_order_relaxed);
-        // B channel: indices 8, 9, 10, 11
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[8], sh_dc_grad.b, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[9], sh_x_grad.b, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[10], sh_y_grad.b, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[11], sh_z_grad.b, memory_order_relaxed);
+        // Atomic gradient accumulation for DC terms only
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0], sh_grad.r, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[4], sh_grad.g, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[8], sh_grad.b, memory_order_relaxed);
 
         atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].opacity,
             dL_dRawOpacity, memory_order_relaxed);

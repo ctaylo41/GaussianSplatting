@@ -32,7 +32,6 @@ AdamOptimizer::AdamOptimizer(MTL::Device* device, MTL::Library* library, size_t 
 
 // Allocate or reallocate Adam state buffers
 void AdamOptimizer::allocateBuffers(size_t count) {
-    // Using 3 floats (12 bytes) per vec3, not simd_float3 (16 bytes)
     size_t posSize = count * 3 * sizeof(float);   
     size_t scaleSize = count * 3 * sizeof(float);
     size_t rotSize = count * sizeof(simd_float4);
@@ -139,21 +138,21 @@ void AdamOptimizer::resetOpacityMomentum() {
     memset(v_opacity->contents(), 0, numGaussians * sizeof(float));
 }
 
-// Reset scale momentum after opacity reset (landscape changes dramatically)
+// Reset scale momentum after opacity reset
 void AdamOptimizer::resetScaleMomentum() {
     memset(m_scale->contents(), 0, numGaussians * 3 * sizeof(float));
     memset(v_scale->contents(), 0, numGaussians * 3 * sizeof(float));
     std::cout << "Reset scale momentum after opacity reset" << std::endl;
 }
 
-// Reset SH momentum after opacity reset (colors may need to re-adapt)
+// Reset SH momentum after opacity reset
 void AdamOptimizer::resetSHMomentum() {
     memset(m_sh->contents(), 0, numGaussians * 12 * sizeof(float));
     memset(v_sh->contents(), 0, numGaussians * 12 * sizeof(float));
     std::cout << "Reset SH momentum after opacity reset" << std::endl;
 }
 
-// Reset Adam state for Gaussians starting at index 'startIdx' (after split/clone)
+// Reset Adam state for Gaussians starting at index startIdx after split/clone
 void AdamOptimizer::resetStateForNewGaussians(size_t startIdx) {
     if (startIdx >= numGaussians) return;
     
@@ -221,8 +220,8 @@ void AdamOptimizer::debugPrintState(int idx) {
     }
     printf("\n");
     
-    // momentum should be in reasonable range [-1, 1] with 0.5 gradient clip
-    // After clipping gradients to [-0.5, 0.5], momentum can at most grow by 0.1*0.5 = 0.05 per step
+    // Momentum should be in reasonable range -1 to 1 with 0.5 gradient clip
+    // After clipping gradients to -0.5 to 0.5, momentum can at most grow by 0.1*0.5 = 0.05 per step
     if (fabsf(m_scl[idx*3+0]) > 1.0f || fabsf(m_scl[idx*3+1]) > 1.0f || fabsf(m_scl[idx*3+2]) > 1.0f) {
         printf("[WARNING] m_scale out of expected range! Max expected ~0.5 with gradient clip.\n");
         printf("[WARNING] Actual magnitude: (%f, %f, %f)\n", fabsf(m_scl[idx*3+0]), fabsf(m_scl[idx*3+1]), fabsf(m_scl[idx*3+2]));

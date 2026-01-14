@@ -19,8 +19,6 @@ struct TileRange {
 };
 
 // Projected Gaussian data for tiled rendering
-// Use float arrays instead of simd_float3 to match Metal packed_float3 layout
-// simd_float2 has 8-byte alignment, so compiler adds 4 bytes padding after tileMaxY
 struct ProjectedGaussian {
     simd_float2 screenPos;
     float conic[3];
@@ -35,7 +33,7 @@ struct ProjectedGaussian {
     float _pad1;
     simd_float2 viewPos_xy;
     float cov2D[3];
-    float viewDir[3];        // Cached view direction for backward pass (replaces _pad2)
+    float viewDir[3];
 };
 
 // Uniforms for tiled rasterizer
@@ -74,12 +72,12 @@ public:
                   MTL::Texture* renderedTexture,
                   MTL::Texture* groundTruthTexture);
     
-    // Get projected gaussians buffer (for density control radius tracking)
+    // Get projected gaussians buffer for density control radius tracking
     MTL::Buffer* getProjectedGaussians() const { return projectedGaussians; }
     
 private:
     static constexpr uint32_t TILE_SIZE = 16;
-    // Average Gaussians touch ~4-8 tiles
+    // Average Gaussians touch 4-8 tiles depending on size
     static constexpr uint32_t AVG_TILES_PER_GAUSSIAN = 8;
     
     // Metal device and library
@@ -101,10 +99,11 @@ private:
     MTL::Buffer* totalPairsBuffer;
     MTL::Buffer* perPixelLastIdx;
     MTL::Buffer* uniformBuffer;
+
     // Atomic counter for GPU pair generation
     MTL::Buffer* pairCounterBuffer;
     
-    // Track which buffers contain the sorted data (may point to GPU sorter's internal buffers)
+    // Track which buffers contain the sorted data
     MTL::Buffer* activeSortedKeys;
     MTL::Buffer* activeSortedValues;  
     

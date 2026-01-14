@@ -221,7 +221,7 @@ simd_float3 getCameraWorldPosition(const ColmapImage& img) {
     float ty = img.translation.y;
     float tz = img.translation.z;
     
-    // R^T * t (transpose of R times t)
+    // R^T * t transpose of R times t)
     float cx = -(r00*tx + r10*ty + r20*tz);
     float cy = -(r01*tx + r11*ty + r21*tz);
     float cz = -(r02*tx + r12*ty + r22*tz);
@@ -254,7 +254,7 @@ float computeSceneExtent(const ColmapData& colmap) {
         maxDist = std::max(maxDist, dist);
     }
     
-    // This is the "nerf_normalization" radius from official code
+    // The nerf_normalization radius from official code
     float radius = maxDist * 1.1f;
     
     std::cout << "Camera centroid: (" << centroid.x << ", " << centroid.y << ", " << centroid.z << ")" << std::endl;

@@ -115,7 +115,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             return gaussians;
         }
         
-        // Request SH rest coefficients (degree 1)
+        // Request SH rest coefficients degree 1
         std::shared_ptr<tinyply::PlyData> sh_rest;
         
         try {
@@ -198,7 +198,7 @@ std::vector<Gaussian> load_ply(const std::string& file_path) {
             
             g.scale = simd_make_float3(s0, s1, s2);
             
-            // rotation
+            // Rotation quaternion w,x,y,z
             float qw = rot_data[i*4 + 0];  
             float qx = rot_data[i*4 + 1]; 
             float qy = rot_data[i*4 + 2]; 

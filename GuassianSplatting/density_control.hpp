@@ -41,14 +41,14 @@ public:
                              MTL::Buffer* gradients,
                              size_t gaussianCount);
     
-    // Accumulate screen-space radii from rasterizer (for accurate size-based pruning)
+    // Accumulate screen-space radii from rasterizer for accurate size-based pruning
     void accumulateRadii(MTL::Buffer* projectedGaussians,
                          size_t gaussianCount);
     
     // Reset internal accumulators
     void resetAccumulator(size_t gaussianCount);
     
-    // Set scene extent for scene-relative thresholds (call before training)
+    // Set scene extent for scene-relative thresholds
     static void setSceneExtent(float extent);
 
 private:
@@ -62,7 +62,7 @@ private:
     // Store position gradients for gradient-directed cloning
     MTL::Buffer* positionGradAccum;
     
-    // Track maximum screen-space radius across all views (matches official max_radii2D)
+    // Track maximum screen-space radius across all views matches official max_radii2D
     MTL::Buffer* maxRadii2D;
     
     size_t maxGaussians;

@@ -48,7 +48,7 @@ GPURadixSort32::GPURadixSort32(MTL::Device* device, MTL::Library* library, size_
 {
     createPipelines(library);
     
-    // Allocate double buffers - initialize to zero to avoid undefined behavior
+    // Allocate double buffers initialize to zero to avoid undefined behavior
     keysBuffers[0] = device->newBuffer(maxElements * sizeof(uint32_t),
                                        MTL::ResourceStorageModeShared);
     keysBuffers[1] = device->newBuffer(maxElements * sizeof(uint32_t),
@@ -58,8 +58,8 @@ GPURadixSort32::GPURadixSort32(MTL::Device* device, MTL::Library* library, size_
     valuesBuffers[1] = device->newBuffer(maxElements * sizeof(uint32_t),
                                          MTL::ResourceStorageModeShared);
     
-    // Zero-initialize the value buffers with identity permutation
-    // This ensures that even if sorting fails, we have valid indices
+    // Zero initialize the value buffers with identity permutation
+    // This ensures that even if sorting fails we have valid indices
     uint32_t* vals0 = (uint32_t*)valuesBuffers[0]->contents();
     uint32_t* vals1 = (uint32_t*)valuesBuffers[1]->contents();
     for (size_t i = 0; i < maxElements; i++) {
@@ -72,6 +72,7 @@ GPURadixSort32::GPURadixSort32(MTL::Device* device, MTL::Library* library, size_
                                         MTL::ResourceStorageModeShared);
     memset(histogramBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
     
+    // Digit counters buffer
     digitCountersBuffer = device->newBuffer(RADIX_SIZE * sizeof(uint32_t),
                                             MTL::ResourceStorageModeShared);
     memset(digitCountersBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
@@ -243,7 +244,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         }
     }
     
-    // 4 passes of radix sort (8 bits per pass)
+    // 4 passes of radix sort 8 bits per pass
     int srcIdx = 0;
     
     for (uint32_t pass = 0; pass < NUM_PASSES; pass++) {
@@ -251,7 +252,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         int dstIdx = 1 - srcIdx;
         
         // Clear histogram using CPU memset for guaranteed zeroing
-        // The GPU clear was potentially racing with histogram32
+        // The GPU clear was potentially racing with histogram32?
         memset(histogramBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
         
         // Clear digit counters for scatter phase
@@ -277,7 +278,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
         cmdBuffer->commit();
         cmdBuffer->waitUntilCompleted();
         
-        // CPU prefix sum (simple and correct)
+        // CPU prefix sum
         {
             uint32_t* hist = (uint32_t*)histogramBuffer->contents();
             
@@ -307,9 +308,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
                           << " (expected " << numElements << ")" << std::endl;
             }
         }
-        
-        // For StorageModeShared, CPU writes are immediately visible to GPU
-        
+
         // Scatter
         cmdBuffer = queue->commandBuffer();
         {
@@ -319,8 +318,8 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
             enc->setBuffer(valuesBuffers[srcIdx], 0, 1);
             enc->setBuffer(keysBuffers[dstIdx], 0, 2);
             enc->setBuffer(valuesBuffers[dstIdx], 0, 3);
-            enc->setBuffer(histogramBuffer, 0, 4);  // prefixSums (read-only)
-            enc->setBuffer(digitCountersBuffer, 0, 5);  // digitCounters (atomic)
+            enc->setBuffer(histogramBuffer, 0, 4);
+            enc->setBuffer(digitCountersBuffer, 0, 5);
             enc->setBytes(&bitOffset, sizeof(uint32_t), 6);
             enc->setBytes(&numElementsU32, sizeof(uint32_t), 7);
             
@@ -400,7 +399,7 @@ GPURadixSort64::GPURadixSort64(MTL::Device* device, MTL::Library* library, size_
                                         MTL::ResourceStorageModeShared);
     digitCountersBuffer = device->newBuffer(RADIX_SIZE * sizeof(uint32_t),
                                             MTL::ResourceStorageModeShared);
-    // REMOVED: localRanksBuffer - no longer needed with atomic scatter
+    // LocalRanksBuffer no longer needed with atomic scatter
 }
 
 // Destructor
@@ -411,7 +410,7 @@ GPURadixSort64::~GPURadixSort64() {
     if (valuesBuffers[1]) valuesBuffers[1]->release();
     if (histogramBuffer) histogramBuffer->release();
     if (digitCountersBuffer) digitCountersBuffer->release();
-    // REMOVED: localRanksBuffer - no longer needed
+    // LocalRanksBuffer no longer needed with atomic scatter
     
     if (histogram64PSO) histogram64PSO->release();
     if (prefixSum256PSO) prefixSum256PSO->release();
@@ -425,8 +424,8 @@ GPURadixSort64::~GPURadixSort64() {
 void GPURadixSort64::createPipelines(MTL::Library* library) {
     histogram64PSO = createPipeline(device, library, "histogram64");
     prefixSum256PSO = createPipeline(device, library, "prefixSum256");
-    scatter64StablePSO = createPipeline(device, library, "scatter64Stable");  // NEW stable version
-    scatter64WithAtomicRankPSO = createPipeline(device, library, "scatter64WithAtomicRank");  // OLD non-stable
+    scatter64StablePSO = createPipeline(device, library, "scatter64Stable");
+    scatter64WithAtomicRankPSO = createPipeline(device, library, "scatter64WithAtomicRank");
     scatter64OptimizedPSO = createPipeline(device, library, "scatter64Optimized");
     clearHistogramPSO = createPipeline(device, library, "clearHistogram");
 }
@@ -435,6 +434,7 @@ void GPURadixSort64::createPipelines(MTL::Library* library) {
 void GPURadixSort64::ensureCapacity(size_t numElements) {
     if (numElements <= maxElements) return;
     
+    // Double buffer size until sufficient
     maxElements = std::max(numElements, maxElements * 2);
     
     if (keysBuffers[0]) keysBuffers[0]->release();
@@ -450,8 +450,6 @@ void GPURadixSort64::ensureCapacity(size_t numElements) {
                                          MTL::ResourceStorageModeShared);
     valuesBuffers[1] = device->newBuffer(maxElements * sizeof(uint32_t),
                                          MTL::ResourceStorageModeShared);
-    
-    // REMOVED: localRanksBuffer - no longer needed with atomic scatter
 }
 
 void GPURadixSort64::sort(MTL::CommandQueue* queue,
@@ -498,7 +496,7 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
                       << " src=" << srcIdx << " dst=" << dstIdx << std::endl;
         }
         
-        // Clear histogram using CPU memset (reliable with SharedStorage)
+        // Clear histogram using CPU memset
         memset(histogramBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
         
         MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
@@ -521,11 +519,11 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
         cmdBuffer->commit();
         cmdBuffer->waitUntilCompleted();
         
-        // CPU prefix sum (in shared memory, CPU writes are immediately visible)
+        // CPU prefix sum
         {
             uint32_t* hist = (uint32_t*)histogramBuffer->contents();
             
-            // Verify histogram BEFORE prefix sum
+            // Verify histogram before prefix sum
             if (doDebug && pass < 2) {
                 uint32_t totalHist = 0;
                 for (int i = 0; i < RADIX_SIZE; i++) {
@@ -547,21 +545,21 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
             }
         }
         
-        // Clear digit counters using CPU memset (reliable with SharedStorage)
+        // Clear digit counters using CPU memset
         memset(digitCountersBuffer->contents(), 0, RADIX_SIZE * sizeof(uint32_t));
         
         cmdBuffer = queue->commandBuffer();
         
-        // Scatter using stable kernel (deterministic local ranks)
+        // Scatter using stable kernel deterministic local ranks
         {
             MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
-            enc->setComputePipelineState(scatter64StablePSO);  // Use stable version
+            enc->setComputePipelineState(scatter64StablePSO);
             enc->setBuffer(keysBuffers[srcIdx], 0, 0);
             enc->setBuffer(valuesBuffers[srcIdx], 0, 1);
             enc->setBuffer(keysBuffers[dstIdx], 0, 2);
             enc->setBuffer(valuesBuffers[dstIdx], 0, 3);
-            enc->setBuffer(histogramBuffer, 0, 4);  // prefixSums
-            enc->setBuffer(digitCountersBuffer, 0, 5);  // global counters
+            enc->setBuffer(histogramBuffer, 0, 4);
+            enc->setBuffer(digitCountersBuffer, 0, 5);
             enc->setBytes(&bitOffset, sizeof(uint32_t), 6);
             enc->setBytes(&numElementsU32, sizeof(uint32_t), 7);
             
@@ -574,7 +572,8 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
         cmdBuffer->commit();
         cmdBuffer->waitUntilCompleted();
         
-        // Debug: Verify each pass
+        // Debug
+        // Verify each pass
         if (doDebug) {
             uint64_t* dst = (uint64_t*)keysBuffers[dstIdx]->contents();
             uint64_t* src = (uint64_t*)keysBuffers[srcIdx]->contents();
@@ -584,9 +583,9 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
             std::cout << "  Pass " << pass << " result: first key changed from 0x" << std::hex << src[0] 
                       << " to 0x" << dst[0] << std::dec;
             if (dataChanged) {
-                std::cout << " ✓" << std::endl;
+                std::cout << "Good" << std::endl;
             } else {
-                std::cout << " ✗ UNCHANGED!" << std::endl;
+                std::cout << "UNCHANGED!" << std::endl;
             }
         }
         
@@ -600,7 +599,7 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
     
     currentBuffer = srcIdx;
     
-    // CRITICAL: Check if final output differs from original input
+    // Check if final output differs from original input
     static int finalCheckCount = 0;
     if (finalCheckCount < 1) {
         uint64_t* finalKeys = (uint64_t*)keysBuffers[currentBuffer]->contents();
@@ -614,12 +613,11 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
         if (finalKeys[0] == inputKeys[0] && finalKeys[1] == inputKeys[1] && finalKeys[2] == inputKeys[2]) {
             std::cout << "ERROR: Final output IDENTICAL to input! Sort did nothing!" << std::endl;
         }
-        std::cout << "=======================" << std::endl;
         
         finalCheckCount++;
     }
     
-    // Debug: Verify sort output
+    // Verify sort output
     static int debugCount = 0;
     if (debugCount < 2) {
         uint64_t* sortedKeys = (uint64_t*)keysBuffers[srcIdx]->contents();

@@ -8,7 +8,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// CRITICAL Must match C++ simd struct layout exactly  
 // The Gaussian Struct
 struct Gaussian {
     packed_float3 position; 
@@ -24,7 +23,7 @@ struct Gaussian {
 };
 
 // Uniforms passed to shaders
-// MUST match C++ Uniforms struct in mtl_engine.hpp exactly
+// Must match C++ Uniforms struct in mtl_engine.hpp exactly
 struct Uniforms {
     float4x4 viewMatrix;
     float4x4 projectionMatrix;
@@ -49,32 +48,26 @@ struct VertexOut {
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
 // MAX_SCALE for viewing higher limit to handle external PLY files
-// Training uses a stricter limit in tiled_shaders.metal
- // Log scale range -8 to 8 for viewing compatibility
 constant float MAX_SCALE = 8.0f; 
 // Stricter MAX_SCALE for training to prevent Gaussians from growing too large
-// MAX_SCALE = 4.0 gives exp(4) ≈ 54.6 world units max, allows initial scales like -2.9
 constant float MAX_SCALE_TRAIN = 4.0f;
 
-// Evaluate degree-1 Spherical Harmonics (vectorized with fma)
-// dir = normalized view direction (from Gaussian to camera)
-// Only clamp lower bound - matches official 3DGS implementation
+// Evaluate color from DC terms using sigmoid activation
+// Matches training renderer sigmoid naturally bounds to (0, 1)
 float3 evalSH(float sh[12], float3 dir) {
-    // DC terms + degree-1 terms using fma for speed
-    // Layout: [0-3] = R (dc, x, y, z), [4-7] = G, [8-11] = B
-    float3 sh1_contrib = dir.x * float3(sh[1], sh[5], sh[9]) +
-                         dir.y * float3(sh[2], sh[6], sh[10]) +
-                         dir.z * float3(sh[3], sh[7], sh[11]);
-    float3 result = fma(float3(SH_C0), float3(sh[0], sh[4], sh[8]),
-                        fma(float3(SH_C1), sh1_contrib, float3(0.5f)));
-    return max(result, float3(0.0f));  // No upper clamp!
+    float3 raw = float3(sh[0], sh[4], sh[8]);
+    return float3(
+        1.0f / (1.0f + exp(-raw.x)),
+        1.0f / (1.0f + exp(-raw.y)),
+        1.0f / (1.0f + exp(-raw.z))
+    );
 }
 
 // Convert quaternion to rotation matrix
 float3x3 quaternionToMatrix(float4 q) {
     // q.x=w, q.y=x, q.z=y, q.w=z
     float w = q.x, x = q.y, y = q.z, z = q.w;
-    // Metal float3x3 constructor takes COLUMNS
+    // Metal float3x3 constructor takes columns
     return float3x3(
         float3(1.0 - 2.0*(y*y + z*z), 2.0*(x*y + w*z), 2.0*(x*z - w*y)), 
         float3(2.0*(x*y - w*z), 1.0 - 2.0*(x*x + z*z), 2.0*(y*z + w*x)), 
@@ -85,7 +78,8 @@ float3x3 quaternionToMatrix(float4 q) {
 // Compute 3D covariance matrix from log scale and rotation
 float3x3 computeCovariance3D(float3 logScale, float4 rotation) {
     float3x3 R = quaternionToMatrix(rotation);
-    // Apply exp() to log scale this is the ONLY place exp() is applied
+    // Apply exp() to log scale
+    // Only place exp() is applied
     float3 scale = exp(clamp(logScale, -MAX_SCALE, MAX_SCALE));
     // Diagonal scale matrix Metal column constructor
     float3x3 S = float3x3(
@@ -114,7 +108,7 @@ float3 computeCovariance2D(float3 mean, float3x3 covariance3D, float4x4 viewMatr
     float tytz = clamp(t.y / z, -limy, limy);
     
     // Jacobian of projection perspective projection derivative
-    // Maps 3D view space -> 2D screen space
+    // Maps 3D view space to 2D screen space
     float J00 = focalLength.x / z;
     float J02 = -focalLength.x * txtz / z;
     float J11 = focalLength.y / z;
@@ -239,9 +233,6 @@ vertex VertexOut vertexShader(
         conic = float3(c * invDet, -b * invDet, a * invDet);
         
         // Safety check conic magnitude is reasonable for the radius
-        // At edge (d=radius), power should be ~-4.5
-        // power = -0.5 * conic_diag * radius^2 = -4.5 => conic_diag = 9/radius^2
-        // If conic is too small (huge covariance), scale it up
         float expectedConic = 9.0f / (radius * radius);
          // Average diagonal
         float actualConic = 0.5f * (conic.x + conic.z); 
@@ -256,20 +247,16 @@ vertex VertexOut vertexShader(
     } else {
         // Fallback to circular Gaussian
         radius = 15.0;
-        // Conic for radius 15: at d=15, want power = -4.5
-        // power = -0.5 * conic * d^2 = -0.5 * conic * 225 = -4.5
-        // conic = 9 / 225 = 0.04
         conic = float3(0.04, 0.0, 0.04);
     }
     
     // Quad corners in normalized [-1,1] space
-    // vertexID 0: bottom-left, 1: bottom-right, 2: top-left, 3: top-right
     float2 quadOffsets[4] = {
         float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1)
     };
     
     // Compute final vertex position with offset
-    float2 quadOffset = quadOffsets[vertexID];  // This is in [-1, 1] range
+    float2 quadOffset = quadOffsets[vertexID];
     float2 centerNDC = clipPos.xy / clipPos.w;
     
     // Offset in pixels from center
@@ -286,17 +273,17 @@ vertex VertexOut vertexShader(
     float3 viewDir = normalize(g.position - uniforms.cameraPos);
     out.color = evalSH(g.sh, viewDir);
     
-    // Apply sigmoid to raw opacity - this is the ONLY place sigmoid() is applied
+    // Apply sigmoid to raw opacity this is the ONLY place sigmoid() is applied
     out.opacity = 1.0 / (1.0 + exp(-clamp(g.opacity, -8.0f, 8.0f)));
     
-    // Center screen position (for debugging, not used in current frag shader)
+    // Center screen position for debugging, not used in current frag shader
     out.centerScreenPos = float2(
         (centerNDC.x * 0.5 + 0.5) * uniforms.screenSize.x,
-        (centerNDC.y * 0.5 + 0.5) * uniforms.screenSize.y  // Don't flip here
+        (centerNDC.y * 0.5 + 0.5) * uniforms.screenSize.y
     );
     
     out.conic = conic;
-    // Pass pixel offset directly - fragment shader uses this for Gaussian calculation
+    // Pass pixel offset directly fragment shader uses this for Gaussian calculation
     out.quadOffset = offsetPixels;
     
     return out;
@@ -307,7 +294,6 @@ fragment float4 fragmentShader(VertexOut in [[stage_in]]) {
     float2 d = in.quadOffset;
     
     // Use proper conic-based Gaussian evaluation matches training
-    // power = -0.5 * (conic.x * d.x^2 + 2 * conic.y * d.x * d.y + conic.z * d.y^2)
     float power = -0.5 * (in.conic.x * d.x * d.x + 
                           2.0 * in.conic.y * d.x * d.y + 
                           in.conic.z * d.y * d.y);
@@ -341,7 +327,7 @@ kernel void computeL1Loss(
     float4 gt = groundTruth.read(gid);
     
     // Compute L1 loss per pixel
-     // Average over RGB channels
+    // Average over RGB channels
     float l1 = (abs(r.r - gt.r) + abs(r.g - gt.g) + abs(r.b - gt.b)) / 3.0;
     
     // Store per-pixel loss
@@ -367,18 +353,12 @@ kernel void reduceLoss(
 
 // SSIM Loss Computation
 // Computes local SSIM over 11x11 windows with Gaussian weighting
-// SSIM = (2*mu_x*mu_y + C1)(2*sigma_xy + C2) / ((mu_x^2 + mu_y^2 + C1)(sigma_x^2 + sigma_y^2 + C2))
-// D-SSIM = (1 - SSIM) / 2
-
-// (0.01 * L)^2 where L=1 for normalized images
 constant float SSIM_C1 = 0.01f * 0.01f;  
-// (0.03 * L)^2
 constant float SSIM_C2 = 0.03f * 0.03f;  
 constant int SSIM_WINDOW_SIZE = 11;
 constant int SSIM_WINDOW_RADIUS = 5;
 
-// Precomputed Gaussian weights for 11x11 window (sigma=1.5)
-// These are separable: weight[x][y] = gauss1d[x] * gauss1d[y]
+// Precomputed Gaussian weights for 11x11 window with sigma=1.5
 constant float SSIM_GAUSS_1D[11] = {
     // Actually use proper Gaussian
     0.0113437f, 0.0838195f, 0.0838195f, 0.000335463f, 0.0f,  
@@ -423,7 +403,7 @@ kernel void computeSSIM(
             float w = exp(-dist_sq / two_sigma_sq);
             weight_sum += w;
             
-            // Read pixels (convert to grayscale luminance for SSIM)
+            // Read pixels and convert to grayscale luminance for SSIM
             float4 r = rendered.read(uint2(px, py));
             float4 gt = groundTruth.read(uint2(px, py));
             
@@ -485,14 +465,14 @@ kernel void computeSSIM(
     float denominator = (mu_x * mu_x + mu_y * mu_y + SSIM_C1) * (sigma_x_sq + sigma_y_sq + SSIM_C2);
     float ssim = numerator / denominator;
     
-    // D-SSIM = (1 - SSIM) / 2, clamped to [0, 1]
+    // D-SSIM = (1 - SSIM) / 2 clamped to [0, 1]
     float dssim = clamp((1.0f - ssim) / 2.0f, 0.0f, 1.0f);
     
     uint idx = gid.y * width + gid.x;
     ssimMap[idx] = dssim;
 }
 
-// Combined loss: 0.8 * L1 + 0.2 * D-SSIM
+// Combined loss 0.8 * L1 + 0.2 * D-SSIM
 // Compute combined loss per pixel
 kernel void computeCombinedLoss(
     texture2d<float, access::read> rendered [[texture(0)]],
@@ -686,20 +666,19 @@ kernel void adamStep(
     
     // Opacity update stays in raw space
     {
-        // Opacity regularization: penalize very high opacities to prevent blocking
+        // Opacity regularization penalize very high opacities to prevent blocking
         // This helps gradients flow through the scene and prevents death spirals
         float rawOp = gaussians[tid].opacity;
-        float sigOp = 1.0 / (1.0 + exp(-rawOp));  // sigmoid(rawOp)
+        float sigOp = 1.0 / (1.0 + exp(-rawOp));
 
-        // Add regularization gradient when opacity > 0.95 (pushes towards lower opacity)
+        // Add regularization gradient when opacity > 0.95 pushes towards lower opacity
         // The regularization strength scales with how far above 0.95 we are
-        // Raised from 0.85 to allow Gaussians to become more opaque and block white background
         float opacityRegGrad = 0.0f;
         if (sigOp > 0.95f) {
             // Gradient of sigmoid is sig * (1 - sig), so dL/dRaw = dL/dSig * sig * (1-sig)
             // We want to push opacity down, so positive gradient on raw opacity
-            float excess = sigOp - 0.95f;  // How much above threshold
-            opacityRegGrad = 0.1f * excess * sigOp * (1.0f - sigOp);  // Soft penalty
+            float excess = sigOp - 0.95f;
+            opacityRegGrad = 0.1f * excess * sigOp * (1.0f - sigOp);
         }
 
         // Clamp gradient and add regularization
@@ -718,11 +697,13 @@ kernel void adamStep(
         gaussians[tid].opacity = clamp(gaussians[tid].opacity - lrs[3] * m_hat / (sqrt(v_hat) + epsilon), -8.0f, 8.0f);
     }
     
-    // SH update - all 12 coefficients for degree-1 SH
-    // Layout: [0-3] = R (dc, x, y, z), [4-7] = G, [8-11] = B
-    for (int i = 0; i < 12; i++) {
-        // Clamp gradient
+    // SH update DC terms only (indices 0, 4, 8)
+    int sh_indices[3] = {0, 4, 8};
+
+    for (int j = 0; j < 3; j++) {
+        int i = sh_indices[j];
         float grad = clamp(g.sh[i], -clip, clip);
+
         uint idx = tid * 12 + i;
 
         // Adam moment updates
@@ -736,15 +717,8 @@ kernel void adamStep(
         float v_hat = v / bc2;
         float newSH = gaussians[tid].sh[i] - lrs[4] * m_hat / (sqrt(v_hat) + epsilon);
 
-        // DC terms (0, 4, 8) need full range for dark/bright areas
-        // Degree-1 terms (1,2,3,5,6,7,9,10,11) are for view-dependence, smaller range
-        bool isDC = (i == 0 || i == 4 || i == 8);
-        if (isDC) {
-            newSH = clamp(newSH, -5.0f, 5.0f);
-        } else {
-            // View-dependent terms don't need extreme values
-            newSH = clamp(newSH, -2.5f, 2.5f);
-        }
+        // Clamp for numerical stability
+        newSH = clamp(newSH, -5.0f, 5.0f);
 
         gaussians[tid].sh[i] = newSH;
     }
