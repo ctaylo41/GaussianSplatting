@@ -1,16 +1,24 @@
 # 3D Gaussian Splatting on Apple Silicon
 
-A from-scratch implementation of [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) in Metal/C++ for macOS. This project implements the complete training pipeline including tiled rasterization, differentiable rendering, and adaptive density control—entirely on GPU using Apple's Metal framework.
+A from-scratch implementation of [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) in Metal/C++ for macOS. This project implements the complete training pipeline including tiled rasterization, differentiable rendering, and adaptive density control, entirely on GPU using Apple's Metal framework.
 
-**This is not a port or wrapper**—every component was implemented directly in Metal shaders and C++, providing deep insight into the algorithm's internals and the challenges of real-time neural rendering.
+**This is not a port or wrapper.** Every component was implemented directly in Metal shaders and C++, providing deep insight into the algorithm's internals and the challenges of real-time neural rendering.
 
 ## Motivation
 
-This project was undertaken as an exploratory deep-dive into 3D Gaussian Splatting—one of the most significant advances in neural rendering from 2023. Rather than using the official PyTorch/CUDA implementation, I chose to reimplement the entire pipeline from scratch in Metal to:
+This project was undertaken as an exploratory deep-dive into 3D Gaussian Splatting, one of the most significant advances in neural rendering from 2023. Rather than using the official PyTorch/CUDA implementation, I chose to reimplement the entire pipeline from scratch in Metal to:
 
-1. **Gain deep algorithmic understanding** - Writing every kernel forces you to understand every mathematical detail
-2. **Explore Apple Silicon for ML/graphics** - Metal's unified memory architecture offers unique advantages for this workload
-3. **Develop debugging intuition** - Encountering and solving novel bugs builds research-level problem-solving skills
+1. **Gain deep algorithmic understanding**
+2. **Explore Apple Silicon for ML/graphics**
+3. **Develop debugging intuition**
+
+## Future Work
+
+- [ ] Implement degree-3 spherical harmonics for view-dependent effects
+- [ ] Debug and enable GPU radix sort for faster training
+- [ ] Add anti-aliasing (EWA splatting) for distant Gaussians
+- [ ] Investigate backward pass gradient accuracy
+- [ ] Profile and optimize Metal shader occupancy
 
 ## Results
 
@@ -20,17 +28,18 @@ This project was undertaken as an exploratory deep-dive into 3D Gaussian Splatti
 |--------|---------------------|---------------|
 | PSNR | 14.15 dB (mean) / 21.34 dB (best) | 25.25 dB |
 | SSIM | 0.280 (mean) / 0.537 (best) | 0.771 |
-| LPIPS ↓ | 0.865 (mean) / 0.579 (best) | — |
-| Final Loss | 0.1276 | — |
+| LPIPS ↓ | 0.865 (mean) / 0.579 (best) | - |
+| Final Loss | 0.1276 | - |
 | Training Time | 510 min | ~6 min |
-| Final Gaussians | 1,000,000 | — |
-| Initial Gaussians | 54,275 | — |
+| Final Gaussians | 1,000,000 | - |
+| Initial Gaussians | 54,275 | - |
 
 <details>
 <summary>Training Convergence</summary>
 
 ```
 Training: 155 epochs (~30K iterations) on 194 images
+Optimizer: Adam with per-parameter learning rates
 
 Loss progression:
   Epoch 0:   0.2628 (initial)
@@ -55,7 +64,7 @@ Loss reduction: 51.4%
 
 The quality gap between this implementation and the original is expected and instructive:
 
-1. **SH Degree**: This implementation uses only DC terms (degree-0 SH) vs. degree-3 in the original. Higher-order SH capture view-dependent effects critical for specular surfaces.
+1. **SH Degree**: This implementation uses only DC terms (degree-0 SH) vs. degree-3 in the original. Higher-order SH captures view-dependent effects critical for specular surfaces like the bicycle frame. Implementing higher-order SH requires a significant speed up in both the forward and backward passes due to the time required for including view-direction dependent evaluation and corresponding gradient computation. Using DC-only was a practical tradeoff that still demonstrates the core algorithm. This explains why peripheral regions (foliage, ground) render reasonably well while the central subject (the bike with its reflective metal surfaces) shows the largest quality gap.
 
 2. **Backward Pass Complexity**: The differentiable rendering backward pass has many intricate gradient computations. Some gradient terms may have subtle bugs that affect long-term convergence.
 
@@ -105,10 +114,10 @@ COLMAP Sparse Reconstruction
 | Component | Description |
 |-----------|-------------|
 | **Tiled Rasterizer** | 16×16 tile-based rendering with front-to-back alpha blending. Each tile processes Gaussians independently for parallelism. |
-| **CPU Radix Sort** | Depth sorting for Gaussians within tiles. Keys encode (tile_id, depth) for correct ordering. GPU sort is a WIP. |
+| **Radix Sort** | Unlike CUDA, Metal provides no built-in sorting primitives, requiring a custom radix sort implementation. Currently CPU-based for stability; GPU version is WIP. Keys encode (tile_id, depth) for correct ordering. |
 | **Differentiable Rendering** | Full backward pass computing gradients w.r.t. position, covariance, color (DC), and opacity. |
 | **Adaptive Density Control** | Clone small Gaussians in high-gradient regions, split large ones, prune low-opacity/large Gaussians. |
-| **Adam Optimizer** | GPU-based optimizer with per-parameter learning rates (position, scale, rotation, color, opacity). |
+| **Adam Optimizer** | GPU-based Adam optimizer with per-parameter learning rates for position, scale, rotation, color, and opacity. Includes momentum and RMSprop-style adaptive learning. |
 
 ### Key Implementation Details
 
@@ -125,7 +134,7 @@ COLMAP Sparse Reconstruction
 
 ### The Post-Reset Saturation Bug
 
-**Problem**: After opacity resets (iterations 3000, 9000, 12000), rendered images showed severe color saturation—whites became yellow, colors washed out. Loss would spike and slowly recover but never reach pre-reset quality.
+**Problem**: After opacity resets (iterations 3000, 9000, 12000), rendered images showed severe color saturation. Whites became yellow, colors washed out. Loss would spike and slowly recover but never reach pre-reset quality.
 
 **Investigation**:
 1. Monitored SH coefficient magnitudes across training
@@ -133,7 +142,7 @@ COLMAP Sparse Reconstruction
 3. Values reaching 10-50+ (should be ~[-2, 2] range)
 4. The opacity reset was disrupting the learned color balance
 
-**Root Cause**: When opacity resets to near-zero, Gaussians that previously contributed strongly suddenly don't. The optimizer compensates by pushing SH coefficients higher to maintain the same visual output—but this creates instability in the gradient flow.
+**Root Cause**: When opacity resets to near-zero, Gaussians that previously contributed strongly suddenly don't. The optimizer compensates by pushing SH coefficients higher to maintain the same visual output, but this creates instability in the gradient flow.
 
 **Solution**: Implemented sigmoid clamping on SH outputs:
 ```cpp
@@ -146,11 +155,11 @@ This prevents the SH coefficients from having unbounded effect on final color, m
 
 **Before Fix** | **After Fix**
 :---:|:---:
-`[INSERT SATURATED IMAGE]` | `[INSERT FIXED IMAGE]`
+![Saturated Image](readme-images/saturated-image.png) | ![Fixed Render](readme-images/fixed_render.jpg)
 
 ### Other Challenges Overcome
 
-1. **Tile Sorting Performance**: Initial CPU sort was bottleneck. Implemented GPU radix sort for 64-bit keys (tile_id << 32 | depth).
+1. **Custom Sorting for Metal**: Unlike CUDA's CUB library which provides optimized sorting primitives, Metal has no built-in sort. Implemented a custom radix sort for 64-bit keys (tile_id << 32 | depth). Currently running on CPU for stability while GPU version is debugged.
 
 2. **Gradient Numerical Stability**: Added epsilon terms to covariance inverse computation to prevent NaN gradients.
 
@@ -160,7 +169,7 @@ This prevents the SH coefficients from having unbounded effect on final color, m
 
 ## What's Not Implemented
 
-- **Higher-order Spherical Harmonics**: Only DC terms (degree-0), no view-dependent color effects
+- **Higher-order Spherical Harmonics**: Only DC terms (degree-0), no view-dependent color effects. Adding degree-3 SH would require substantial changes to both forward evaluation and backward gradient computation, making it impractical within the project scope.
 - **GPU Radix Sort**: Currently using CPU sort; GPU implementation is WIP
 - **Anti-aliasing / EWA splatting**: No mip-mapping for distant Gaussians
 - **Exposure compensation**: Fixed exposure across training views
@@ -175,7 +184,7 @@ This prevents the SH coefficients from having unbounded effect on final color, m
 | **Training Iteration** | ~1019 ms |
 | Forward Pass (Projection + Sort + Render) | ~400 ms |
 | Backward Pass | ~500 ms |
-| Optimizer Step | ~100 ms |
+| Adam Optimizer Step | ~100 ms |
 
 *Measured on Apple M1 Pro with 16GB unified memory, 1M Gaussians*
 
@@ -183,7 +192,7 @@ This prevents the SH coefficients from having unbounded effect on final color, m
 
 Training is significantly slower than the original (1019 ms/iter vs ~20 ms/iter) primarily due to:
 
-1. **CPU Sort Bottleneck**: Tile sorting currently runs on CPU. GPU radix sort is implemented but has bugs being investigated.
+1. **CPU Sort Bottleneck**: Tile sorting currently runs on CPU. Metal lacks CUDA's built-in sorting primitives (like CUB), requiring a custom implementation. GPU radix sort is implemented but has bugs being investigated.
 2. **Memory Bandwidth**: Unified memory, while convenient, doesn't match dedicated VRAM bandwidth.
 3. **Shader Occupancy**: Metal compute shader tuning differs significantly from CUDA. Thread group sizes and memory access patterns need optimization.
 
@@ -230,21 +239,13 @@ This project developed skills directly applicable to computer vision research:
 - **Optimization**: Adam optimizer implementation, per-parameter learning rates, gradient clipping strategies
 
 ### Research Skills
-- **Systematic Debugging**: The post-reset SH saturation bug required methodical investigation—logging metrics, visualizing intermediate outputs, forming and testing hypotheses
+- **Systematic Debugging**: The post-reset SH saturation bug required methodical investigation: logging metrics, visualizing intermediate outputs, forming and testing hypotheses
 - **Reading Research Code**: Translating the original CUDA implementation's conventions to Metal required understanding undocumented assumptions
 - **Ablation Mentality**: When quality was poor, I learned to isolate components (disable density control, freeze certain parameters) to identify the cause
 
 ### Key Insight
 
-The most valuable lesson: **research-level bugs are qualitatively different from software bugs**. The SH saturation issue wasn't a crash or wrong output—it was subtle quality degradation that required understanding the algorithm deeply to even recognize as a bug, let alone fix it.
-
-## Future Work
-
-- [ ] Implement degree-3 spherical harmonics for view-dependent effects
-- [ ] Debug and enable GPU radix sort for faster training
-- [ ] Add anti-aliasing (EWA splatting) for distant Gaussians
-- [ ] Investigate backward pass gradient accuracy
-- [ ] Profile and optimize Metal shader occupancy
+The most valuable lesson: **research-level bugs are qualitatively different from software bugs**. The SH saturation issue wasn't a crash or wrong output. It was subtle quality degradation that required understanding the algorithm deeply to even recognize as a bug, let alone fix it.
 
 ## References
 
