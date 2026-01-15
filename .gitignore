@@ -1,2 +1,6 @@
-GuassianSplatting/output.ply
-GuassianSplatting/renders/
+GaussianSplatting/output.ply
+GaussianSplatting/renders/
+GaussianSplatting/CLAME.md
+GaussianSplatting/renders_bike
+GaussianSplatting/scenes
+CLAUDE.md

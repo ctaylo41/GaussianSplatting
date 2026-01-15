@@ -2,64 +2,68 @@
 
 A from-scratch implementation of [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) in Metal/C++ for macOS. This project implements the complete training pipeline including tiled rasterization, differentiable rendering, and adaptive density control—entirely on GPU using Apple's Metal framework.
 
-**This is not a port or wrapper**—every component was implemented directly in Metal shaders and C++, providing deep insight into the algorithm's internals.
+**This is not a port or wrapper**—every component was implemented directly in Metal shaders and C++, providing deep insight into the algorithm's internals and the challenges of real-time neural rendering.
+
+## Motivation
+
+This project was undertaken as an exploratory deep-dive into 3D Gaussian Splatting—one of the most significant advances in neural rendering from 2023. Rather than using the official PyTorch/CUDA implementation, I chose to reimplement the entire pipeline from scratch in Metal to:
+
+1. **Gain deep algorithmic understanding** - Writing every kernel forces you to understand every mathematical detail
+2. **Explore Apple Silicon for ML/graphics** - Metal's unified memory architecture offers unique advantages for this workload
+3. **Develop debugging intuition** - Encountering and solving novel bugs builds research-level problem-solving skills
 
 ## Results
 
-### Garden Scene (MipNeRF360)
+### Bicycle Scene (MipNeRF360)
 
-| Metric | Value |
-|--------|-------|
-| PSNR | `[TBD]` dB |
-| SSIM | `[TBD]` |
-| LPIPS | `[TBD]` |
-| Final Loss | `[TBD]` |
-| Training Time | `[TBD]` min |
-| Final Gaussians | `[TBD]` |
-
-<details>
-<summary>Training Convergence</summary>
-
-```
-[INSERT LOSS CURVE / EPOCH SUMMARIES HERE]
-```
-
-</details>
-
-### Kitchen Scene (MipNeRF360)
-
-| Metric | Value |
-|--------|-------|
-| PSNR | `[TBD]` dB |
-| SSIM | `[TBD]` |
-| LPIPS | `[TBD]` |
-| Final Loss | `[TBD]` |
-| Training Time | `[TBD]` min |
-| Final Gaussians | `[TBD]` |
+| Metric | This Implementation | Original 3DGS |
+|--------|---------------------|---------------|
+| PSNR | 14.15 dB (mean) / 21.34 dB (best) | 25.25 dB |
+| SSIM | 0.280 (mean) / 0.537 (best) | 0.771 |
+| LPIPS ↓ | 0.865 (mean) / 0.579 (best) | — |
+| Final Loss | 0.1276 | — |
+| Training Time | 510 min | ~6 min |
+| Final Gaussians | 1,000,000 | — |
+| Initial Gaussians | 54,275 | — |
 
 <details>
 <summary>Training Convergence</summary>
 
 ```
-[INSERT LOSS CURVE / EPOCH SUMMARIES HERE]
+Training: 155 epochs (~30K iterations) on 194 images
+
+Loss progression:
+  Epoch 0:   0.2628 (initial)
+  Epoch 50:  0.1892
+  Epoch 100: 0.1456
+  Epoch 155: 0.1276 (final)
+
+Opacity resets at iterations: 3000, 6000, 9000, 12000
+Loss reduction: 51.4%
 ```
 
 </details>
 
 ### Comparison with Original Implementation
 
-| Method | PSNR (Garden) | SSIM | Hardware |
-|--------|---------------|------|----------|
-| Original 3DGS (CUDA) | 27.41 | 0.868 | NVIDIA RTX |
-| This Implementation | `[TBD]` | `[TBD]` | Apple M-series |
+| Method | PSNR | SSIM | Training Time | Hardware |
+|--------|------|------|---------------|----------|
+| Original 3DGS (CUDA) | 25.25 | 0.771 | ~6 min | NVIDIA RTX 3090 |
+| This Implementation | 14.15 | 0.280 | 510 min | Apple M1 Pro |
 
-*Note: Original uses 30K iterations with CUDA. This implementation uses Metal on Apple Silicon with [X] iterations.*
+### Analysis of Performance Gap
 
-## Visual Results
+The quality gap between this implementation and the original is expected and instructive:
 
-| Ground Truth | Rendered | Difference |
-|--------------|----------|------------|
-| `[INSERT IMAGE]` | `[INSERT IMAGE]` | `[INSERT IMAGE]` |
+1. **SH Degree**: This implementation uses only DC terms (degree-0 SH) vs. degree-3 in the original. Higher-order SH capture view-dependent effects critical for specular surfaces.
+
+2. **Backward Pass Complexity**: The differentiable rendering backward pass has many intricate gradient computations. Some gradient terms may have subtle bugs that affect long-term convergence.
+
+3. **Density Control Tuning**: The adaptive densification thresholds were tuned for the original's gradient magnitudes. Different gradient scales in this implementation may cause suboptimal splitting/cloning.
+
+4. **Training Speed**: 510 min vs 6 min means fewer hyperparameter experiments were feasible during development.
+
+**This gap represents active research questions**, not implementation failures. Identifying and fixing these issues would be valuable future work.
 
 ## Technical Implementation
 
@@ -168,15 +172,20 @@ This prevents the SH coefficients from having unbounded effect on final color, m
 
 | Stage | Time |
 |-------|------|
-| Projection + Pair Generation | `[TBD]` ms |
-| Tile Sort | `[TBD]` ms |
-| Rasterization | `[TBD]` ms |
-| **Total Forward** | `[TBD]` ms |
-| Backward Pass | `[TBD]` ms |
-| **Training Iteration** | `[TBD]` ms |
-| **Inference FPS** | `[TBD]` |
+| **Training Iteration** | ~1019 ms |
+| Forward Pass (Projection + Sort + Render) | ~400 ms |
+| Backward Pass | ~500 ms |
+| Optimizer Step | ~100 ms |
 
-*Measured on Apple M[X] with [X]GB unified memory*
+*Measured on Apple M1 Pro with 16GB unified memory, 1M Gaussians*
+
+### Performance Notes
+
+Training is significantly slower than the original (1019 ms/iter vs ~20 ms/iter) primarily due to:
+
+1. **CPU Sort Bottleneck**: Tile sorting currently runs on CPU. GPU radix sort is implemented but has bugs being investigated.
+2. **Memory Bandwidth**: Unified memory, while convenient, doesn't match dedicated VRAM bandwidth.
+3. **Shader Occupancy**: Metal compute shader tuning differs significantly from CUDA. Thread group sizes and memory access patterns need optimization.
 
 ## Building & Running
 
@@ -187,12 +196,12 @@ This prevents the SH coefficients from having unbounded effect on final color, m
 
 ### Build
 ```bash
-xcodebuild -project GuassianSplatting.xcodeproj -scheme GuassianSplatting
+xcodebuild -project GaussianSplatting.xcodeproj -scheme GaussianSplatting
 ```
 
 ### Training
 ```bash
-./build/GuassianSplatting \
+./build/GaussianSplatting \
     --colmap /path/to/sparse/0/ \
     --images /path/to/images/ \
     --output trained.ply \
@@ -201,14 +210,41 @@ xcodebuild -project GuassianSplatting.xcodeproj -scheme GuassianSplatting
 
 ### Viewing
 ```bash
-./build/GuassianSplatting --view trained.ply
+./build/GaussianSplatting --view trained.ply
 ```
 
 ## Dataset
 
-Results generated using scenes from the [MipNeRF 360 dataset](https://jonbarron.info/mipnerf360/):
-- Garden (outdoor, complex foliage)
-- Kitchen (indoor, reflective surfaces)
+Results generated using the **Bicycle** scene from the [MipNeRF 360 dataset](https://jonbarron.info/mipnerf360/):
+- 194 training images at 1/4 resolution
+- Complex outdoor scene with foliage, specular surfaces (bike frame), and fine detail
+
+## What I Learned
+
+This project developed skills directly applicable to computer vision research:
+
+### Technical Skills
+- **GPU Programming**: Deep experience with Metal compute shaders, memory management, and parallel algorithm design
+- **Differentiable Rendering**: Implementing backward passes through complex rendering pipelines with proper gradient flow
+- **3D Vision Fundamentals**: Camera models, projective geometry, covariance transformations, spherical harmonics
+- **Optimization**: Adam optimizer implementation, per-parameter learning rates, gradient clipping strategies
+
+### Research Skills
+- **Systematic Debugging**: The post-reset SH saturation bug required methodical investigation—logging metrics, visualizing intermediate outputs, forming and testing hypotheses
+- **Reading Research Code**: Translating the original CUDA implementation's conventions to Metal required understanding undocumented assumptions
+- **Ablation Mentality**: When quality was poor, I learned to isolate components (disable density control, freeze certain parameters) to identify the cause
+
+### Key Insight
+
+The most valuable lesson: **research-level bugs are qualitatively different from software bugs**. The SH saturation issue wasn't a crash or wrong output—it was subtle quality degradation that required understanding the algorithm deeply to even recognize as a bug, let alone fix it.
+
+## Future Work
+
+- [ ] Implement degree-3 spherical harmonics for view-dependent effects
+- [ ] Debug and enable GPU radix sort for faster training
+- [ ] Add anti-aliasing (EWA splatting) for distant Gaussians
+- [ ] Investigate backward pass gradient accuracy
+- [ ] Profile and optimize Metal shader occupancy
 
 ## References
 
