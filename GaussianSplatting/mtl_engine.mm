@@ -280,6 +280,8 @@ void MTLEngine::cleanup() {
     if (densityController) delete densityController;
     if (tiledRasterizer) delete tiledRasterizer;
     if (gaussianGradients) gaussianGradients->release();
+    if (viewerRenderTarget) viewerRenderTarget->release();
+    if (blitPSO) blitPSO->release();
 }
 
 // Initialize Metal device
@@ -456,13 +458,13 @@ void MTLEngine::createPipeline() {
     assert(vertexShader);
     MTL::Function* fragmentShader = shaderLibrary->newFunction(NS::String::string("fragmentShader", NS::ASCIIStringEncoding));
     assert(fragmentShader);
-    
-    // Create render pipeline descriptor    
+
+    // Create render pipeline descriptor
     MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
     // Set shaders
     desc->setVertexFunction(vertexShader);
     desc->setFragmentFunction(fragmentShader);
-    
+
     // Set color attachment properties
     auto colorAttachment = desc->colorAttachments()->object(0);
     colorAttachment->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
@@ -473,20 +475,43 @@ void MTLEngine::createPipeline() {
     colorAttachment->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
     colorAttachment->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
     colorAttachment->setAlphaBlendOperation(MTL::BlendOperationAdd);
-    
+
     // Create render pipeline state
     NS::Error* error;
     metalRenderPSO = metalDevice->newRenderPipelineState(desc, &error);
-    
+
     if (metalRenderPSO == nil) {
         std::cout << "Error creating render pipeline state: " << error << std::endl;
         std::exit(0);
     }
-    
+
     // Cleanup
     desc->release();
     vertexShader->release();
     fragmentShader->release();
+
+    // Create blit pipeline for copying float texture to drawable
+    MTL::Function* blitVertex = shaderLibrary->newFunction(NS::String::string("blitVertexShader", NS::ASCIIStringEncoding));
+    MTL::Function* blitFragment = shaderLibrary->newFunction(NS::String::string("blitFragmentShader", NS::ASCIIStringEncoding));
+
+    // Create blit pipeline state
+    if (blitVertex && blitFragment) {
+        MTL::RenderPipelineDescriptor* blitDesc = MTL::RenderPipelineDescriptor::alloc()->init();
+        blitDesc->setVertexFunction(blitVertex);
+        blitDesc->setFragmentFunction(blitFragment);
+        blitDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+
+        blitPSO = metalDevice->newRenderPipelineState(blitDesc, &error);
+        if (!blitPSO) {
+            std::cerr << "Failed to create blit pipeline: " << error->localizedDescription()->utf8String() << std::endl;
+        }
+
+        blitDesc->release();
+        blitVertex->release();
+        blitFragment->release();
+    } else {
+        std::cerr << "Failed to load blit shaders" << std::endl;
+    }
 }
 
 // Load Metal shaders
@@ -555,213 +580,190 @@ void MTLEngine::cpuSortByDepth(simd_float3 cameraPos) {
 }
 
 void MTLEngine::render(Camera& camera) {
-    // CPU sort for depth ordering (GPU sort is broken)
-    cpuSortByDepth(camera.get_position());
-    MTL::Buffer* sortedIndices = cpuSortedIndices;
-    
-    // Prepare uniform data
-    Uniforms uniforms;
-    
     // Debug printing flag
     static bool renderDebugPrinted = false;
-    
+
+    // Build TiledUniforms for the tiled rasterizer which is the same format used in training
+    TiledUniforms tiledUniforms;
+
     // Set camera matrices based on mode
     if (useTrainingView && !trainingImages.empty()) {
         const TrainingImage& img = trainingImages[currentTrainingIndex];
         const ColmapCamera& cam = colmapData.cameras.at(img.cameraId);
-        
-        // Set view matrix from COLMAP pose must be done before any transforms
-        uniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
 
-        
-        // For display render to window size
+        // Set view matrix from COLMAP pose
+        tiledUniforms.viewMatrix = viewMatrixFromColmap(img.rotation, img.translation);
+
         // Scale focal length proportionally to window size
         float scaleX = (float)windowWidth / (float)cam.width;
         float scaleY = (float)windowHeight / (float)cam.height;
         float scaledFx = cam.fx * scaleX;
         float scaledFy = cam.fy * scaleY;
-        
+
         // Create projection for window size with scaled focal lengths
         float near = 0.1f;
         float far = 1000.0f;
         float cx = cam.cx * scaleX;
         float cy = cam.cy * scaleY;
-        
-        // COLMAP uses OpenCV convention: +Z forward, Y-down
-        // Build projection matrix in column-major format directly 
-        // Projection matrix matching projectionFromColmap() for consistency
-        // COLMAP Y-down + Metal texture top-left origin = NO Y flip needed
+
+        // Build projection matrix in column-major format
         simd_float4x4 proj = {0};
         proj.columns[0][0] = 2.0f * scaledFx / windowWidth;
-        proj.columns[1][1] = 2.0f * scaledFy / windowHeight; 
-        proj.columns[2][0] = 2.0f * cx / windowWidth - 1.0f;  
+        proj.columns[1][1] = 2.0f * scaledFy / windowHeight;
+        proj.columns[2][0] = 2.0f * cx / windowWidth - 1.0f;
         proj.columns[2][1] = 2.0f * cy / windowHeight - 1.0f;
         proj.columns[2][2] = far / (far - near);
-        proj.columns[2][3] = 1.0f; 
+        proj.columns[2][3] = 1.0f;
         proj.columns[3][2] = -(far * near) / (far - near);
-        // Set projection matrix
-        uniforms.projectionMatrix = proj;
-        
+        tiledUniforms.projectionMatrix = proj;
+
         // Compute view-projection matrix
-        uniforms.viewProjectionMatrix = matrix_multiply(uniforms.projectionMatrix, uniforms.viewMatrix);
-        uniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
-        uniforms.focalLength = simd_make_float2(scaledFx, scaledFy);
-        
-        // compute camera position from view matrix
+        tiledUniforms.viewProjectionMatrix = matrix_multiply(tiledUniforms.projectionMatrix, tiledUniforms.viewMatrix);
+        tiledUniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
+        tiledUniforms.focalLength = simd_make_float2(scaledFx, scaledFy);
+
+        // Compute camera position from view matrix
         simd_float3x3 R;
-        R.columns[0] = uniforms.viewMatrix.columns[0].xyz;
-        R.columns[1] = uniforms.viewMatrix.columns[1].xyz;
-        R.columns[2] = uniforms.viewMatrix.columns[2].xyz;
-        // -C^T * R^T
-        uniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
-        
+        R.columns[0] = tiledUniforms.viewMatrix.columns[0].xyz;
+        R.columns[1] = tiledUniforms.viewMatrix.columns[1].xyz;
+        R.columns[2] = tiledUniforms.viewMatrix.columns[2].xyz;
+        tiledUniforms.cameraPos = -matrix_multiply(simd_transpose(R), img.translation);
+
         // Debug printing
         if (!renderDebugPrinted) {
-            printf("\n=== RENDER DEBUG (Training View) ===\n");
+            printf("\n=== RENDER DEBUG (Training View - Tiled) ===\n");
             printf("Window: %dx%d, COLMAP: %dx%d\n", windowWidth, windowHeight, cam.width, cam.height);
-            printf("Scale: scaleX=%.4f, scaleY=%.4f\n", scaleX, scaleY);
-            printf("Focal: original fx=%.2f fy=%.2f, scaled fx=%.2f fy=%.2f\n", 
-                   cam.fx, cam.fy, scaledFx, scaledFy);
-            printf("Principal: original cx=%.2f cy=%.2f, scaled cx=%.2f cy=%.2f\n",
-                   cam.cx, cam.cy, cx, cy);
-            printf("Camera position: (%.3f, %.3f, %.3f)\n", 
-                   uniforms.cameraPos.x, uniforms.cameraPos.y, uniforms.cameraPos.z);
-            printf("View matrix:\n");
-            for (int r = 0; r < 4; r++) {
-                printf("  [%.4f %.4f %.4f %.4f]\n",
-                       uniforms.viewMatrix.columns[0][r],
-                       uniforms.viewMatrix.columns[1][r],
-                       uniforms.viewMatrix.columns[2][r],
-                       uniforms.viewMatrix.columns[3][r]);
-            }
-            printf("Projection matrix:\n");
-            for (int r = 0; r < 4; r++) {
-                printf("  [%.4f %.4f %.4f %.4f]\n",
-                       uniforms.projectionMatrix.columns[0][r],
-                       uniforms.projectionMatrix.columns[1][r],
-                       uniforms.projectionMatrix.columns[2][r],
-                       uniforms.projectionMatrix.columns[3][r]);
-            }
-            
-            // Test transform a sample point
-            Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
-            simd_float3 testPos = gaussians[0].position;
-            // Multiply to get view and clip positions
-            simd_float4 viewPos = matrix_multiply(uniforms.viewMatrix, simd_make_float4(testPos, 1.0f));
-            simd_float4 clipPos = matrix_multiply(uniforms.viewProjectionMatrix, simd_make_float4(testPos, 1.0f));
-            // Debug print
-            printf("Sample Gaussian 0:\n");
-            printf("  world pos: (%.3f, %.3f, %.3f)\n", testPos.x, testPos.y, testPos.z);
-            printf("  view pos: (%.3f, %.3f, %.3f, %.3f)\n", viewPos.x, viewPos.y, viewPos.z, viewPos.w);
-            printf("  clip pos: (%.3f, %.3f, %.3f, %.3f)\n", clipPos.x, clipPos.y, clipPos.z, clipPos.w);
-            printf("  NDC: (%.3f, %.3f)\n", clipPos.x/clipPos.w, clipPos.y/clipPos.w);
-            printf("  depth (z in view): %.3f\n", viewPos.z);
-            printf("  scale (log): (%.3f, %.3f, %.3f)\n", 
-                   gaussians[0].scale.x, gaussians[0].scale.y, gaussians[0].scale.z);
-            printf("  scale (exp): (%.6f, %.6f, %.6f)\n", 
-                   exp(gaussians[0].scale.x), exp(gaussians[0].scale.y), exp(gaussians[0].scale.z));
-            
-            // Compute expected 2D size
-            float scale = exp(gaussians[0].scale.x);
-            float depth = viewPos.z;
-            float size2d = scale * scaledFx / depth;
-            printf("  Expected 2D size: scale * fx / depth = %.6f * %.2f / %.3f = %.2f pixels\n",
-                   scale, scaledFx, depth, size2d);
-            
+            printf("Focal: scaled fx=%.2f fy=%.2f\n", scaledFx, scaledFy);
+            printf("Camera position: (%.3f, %.3f, %.3f)\n",
+                   tiledUniforms.cameraPos.x, tiledUniforms.cameraPos.y, tiledUniforms.cameraPos.z);
             renderDebugPrinted = true;
         }
     } else {
-        // Free camera view
+        // Free camera view convert to COLMAP-style matrices for consistency
         float fovY = 45.0f * M_PI / 180.0f;
         float fy = windowHeight / (2.0f * tan(fovY / 2.0f));
         float fx = fy;
-        
-        // Set camera matrices
-        uniforms.viewMatrix = camera.get_view_matrix();
-        uniforms.projectionMatrix = camera.get_projection_matrix();
-        uniforms.viewProjectionMatrix = matrix_multiply(camera.get_projection_matrix(), camera.get_view_matrix());
-        uniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
-        uniforms.focalLength = simd_make_float2(fx, fy);
-        uniforms.cameraPos = camera.get_position();
-        
+
+        // Get camera position and compute look-at direction
+        simd_float3 camPos = camera.get_position();
+
+        // Use the Camera's view matrix but ensure it uses left-hand convention
+        tiledUniforms.viewMatrix = camera.get_view_matrix();
+
+        // Build projection matrix matching COLMAP style for tiled rasterizer
+        float near = 0.1f;
+        float far = 10000.0f;
+        float cx = windowWidth / 2.0f;
+        float cy = windowHeight / 2.0f;
+
+        simd_float4x4 proj = {0};
+        proj.columns[0][0] = 2.0f * fx / windowWidth;
+        proj.columns[1][1] = 2.0f * fy / windowHeight;
+        proj.columns[2][0] = 2.0f * cx / windowWidth - 1.0f;
+        proj.columns[2][1] = 2.0f * cy / windowHeight - 1.0f;
+        proj.columns[2][2] = far / (far - near);
+        proj.columns[2][3] = 1.0f;
+        proj.columns[3][2] = -(far * near) / (far - near);
+        tiledUniforms.projectionMatrix = proj;
+
+        tiledUniforms.viewProjectionMatrix = matrix_multiply(tiledUniforms.projectionMatrix, tiledUniforms.viewMatrix);
+        tiledUniforms.screenSize = simd_make_float2((float)windowWidth, (float)windowHeight);
+        tiledUniforms.focalLength = simd_make_float2(fx, fy);
+        tiledUniforms.cameraPos = camPos;
+
         // Debug printing
         if (!renderDebugPrinted && gaussianBuffer) {
-            printf("\n=== RENDER DEBUG (Free Camera) ===\n");
+            printf("\n=== RENDER DEBUG (Free Camera - Tiled) ===\n");
             printf("Window: %dx%d\n", windowWidth, windowHeight);
             printf("Focal: fx=%.2f fy=%.2f\n", fx, fy);
-            printf("Camera position: (%.3f, %.3f, %.3f)\n", 
-                   uniforms.cameraPos.x, uniforms.cameraPos.y, uniforms.cameraPos.z);
+            printf("Camera position: (%.3f, %.3f, %.3f)\n",
+                   tiledUniforms.cameraPos.x, tiledUniforms.cameraPos.y, tiledUniforms.cameraPos.z);
             printf("View matrix:\n");
             for (int r = 0; r < 4; r++) {
                 printf("  [%.4f %.4f %.4f %.4f]\n",
-                       uniforms.viewMatrix.columns[0][r],
-                       uniforms.viewMatrix.columns[1][r],
-                       uniforms.viewMatrix.columns[2][r],
-                       uniforms.viewMatrix.columns[3][r]);
+                       tiledUniforms.viewMatrix.columns[0][r],
+                       tiledUniforms.viewMatrix.columns[1][r],
+                       tiledUniforms.viewMatrix.columns[2][r],
+                       tiledUniforms.viewMatrix.columns[3][r]);
             }
-            
+
             // Test transform a sample point
             Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
             simd_float3 testPos = gaussians[0].position;
-            // Multiply to get view and clip positions
-            simd_float4 viewPos = matrix_multiply(uniforms.viewMatrix, simd_make_float4(testPos, 1.0f));
-            simd_float4 clipPos = matrix_multiply(uniforms.viewProjectionMatrix, simd_make_float4(testPos, 1.0f));
+            simd_float4 viewPos = matrix_multiply(tiledUniforms.viewMatrix, simd_make_float4(testPos, 1.0f));
+            simd_float4 clipPos = matrix_multiply(tiledUniforms.viewProjectionMatrix, simd_make_float4(testPos, 1.0f));
             printf("Sample Gaussian 0:\n");
             printf("  world pos: (%.3f, %.3f, %.3f)\n", testPos.x, testPos.y, testPos.z);
             printf("  view pos: (%.3f, %.3f, %.3f, %.3f)\n", viewPos.x, viewPos.y, viewPos.z, viewPos.w);
-            printf("  clip pos: (%.3f, %.3f, %.3f, %.3f)\n", clipPos.x, clipPos.y, clipPos.z, clipPos.w);
             if (clipPos.w != 0) {
                 printf("  NDC: (%.3f, %.3f)\n", clipPos.x/clipPos.w, clipPos.y/clipPos.w);
             }
             printf("  depth (z in view): %.3f\n", viewPos.z);
-            printf("  scale (log): (%.3f, %.3f, %.3f)\n", 
+            printf("  scale (log): (%.3f, %.3f, %.3f)\n",
                    gaussians[0].scale.x, gaussians[0].scale.y, gaussians[0].scale.z);
-            printf("  scale (exp): (%.6f, %.6f, %.6f)\n", 
+            printf("  scale (exp): (%.6f, %.6f, %.6f)\n",
                    exp(gaussians[0].scale.x), exp(gaussians[0].scale.y), exp(gaussians[0].scale.z));
-            
+
             // Compute expected 2D size
             float scale = exp(gaussians[0].scale.x);
             float depth = viewPos.z;
             float size2d = scale * fx / depth;
             printf("  Expected 2D size: scale * fx / depth = %.6f * %.2f / %.3f = %.2f pixels\n",
                    scale, fx, depth, size2d);
-            
+
             renderDebugPrinted = true;
         }
     }
-    // Upload uniforms to GPU
-    memcpy(uniformBuffer->contents(), &uniforms, sizeof(Uniforms));
-    
+
+    // Set tile info for tiled rasterizer
+    tiledUniforms.numTilesX = (windowWidth + 15) / 16;
+    tiledUniforms.numTilesY = (windowHeight + 15) / 16;
+    tiledUniforms.numGaussians = (uint32_t)gaussianCount;
+
     // Get next drawable from Metal layer
     CA::MetalDrawable* drawable = (__bridge CA::MetalDrawable*)[metalLayer nextDrawable];
     if (!drawable) return;
-    // Set up render pass descriptor
+
+    // Create a render target texture matching window size for tiled rasterizer
+    // The tiled rasterizer writes to a texture, then we blit to the drawable
+    if (!viewerRenderTarget ||
+        viewerRenderTarget->width() != windowWidth ||
+        viewerRenderTarget->height() != windowHeight) {
+        if (viewerRenderTarget) viewerRenderTarget->release();
+
+        MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
+        desc->setWidth(windowWidth);
+        desc->setHeight(windowHeight);
+        desc->setPixelFormat(MTL::PixelFormatRGBA16Float);
+        desc->setStorageMode(MTL::StorageModeShared);
+        desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
+        viewerRenderTarget = metalDevice->newTexture(desc);
+        desc->release();
+    }
+
+    // Use tiled rasterizer for rendering (same as training for consistency)
+    tiledRasterizer->forward(commandQueue, gaussianBuffer, gaussianCount, tiledUniforms, viewerRenderTarget);
+
+    // Render the texture to the drawable using a full-screen pass
+    // (Can't blit directly due to pixel format mismatch)
     MTL::RenderPassDescriptor* renderPassDesc = MTL::RenderPassDescriptor::alloc()->init();
     renderPassDesc->colorAttachments()->object(0)->setTexture(drawable->texture());
-    renderPassDesc->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
+    renderPassDesc->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionDontCare);
     renderPassDesc->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
-    renderPassDesc->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(1.0, 1.0, 1.0, 1.0));
-    
-    // Create command buffer and render encoder
+
     MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
     MTL::RenderCommandEncoder* encoder = commandBuffer->renderCommandEncoder(renderPassDesc);
-    
-    // Set pipeline and draw
-    encoder->setRenderPipelineState(metalRenderPSO);
-    // Set buffers
-    encoder->setVertexBuffer(gaussianBuffer, 0, 0);
-    encoder->setVertexBuffer(uniformBuffer, 0, 1);
-    encoder->setVertexBuffer(sortedIndices, 0, 2);
-    // Draw Gaussians as triangle strips
-    encoder->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4), gaussianCount);
-    
-    // Finalize encoding and present
+
+    // Use the blit pipeline to copy the texture
+    encoder->setRenderPipelineState(blitPSO);
+    encoder->setFragmentTexture(viewerRenderTarget, 0);
+    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+
     encoder->endEncoding();
     commandBuffer->presentDrawable(drawable);
     commandBuffer->commit();
     commandBuffer->waitUntilCompleted();
-    
-    // Cleanup
+
     renderPassDesc->release();
 }
 

@@ -203,8 +203,8 @@ int main(int argc, char* argv[]) {
     std::string outputPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_kitchen.ply";
     // 30k Iterations for 108 images
     size_t numEpochs = 108;
-    bool viewOnly = false;
-    std::string viewPlyPath = "";
+    bool viewOnly = true;
+    std::string viewPlyPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_bike.ply";
     
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {

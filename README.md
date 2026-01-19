@@ -243,10 +243,6 @@ This project developed skills directly applicable to computer vision research:
 - **Reading Research Code**: Translating the original CUDA implementation's conventions to Metal required understanding undocumented assumptions
 - **Ablation Mentality**: When quality was poor, I learned to isolate components (disable density control, freeze certain parameters) to identify the cause
 
-### Key Insight
-
-The most valuable lesson: **research-level bugs are qualitatively different from software bugs**. The SH saturation issue wasn't a crash or wrong output. It was subtle quality degradation that required understanding the algorithm deeply to even recognize as a bug, let alone fix it.
-
 ## References
 
 - Kerbl et al., "3D Gaussian Splatting for Real-Time Radiance Field Rendering", SIGGRAPH 2023

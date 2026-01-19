@@ -92,6 +92,7 @@ private:
     MTL::CommandQueue* commandQueue;
     MTL::Buffer* uniformBuffer;
     MTL::RenderPipelineState* metalRenderPSO;
+    MTL::RenderPipelineState* blitPSO = nullptr;
     MTL::DepthStencilState* depthStencilState;
     MTL::Texture* depthTexture;
     MTL::Buffer* sequentialIndexBuffer = nullptr;
@@ -136,6 +137,8 @@ private:
     
     // Render target for training
     MTL::Texture* renderTarget = nullptr;
+    // Render target for viewer
+    MTL::Texture* viewerRenderTarget = nullptr;
     void createRenderTarget(uint32_t width, uint32_t height);
     
     // Loss computation

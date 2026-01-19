@@ -723,3 +723,41 @@ kernel void adamStep(
         gaussians[tid].sh[i] = newSH;
     }
 }
+
+// Blit Shader
+struct BlitVertexOut {
+    float4 position [[position]];
+    float2 texCoord;
+};
+
+// Full-screen triangle vertex shader (no vertex buffer needed)
+vertex BlitVertexOut blitVertexShader(uint vertexID [[vertex_id]]) {
+    BlitVertexOut out;
+
+    // Generate full-screen triangle vertices
+    float2 positions[3] = {
+        float2(-1, -1),
+        float2( 3, -1),
+        float2(-1,  3)
+    };
+
+    float2 texCoords[3] = {
+        float2(0, 1), 
+        float2(2, 1),
+        float2(0, -1)
+    };
+
+    out.position = float4(positions[vertexID], 0, 1);
+    out.texCoord = texCoords[vertexID];
+
+    return out;
+}
+
+// Fragment shader to sample and output the texture
+fragment float4 blitFragmentShader(BlitVertexOut in [[stage_in]],
+                                    texture2d<float> sourceTexture [[texture(0)]]) {
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    float4 color = sourceTexture.sample(s, in.texCoord);
+    // Clamp to [0,1] for output to RGBA8 drawable
+    return clamp(color, 0.0, 1.0);
+}
