@@ -173,7 +173,7 @@ This prevents the SH coefficients from having unbounded effect on final color, m
 - **GPU Radix Sort**: Currently using CPU sort; GPU implementation is WIP
 - **Anti-aliasing / EWA splatting**: No mip-mapping for distant Gaussians
 - **Exposure compensation**: Fixed exposure across training views
-- **Background modeling**: Assumes black background (no sky dome)
+- **Background modeling**: Assumes white background (no sky dome)
 - **Multi-resolution training**: Single resolution only
 - **Batch processing**: Single image per iteration
 

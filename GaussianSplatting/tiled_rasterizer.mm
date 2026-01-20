@@ -19,8 +19,8 @@
 // Number of threads for parallel operations
 static const int NUM_THREADS = 8;
 
-// Enable GPU sorting set to false to use CPU radix sort
-static constexpr bool USE_GPU_SORT = false;
+// Enable GPU sorting set to true to use GPU radix sort
+static constexpr bool USE_GPU_SORT = true;
 
 // Fast parallel radix sort using GCD
 // Optimized with parallel histogram and parallel scatter
@@ -120,23 +120,6 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
     // Static assert struct sizes
     static_assert(sizeof(ProjectedGaussian) == 96, "ProjectedGaussian must be 96 bytes!");
     static_assert(sizeof(TiledUniforms) == 240, "TiledUniforms must be 240 bytes!");
-
-    // Verify struct alignment 96 bytes total
-    printf("sizeof(ProjectedGaussian) = %zu bytes (expected 96)\n", sizeof(ProjectedGaussian));
-    printf("sizeof(TiledUniforms) = %zu bytes (expected 240)\n", sizeof(TiledUniforms));
-    printf("  offsetof(screenPos) = %zu (expected 0)\n", offsetof(ProjectedGaussian, screenPos));
-    printf("  offsetof(conic) = %zu (expected 8)\n", offsetof(ProjectedGaussian, conic));
-    printf("  offsetof(depth) = %zu (expected 20)\n", offsetof(ProjectedGaussian, depth));
-    printf("  offsetof(opacity) = %zu (expected 24)\n", offsetof(ProjectedGaussian, opacity));
-    printf("  offsetof(color) = %zu (expected 28)\n", offsetof(ProjectedGaussian, color));
-    printf("  offsetof(radius) = %zu (expected 40)\n", offsetof(ProjectedGaussian, radius));
-    printf("  offsetof(tileMinX) = %zu (expected 44)\n", offsetof(ProjectedGaussian, tileMinX));
-    printf("  offsetof(tileMinY) = %zu (expected 48)\n", offsetof(ProjectedGaussian, tileMinY));
-    printf("  offsetof(tileMaxX) = %zu (expected 52)\n", offsetof(ProjectedGaussian, tileMaxX));
-    printf("  offsetof(tileMaxY) = %zu (expected 56)\n", offsetof(ProjectedGaussian, tileMaxY));
-    printf("  offsetof(viewPos_xy) = %zu (expected 64)\n", offsetof(ProjectedGaussian, viewPos_xy));
-    printf("  offsetof(cov2D) = %zu (expected 72)\n", offsetof(ProjectedGaussian, cov2D));
-    printf("  offsetof(viewDir) = %zu (expected 84)\n", offsetof(ProjectedGaussian, viewDir));
     
     // Allocate projection buffer
     projectedGaussians = device->newBuffer(maxGaussians * sizeof(ProjectedGaussian),
@@ -257,10 +240,7 @@ void TiledRasterizer::ensurePairsCapacity(uint32_t requiredPairs) {
     
     // Grow by 1.5x or to required size, whichever is larger
     uint32_t newMaxPairs = std::max(requiredPairs, (uint32_t)(maxPairs * 1.5));
-    
-    // Debug print
-    std::cout << "Growing pairs buffer: " << maxPairs << " -> " << newMaxPairs << std::endl;
-    
+
     // Reallocate buffers
     if (gaussianKeys) gaussianKeys->release();
     if (gaussianValues) gaussianValues->release();
@@ -485,15 +465,12 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     MTL::Buffer* sortedValuesBuffer = gaussianValues;
     
     if (USE_GPU_SORT) {
-        std::cout << "Using GPU sort for " << totalPairs << " pairs" << std::endl;
-        // GPU sort much faster, entirely on GPU
+        // GPU sort - entirely on GPU
         gpuRadixSort->sort(queue, gaussianKeys, gaussianValues, totalPairs);
         // Use the GPU's internal sorted buffers directly
         sortedKeysBuffer = gpuRadixSort->getSortedKeys();
         sortedValuesBuffer = gpuRadixSort->getSortedValues();
-        std::cout << "GPU sort complete. Keys buffer: " << sortedKeysBuffer 
-                  << " Values buffer: " << sortedValuesBuffer << std::endl;
-        
+
         // Store active sorted buffers for backward pass GPU sort case
         activeSortedKeys = sortedKeysBuffer;
         activeSortedValues = sortedValuesBuffer;
@@ -692,18 +669,23 @@ void TiledRasterizer::backward(MTL::CommandQueue* queue,
     
     uint32_t width = (uint32_t)renderedTexture->width();
     uint32_t height = (uint32_t)renderedTexture->height();
-    
-    // Clear gradients
-    memset(gradientBuffer->contents(), 0, gaussianCount * sizeof(GaussianGradients));
-    
-    // Copy uniforms
+
+    // Copy uniforms (small, CPU is fine)
     TiledUniforms u = uniforms;
     u.numTilesX = numTilesX;
     u.numTilesY = numTilesY;
     u.numGaussians = (uint32_t)gaussianCount;
     memcpy(uniformBuffer->contents(), &u, sizeof(TiledUniforms));
-    
+
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
+
+    // Clear gradients on GPU (much faster than CPU memset on unified memory)
+    {
+        MTL::BlitCommandEncoder* blit = cmdBuffer->blitCommandEncoder();
+        blit->fillBuffer(gradientBuffer, NS::Range(0, gaussianCount * sizeof(GaussianGradients)), 0);
+        blit->endEncoding();
+    }
+
     // Backward rendering
     {
         // Setup compute encoder and buffers

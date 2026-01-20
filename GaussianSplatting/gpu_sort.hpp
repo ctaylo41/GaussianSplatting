@@ -77,7 +77,7 @@ public:
     MTL::Buffer* getSortedValues() { return valuesBuffers[currentBuffer]; }
     
 private:
-    // Constants    
+    // Constants
     static constexpr size_t RADIX_SIZE = 256;
     static constexpr size_t THREADGROUP_SIZE = 256;
     static constexpr size_t NUM_PASSES = 8;
@@ -88,19 +88,29 @@ private:
     
     // Compute pipelines
     MTL::ComputePipelineState* histogram64PSO;
+    MTL::ComputePipelineState* histogram64CombinedPSO;
     MTL::ComputePipelineState* prefixSum256PSO;
+    MTL::ComputePipelineState* prefixSum256KernelPSO;
+    MTL::ComputePipelineState* computeBlockOffsetsGPUPSO;
     MTL::ComputePipelineState* scatter64StablePSO;
     MTL::ComputePipelineState* scatter64WithAtomicRankPSO;
     MTL::ComputePipelineState* scatter64OptimizedPSO;
     MTL::ComputePipelineState* clearHistogramPSO;
-    
+    MTL::ComputePipelineState* computeBlockHistogramsPSO;
+    MTL::ComputePipelineState* scatter64BlockStablePSO;
+
     // Double-buffered arrays
     MTL::Buffer* keysBuffers[2];
     MTL::Buffer* valuesBuffers[2];
-    
+
     // Histogram
     MTL::Buffer* histogramBuffer;
     MTL::Buffer* digitCountersBuffer;
+
+    // Block histograms and offsets for stable scatter (numBlocks * 256)
+    MTL::Buffer* blockHistogramsBuffer;
+    MTL::Buffer* blockOffsetsBuffer;
+    size_t maxBlocks;
     
     // Helper methods
     void createPipelines(MTL::Library* library);

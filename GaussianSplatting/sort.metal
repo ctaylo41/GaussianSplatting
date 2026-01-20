@@ -25,7 +25,7 @@ inline uint floatToSortable(float f) {
 
 // Compute depth and create key-value pairs
 kernel void computeDepths(
-    device const float4* positions [[buffer(0)]],
+    device const packed_float3* positions [[buffer(0)]],
     constant float3& cameraPos [[buffer(1)]],
     device uint* keys [[buffer(2)]],
     device uint* values [[buffer(3)]],
@@ -34,8 +34,8 @@ kernel void computeDepths(
 {
     if (id >= numElements) return;
 
-    // Extract xyz from float4
-    float3 pos = positions[id].xyz;  
+    // Read packed_float3 (12-byte stride matches simd_float3 on CPU)
+    float3 pos = float3(positions[id]);  
     
     // Skip invalid positions
     if (isnan(pos.x) || isnan(pos.y) || isnan(pos.z) ||
@@ -205,7 +205,8 @@ kernel void clearHistogram(
     }
 }
 
-// 64 bit raddix sort for tile + depth compound keys
+// 64 bit radix sort - combined histogram kernel
+// Computes both global histogram and per-block histograms in one pass
 kernel void histogram64(
     device const ulong* keys [[buffer(0)]],
     device atomic_uint* globalHistogram [[buffer(1)]],
@@ -214,12 +215,52 @@ kernel void histogram64(
     uint id [[thread_position_in_grid]])
 {
     // Simple version each thread directly increments global histogram
-    // Avoids any threadgroup-level issues with partial threadgroups
     if (id < numElements) {
         ulong key = keys[id];
-        // Extract digit
         uint digit = (key >> bitOffset) & 0xFF;
         atomic_fetch_add_explicit(&globalHistogram[digit], 1, memory_order_relaxed);
+    }
+}
+
+// Combined kernel: builds both global histogram AND per-block histograms
+// Reads keys only once, reducing memory bandwidth
+kernel void histogram64Combined(
+    device const ulong* keys [[buffer(0)]],
+    device atomic_uint* globalHistogram [[buffer(1)]],
+    device uint* blockHistograms [[buffer(2)]],
+    constant uint& bitOffset [[buffer(3)]],
+    constant uint& numElements [[buffer(4)]],
+    uint id [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup uint localHist[256];
+
+    // Initialize local histogram - handle partial threadgroups
+    uint blockStart = tgid * 256;
+    uint threadsInBlock = min(256u, numElements > blockStart ? numElements - blockStart : 0u);
+    for (uint i = tid; i < 256; i += max(threadsInBlock, 1u)) {
+        localHist[i] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Count digit in local histogram
+    if (id < numElements) {
+        ulong key = keys[id];
+        uint digit = (key >> bitOffset) & 0xFF;
+        atomic_fetch_add_explicit((threadgroup atomic_uint*)&localHist[digit], 1, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write to both global histogram and block histogram - handle partial threadgroups
+    for (uint i = tid; i < 256; i += max(threadsInBlock, 1u)) {
+        uint count = localHist[i];
+        // Add to global histogram
+        if (count > 0) {
+            atomic_fetch_add_explicit(&globalHistogram[i], count, memory_order_relaxed);
+        }
+        // Write block histogram
+        blockHistograms[tgid * 256 + i] = count;
     }
 }
 
@@ -649,4 +690,160 @@ kernel void buildTileRanges(
     }
     
     tileRanges[id] = uint2(start, count);
+}
+
+// ============================================================================
+// ALL-GPU RADIX SORT
+// No CPU synchronization - everything runs on GPU
+// ============================================================================
+
+// Prefix sum on 256-element histogram (single threadgroup)
+kernel void prefixSum256Kernel(
+    device uint* histogram [[buffer(0)]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint temp[256];
+
+    // Load
+    temp[tid] = histogram[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Parallel prefix sum (Blelloch scan)
+    // Up-sweep (reduce)
+    for (uint stride = 1; stride < 256; stride *= 2) {
+        uint idx = (tid + 1) * stride * 2 - 1;
+        if (idx < 256) {
+            temp[idx] += temp[idx - stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Set last element to 0 for exclusive scan
+    if (tid == 0) {
+        temp[255] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Down-sweep
+    for (uint stride = 128; stride >= 1; stride /= 2) {
+        uint idx = (tid + 1) * stride * 2 - 1;
+        if (idx < 256) {
+            uint t = temp[idx - stride];
+            temp[idx - stride] = temp[idx];
+            temp[idx] += t;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store
+    histogram[tid] = temp[tid];
+}
+
+// Compute block offsets from block histograms and global prefix
+// O(numBlocks) total - each of 256 threads handles one digit's prefix sum
+// Single threadgroup processes ALL blocks sequentially per digit
+kernel void computeBlockOffsetsGPU(
+    device const uint* blockHistograms [[buffer(0)]],
+    device uint* blockOffsets [[buffer(1)]],
+    device const uint* globalPrefix [[buffer(2)]],
+    constant uint& numBlocks [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    // Each thread handles one digit across ALL blocks
+    if (tid >= 256) return;
+
+    // Start with global prefix for this digit
+    uint runningSum = globalPrefix[tid];
+
+    // Sequential prefix sum across blocks for this digit
+    for (uint b = 0; b < numBlocks; b++) {
+        // Write current running sum as this block's offset
+        blockOffsets[b * 256 + tid] = runningSum;
+        // Add this block's count for next iteration
+        runningSum += blockHistograms[b * 256 + tid];
+    }
+}
+
+// Compute histogram for each block (threadgroup)
+// Output: blockHistograms[blockId * 256 + digit] = count of digit in block
+// Works with any threadgroup size (uses loops for 256 bins)
+kernel void computeBlockHistograms64(
+    device const ulong* keys [[buffer(0)]],
+    device uint* blockHistograms [[buffer(1)]],
+    constant uint& bitOffset [[buffer(2)]],
+    constant uint& numElements [[buffer(3)]],
+    constant uint& threadgroupSize [[buffer(4)]],
+    uint id [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup uint localHist[256];
+
+    // Initialize local histogram (loop for threadgroup sizes < 256)
+    for (uint i = tid; i < 256; i += threadgroupSize) {
+        localHist[i] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Count digits for this element
+    if (id < numElements) {
+        uint digit = (keys[id] >> bitOffset) & 0xFF;
+        atomic_fetch_add_explicit((threadgroup atomic_uint*)&localHist[digit], 1, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write block histogram to global memory
+    for (uint i = tid; i < 256; i += threadgroupSize) {
+        blockHistograms[tgid * 256 + i] = localHist[i];
+    }
+}
+
+// Parallel stable scatter using precomputed block offsets
+// Each thread counts preceding elements with same digit (linear scan)
+kernel void scatter64BlockStable(
+    device const ulong* keysIn [[buffer(0)]],
+    device const uint* valuesIn [[buffer(1)]],
+    device ulong* keysOut [[buffer(2)]],
+    device uint* valuesOut [[buffer(3)]],
+    device const uint* blockOffsets [[buffer(4)]],
+    constant uint& bitOffset [[buffer(5)]],
+    constant uint& numElements [[buffer(6)]],
+    uint id [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup uint localDigits[256];
+
+    uint blockStart = tgid * 256;
+    bool valid = (blockStart + tid) < numElements;
+
+    // Each thread loads its element and extracts digit
+    ulong key = 0;
+    uint value = 0;
+    uint digit = 0;
+
+    if (valid) {
+        key = keysIn[blockStart + tid];
+        value = valuesIn[blockStart + tid];
+        digit = (key >> bitOffset) & 0xFF;
+        localDigits[tid] = digit;
+    } else {
+        localDigits[tid] = 0xFFFFFFFF; // Invalid marker
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each thread computes its local rank by counting preceding elements with same digit
+    if (valid) {
+        uint localRank = 0;
+        for (uint i = 0; i < tid; i++) {
+            if (localDigits[i] == digit) {
+                localRank++;
+            }
+        }
+
+        // Write to output using precomputed block offset + local rank
+        uint writePos = blockOffsets[tgid * 256 + digit] + localRank;
+        keysOut[writePos] = key;
+        valuesOut[writePos] = value;
+    }
 }

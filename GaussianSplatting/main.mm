@@ -198,12 +198,12 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
 
 int main(int argc, char* argv[]) {
     // Default paths can be overridden with command line args
-    std::string colmapPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/sparse_kitchen/0";
-    std::string imagePath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/images_4_kitchen";
-    std::string outputPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_kitchen.ply";
+    std::string colmapPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/sparse/0";
+    std::string imagePath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/images_4";
+    std::string outputPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_bike.ply";
     // 30k Iterations for 108 images
-    size_t numEpochs = 108;
-    bool viewOnly = true;
+    size_t numEpochs = 155;
+    bool viewOnly = false;
     std::string viewPlyPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_bike.ply";
     
     // Parse command line arguments

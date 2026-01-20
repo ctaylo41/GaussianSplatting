@@ -108,7 +108,7 @@ private:
     MTL::Buffer* positionBuffer = nullptr;
     GPURadixSort32* gpuSort = nullptr;
 
-    // CPU sort for viewer (GPU sort is broken)
+    // CPU sort for viewer (fallback, GPU sort enabled in tiled rasterizer)
     MTL::Buffer* cpuSortedIndices = nullptr;
     void cpuSortByDepth(simd_float3 cameraPos);
     
