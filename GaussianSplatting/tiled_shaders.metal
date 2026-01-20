@@ -384,7 +384,31 @@ kernel void tiledForward(
     output.write(float4(color, 1.0), gid);
 }
 
-// Tiled backward rendering kernel
+// Tile-local gradient accumulation constants
+// 128 Gaussians * 16 floats = 2048 floats = 8KB threadgroup memory
+constant uint BACKWARD_CHUNK_SIZE = 128;
+constant uint NUM_GRAD_COMPONENTS = 16;
+
+// Helper: atomic float add for threadgroup memory using CAS loop
+inline void atomicAddTG(threadgroup atomic_uint* addr, float val) {
+    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(
+        addr, &expected,
+        as_type<uint>(as_type<float>(expected) + val),
+        memory_order_relaxed, memory_order_relaxed)) {}
+}
+
+// SIMD-reduced atomic add: reduces 256 threads to 8 atomics (32 threads per simdgroup)
+inline void simdAtomicAddTG(threadgroup atomic_uint* addr, float val) {
+    float sum = simd_sum(val);
+    if (simd_is_first()) {
+        atomicAddTG(addr, sum);
+    }
+}
+
+// Tiled backward rendering kernel with tile-local gradient accumulation
+// Instead of 256 pixels doing 15 device atomics each per Gaussian (3840 atomics),
+// we accumulate in threadgroup memory and do 15 device atomics per Gaussian per tile
 kernel void tiledBackward(
     device const Gaussian* gaussians [[buffer(0)]],
     device GaussianGradients* gradients [[buffer(1)]],
@@ -395,353 +419,328 @@ kernel void tiledBackward(
     device const uint* lastContribIdx [[buffer(6)]],
     texture2d<float, access::read> rendered [[texture(0)]],
     texture2d<float, access::read> groundTruth [[texture(1)]],
-    uint2 gid [[thread_position_in_grid]])
+    uint2 gid [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]])
 {
-    // Bounds check
-    if (gid.x >= uint(uniforms.screenSize.x) || gid.y >= uint(uniforms.screenSize.y)) return;
-    
-    // Find last contributing Gaussian index for this pixel
-    uint pixelIdx = gid.y * uint(uniforms.screenSize.x) + gid.x;
-    uint lastIdx = lastContribIdx[pixelIdx];
-    
-    if (lastIdx == UINT_MAX) return;
-    
-    // Determine tile index
-    uint tileX = gid.x / TILE_SIZE;
-    uint tileY = gid.y / TILE_SIZE;
-    uint tileIdx = tileY * uniforms.numTilesX + tileX;
+    // Threadgroup memory for gradient accumulation (as atomic_uint, bits interpreted as float)
+    // Layout: [CHUNK_SIZE][16] - 16 gradient components per Gaussian
+    // Components: pos(3), opacity(1), scale(3), rot(4), sh_dc(3), viewspace(2)
+    threadgroup atomic_uint tgGrads[BACKWARD_CHUNK_SIZE * NUM_GRAD_COMPONENTS];
+    threadgroup uint tgGaussianIdx[BACKWARD_CHUNK_SIZE];
+
+    // Bounds check - but we need all threads for reduction
+    bool valid = (gid.x < uint(uniforms.screenSize.x) && gid.y < uint(uniforms.screenSize.y));
+
+    // Get tile range (all threads in tile share this)
+    uint tileIdx = tgid.y * uniforms.numTilesX + tgid.x;
     TileRange range = tileRanges[tileIdx];
-    
-    // Pixel position
+
+    // Per-pixel state
+    uint pixelIdx = valid ? (gid.y * uint(uniforms.screenSize.x) + gid.x) : 0;
+    uint lastIdx = valid ? lastContribIdx[pixelIdx] : UINT_MAX;
+    bool hasContrib = valid && (lastIdx != UINT_MAX);
+    uint endIdx = hasContrib ? min(lastIdx + 1, range.start + range.count) : 0;
+
+    // Pixel position and gradient computation
     float2 pixelPos = float2(gid) + 0.5;
-    
-    float4 r_pix = rendered.read(gid);
-    float4 gt_pix = groundTruth.read(gid);
-    
-    // L1 gradient
+    float4 r_pix = valid ? rendered.read(gid) : float4(0);
+    float4 gt_pix = valid ? groundTruth.read(gid) : float4(0);
     float3 diff = r_pix.rgb - gt_pix.rgb;
     float3 dL_dPixel = sign(diff) / 3.0;
-    
-    // Traverse back to front for correct gradients
-    // Find how many Gaussians contribute and compute T_final
-    uint endIdx = min(lastIdx + 1, range.start + range.count);
-    
-    // Pre-compute T transmittance for the forward pass to get T_final
+
+    // Pre-compute T_final (same as before)
     float T_final = 1.0;
-    // Traverse front to back to compute T_final
-    for (uint sortIdx = range.start; sortIdx < endIdx; sortIdx++) {
-        // Fetch Gaussian index
-        uint gIdx = sortedIndices[sortIdx];
-        if (gIdx >= uniforms.numGaussians) continue;
-        
-        ProjectedGaussian p = projected[gIdx];
-        if (p.radius <= 0) continue;
-        
-        // Compute offset from Gaussian center
-        float2 d = pixelPos - p.screenPos;
-        float power = -0.5 * (p.conic.x * d.x * d.x +
-                              2.0 * p.conic.y * d.x * d.y +
-                              p.conic.z * d.y * d.y);
-        
-        // Early skip for negligible contribution
-        if (power > 0.0 || power < -4.5) continue;
-        
-        // Compute Gaussian weight and alpha
-        float G = exp(power);
-        float alpha = min(p.opacity * G, 0.99f);
-        
-        // Skip negligible alpha
-        if (alpha < 1.0 / 255.0) continue;
-        
-        // Update T
-        float test_T = T_final * (1.0 - alpha);
-        if (test_T < 0.0001) break;
-        T_final = test_T;
+    if (hasContrib) {
+        for (uint sortIdx = range.start; sortIdx < endIdx; sortIdx++) {
+            uint gIdx = sortedIndices[sortIdx];
+            if (gIdx >= uniforms.numGaussians) continue;
+
+            ProjectedGaussian p = projected[gIdx];
+            if (p.radius <= 0) continue;
+
+            float2 d = pixelPos - p.screenPos;
+            float power = -0.5 * (p.conic.x * d.x * d.x +
+                                  2.0 * p.conic.y * d.x * d.y +
+                                  p.conic.z * d.y * d.y);
+
+            if (power > 0.0 || power < -4.5) continue;
+
+            float G = exp(power);
+            float alpha = min(p.opacity * G, 0.99f);
+
+            if (alpha < 1.0 / 255.0) continue;
+
+            float test_T = T_final * (1.0 - alpha);
+            if (test_T < 0.0001) break;
+            T_final = test_T;
+        }
     }
-    
-    // Traverse back to front for gradients
-    // T starts at T_final and we go backwards by dividing by (1-alpha)
+
+    // Initialize backward pass state
     float T = T_final;
-    
-    // Initialize accum_rec to the background color
-    // White background
-    float3 bgColor = float3(1.0);  
-     // Accumulated color from Gaussians behind current starts with background
-    float3 accum_rec = bgColor; 
-    
-    // Iterate in reverse order back to front
-    for (int sortIdx = int(endIdx) - 1; sortIdx >= int(range.start); sortIdx--) {
-        uint gIdx = sortedIndices[uint(sortIdx)];
-        
-        if (gIdx >= uniforms.numGaussians) continue;
-        
-        ProjectedGaussian p = projected[gIdx];
-        
-        if (p.radius <= 0) continue;
-        
-        // Compute offset from Gaussian center
-        float2 d = pixelPos - p.screenPos;
-        float power = -0.5 * (p.conic.x * d.x * d.x +
-                              2.0 * p.conic.y * d.x * d.y +
-                              p.conic.z * d.y * d.y);
-        
-        // Early skip for negligible contribution
-        if (power > 0.0 || power < -4.5) continue;
-        
-        // Compute Gaussian weight and alpha
-        float G = exp(power);
-        float alpha = min(p.opacity * G, 0.99f);
-        
-        if (alpha < 1.0 / 255.0) continue;
-        
-        // Recover T at this position by undoing the alpha blend
-        // Use larger epsilon (0.01) to match forward pass alpha cap of 0.99
-        // This prevents numerical instability from division by very small numbers
-        T = T / max(1.0 - alpha, 0.01);
-        
-        float weight = alpha * T;
-        
-        // Color gradient
-        float3 dL_dColor = dL_dPixel * weight;
-        
-        // Accumulate color gradient
-        float dL_dAlpha = T * dot(dL_dPixel, p.color - accum_rec);
-        
-        // Update accum_rec to include current Gaussian for the next Gaussian
-        // The contribution from current Gaussian + attenuated contribution from behind
-        accum_rec = alpha * p.color + (1.0 - alpha) * accum_rec;
-        
-        // Opacity gradient
-        float sig = p.opacity;
-        float dAlpha_dRawOp = sig * (1.0 - sig) * G;
-        float dL_dRawOpacity = dL_dAlpha * dAlpha_dRawOp;
+    float3 bgColor = float3(1.0);
+    float3 accum_rec = bgColor;
 
-        // Clamp per-pixel opacity gradient
-        const float MAX_PIXEL_OPACITY_GRAD = 0.1f;
-        dL_dRawOpacity = clamp(dL_dRawOpacity, -MAX_PIXEL_OPACITY_GRAD, MAX_PIXEL_OPACITY_GRAD);
-        
-        // Gaussian gradient
-        // For position/scale gradients, we need dL/dG
-        float dL_dG = dL_dAlpha * sig;
-        
-        // Screen position gradient
-       
-        // Precompute gdx, gdy
-        float gdx = G * d.x;
-        float gdy = G * d.y;
-        
-        // Screen position gradient:
-        float dG_ddelx = -gdx * p.conic.x - gdy * p.conic.y;
-        float dG_ddely = -gdy * p.conic.z - gdx * p.conic.y;
-        
-        // Negate because the d convention is opposite of official
-        float2 dL_dScreenPos = dL_dG * float2(-dG_ddelx, -dG_ddely);
-        
-        // World position gradient
-        // Chain rule dL/dViewPos = dL/dScreenPos * dScreenPos/dViewPos
-        float z = p.depth;
-        float fx = uniforms.focalLength.x;
-        float fy = uniforms.focalLength.y;
-        
-        // Compute normalized view ratios
-        // Same as forward pass Jacobian
-        float txtz = p.viewPos_xy.x / z;
-        float tytz = p.viewPos_xy.y / z;
-        
-        // dL/dViewPos
-        float3 dL_dViewPos;
-        dL_dViewPos.x = dL_dScreenPos.x * fx / z;
-        dL_dViewPos.y = dL_dScreenPos.y * fy / z;
-        dL_dViewPos.z = -dL_dScreenPos.x * fx * txtz / z
-                        -dL_dScreenPos.y * fy * tytz / z;
-        
-        // Extract view rotation
-        // viewMatrix is world-to-view, so transpose gives view-to-world
-        float3x3 viewRot = float3x3(
-            uniforms.viewMatrix[0].xyz,
-            uniforms.viewMatrix[1].xyz,
-            uniforms.viewMatrix[2].xyz
-        );
+    // Cache view rotation (used for all Gaussians)
+    float3x3 viewRot = float3x3(
+        uniforms.viewMatrix[0].xyz,
+        uniforms.viewMatrix[1].xyz,
+        uniforms.viewMatrix[2].xyz
+    );
+    float fx = uniforms.focalLength.x;
+    float fy = uniforms.focalLength.y;
 
-        // viewRot already contains columns of rotation, transpose gives view-to-world
-        float3 dL_dWorldPos = transpose(viewRot) * dL_dViewPos;
-        
-        // Conic gradient
-        // power = -0.5 * (conic.x * dx^2 + 2 * conic.y * dx*dy + conic.z * dy^2)
-        // dL/dconic = dL/dG * dG/dpower * dpower/dconic = dL_dG * G * (-0.5) * (dx^2, 2*dx*dy, dy^2)
-        float3 dL_dConic;
-        dL_dConic.x = -0.5f * dL_dG * G * d.x * d.x;
-        dL_dConic.y = -0.5f * dL_dG * G * 2.0f * d.x * d.y;
-        dL_dConic.z = -0.5f * dL_dG * G * d.y * d.y;
-        
-        // Cov2D gradient
-        // conic = inverse(cov2D), dL/dCov2D requires derivative of matrix inverse
-        float cov_a = p.cov2D.x;
-        float cov_b = p.cov2D.y;
-        float cov_c = p.cov2D.z;
-        
-        // Denominator and its inverse squared
-        float denom = cov_a * cov_c - cov_b * cov_b;
-        float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
-        
-        float3 dL_dCov2D;
-        
-        // Using formula for derivative of inverse of 2x2 matrix
-        dL_dCov2D.x = denom2inv * (-cov_c * cov_c * dL_dConic.x
-                                   + 2.0f * cov_b * cov_c * dL_dConic.y
-                                   + (denom - cov_a * cov_c) * dL_dConic.z);
-        dL_dCov2D.z = denom2inv * (-cov_a * cov_a * dL_dConic.z
-                                   + 2.0f * cov_a * cov_b * dL_dConic.y
-                                   + (denom - cov_a * cov_c) * dL_dConic.x);
-        dL_dCov2D.y = denom2inv * 2.0f * (cov_b * cov_c * dL_dConic.x
-                                          - (denom + 2.0f * cov_b * cov_b) * dL_dConic.y
-                                          + cov_a * cov_b * dL_dConic.z);
-        
-        // Cov3D gradient
-        // Forward cov2D = T * Sigma3D * T^T where T = J * W
-        // Gradient for Y = A * X * A^T, dL/dX = A^T * dL/dY * A
-        // So dL/dSigma3D = T^T * dL/dCov2D * T
-        float3 t_cam = float3(p.viewPos_xy, p.depth);
-        txtz = t_cam.x / t_cam.z;
-        tytz = t_cam.y / t_cam.z;
-        
-        // Jacobian of projection
-        float J00 = fx / t_cam.z;
-        float J02 = -fx * txtz / t_cam.z;
-        float J11 = fy / t_cam.z;
-        float J12 = -fy * tytz / t_cam.z;
-        
-        // Jacobian matrix
-        float3x3 J = float3x3(
-            float3(J00, 0, 0),
-            float3(0, J11, 0),
-            float3(J02, J12, 0)
-        );
-        
-        // T = J * viewRot
-        float3x3 T_mat = J * viewRot;
-        
-        // dL/dCov2D as 2x2 matrix embedded in 3x3
-        // Extend to 3x3 with zeros for the third row/col
-        float3x3 dL_dCov2D_mat = float3x3(
-            float3(dL_dCov2D.x, dL_dCov2D.y, 0),
-            float3(dL_dCov2D.y, dL_dCov2D.z, 0),
-            float3(0, 0, 0)
-        );
-        
-        // For cov2D = T * Sigma3D * T^T, gradient is dL/dSigma3D = T^T * dL/dCov2D * T
-        float3x3 dL_dCov3D = transpose(T_mat) * dL_dCov2D_mat * T_mat;
-        
-        // Scale and Rotation gradients
-        // Using convention: M = R * S, Sigma = M * M^T
-        Gaussian g_orig = gaussians[gIdx];
-        float3 scale = exp(clamp(g_orig.scale, -MAX_SCALE, MAX_SCALE));
-        
-        // Quaternion components: q = (w, x, y, z) stored as (q.x, q.y, q.z, q.w)
-        float4 q = g_orig.rotation;
-        float r = q.x;
-        float x_q = q.y;
-        float y_q = q.z;
-        float z_q = q.w;
-        
-        // Build rotation matrix
-        float3x3 R = quatToMat(q);
-        
-        // S is diagonal scale matrix
-        float3x3 S = float3x3(
-            float3(scale.x, 0, 0),
-            float3(0, scale.y, 0),
-            float3(0, 0, scale.z)
-        );
-        float3x3 M = R * S;
-        
-        // For Sigma = M * M^T correct gradient is dL/dM = 2 * dL/dSigma * M
-        float3x3 dL_dM = 2.0f * dL_dCov3D * M;
-        
-        // For M = R * S: dL/dS = R^T * dL/dM, extract diagonal
-        float3x3 Rt = transpose(R);
-        float3x3 Rt_dLdM = Rt * dL_dM;
-        float3 dL_dScale_val = float3(Rt_dLdM[0][0], Rt_dLdM[1][1], Rt_dLdM[2][2]);
-        
-        // Convert to log scale gradient dL/d(log_s) = dL/ds * s
-        float3 dL_dLogScale = dL_dScale_val * scale;
-        
-        // For M = R * S: dL/dR = dL/dM * S (scale columns of dL/dM)
-        float3x3 dL_dR = float3x3(
-            dL_dM[0] * scale.x,   // Column 0 * s_x
-            dL_dM[1] * scale.y,   // Column 1 * s_y
-            dL_dM[2] * scale.z    // Column 2 * s_z
-        );
-        // Transpose for quaternion gradient formula compatibility
-        float3x3 dL_dMt_scaled = transpose(dL_dR);
-        
-        // Quaternion gradient
-        float4 dL_dq;
-        dL_dq.x = 2.0f * (z_q * (dL_dMt_scaled[0][1] - dL_dMt_scaled[1][0]) +
-                         y_q * (dL_dMt_scaled[2][0] - dL_dMt_scaled[0][2]) +
-                         x_q * (dL_dMt_scaled[1][2] - dL_dMt_scaled[2][1]));
-        
-        dL_dq.y = 2.0f * (y_q * (dL_dMt_scaled[1][0] + dL_dMt_scaled[0][1]) +
-                         z_q * (dL_dMt_scaled[2][0] + dL_dMt_scaled[0][2]) +
-                         r * (dL_dMt_scaled[1][2] - dL_dMt_scaled[2][1]) -
-                         2.0f * x_q * (dL_dMt_scaled[2][2] + dL_dMt_scaled[1][1]));
-        
-        dL_dq.z = 2.0f * (x_q * (dL_dMt_scaled[1][0] + dL_dMt_scaled[0][1]) +
-                         r * (dL_dMt_scaled[2][0] - dL_dMt_scaled[0][2]) +
-                         z_q * (dL_dMt_scaled[1][2] + dL_dMt_scaled[2][1]) -
-                         2.0f * y_q * (dL_dMt_scaled[2][2] + dL_dMt_scaled[0][0]));
-        
-        dL_dq.w = 2.0f * (r * (dL_dMt_scaled[0][1] - dL_dMt_scaled[1][0]) +
-                         x_q * (dL_dMt_scaled[2][0] + dL_dMt_scaled[0][2]) +
-                         y_q * (dL_dMt_scaled[1][2] + dL_dMt_scaled[2][1]) -
-                         2.0f * z_q * (dL_dMt_scaled[1][1] + dL_dMt_scaled[0][0]));
-        
-        // Atomic accumulation DC SH gradients only (indices 0, 4, 8)
-        // Forward color = sigmoid(sh)
-        // Backward dL/dsh = dL/dcolor * dcolor/dsh = dL/dcolor * color * (1 - color)
-        float3 color = float3(p.color);
-        float3 sigmoid_grad = color * (1.0f - color);
-        float3 sh_grad = dL_dColor * sigmoid_grad;
+    // Process the tile's Gaussians in chunks
+    uint totalCount = range.count;
+    uint numChunks = (totalCount + BACKWARD_CHUNK_SIZE - 1) / BACKWARD_CHUNK_SIZE;
 
-        // Per-pixel gradient clamp sigmoid grad is naturally bounded, but clamp for safety
-        sh_grad = clamp(sh_grad, -1.0f, 1.0f);
+    // Process chunks back-to-front (high sortIdx to low)
+    for (int chunk = int(numChunks) - 1; chunk >= 0; chunk--) {
+        uint chunkStart = range.start + uint(chunk) * BACKWARD_CHUNK_SIZE;
+        uint chunkEnd = min(chunkStart + BACKWARD_CHUNK_SIZE, range.start + totalCount);
+        uint chunkSize = chunkEnd - chunkStart;
 
-        // Atomic gradient accumulation for DC terms only
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0], sh_grad.r, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[4], sh_grad.g, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[8], sh_grad.b, memory_order_relaxed);
+        // Clear threadgroup accumulators (all threads participate)
+        for (uint i = tid; i < BACKWARD_CHUNK_SIZE * NUM_GRAD_COMPONENTS; i += 256) {
+            atomic_store_explicit(&tgGrads[i], 0u, memory_order_relaxed);
+        }
 
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].opacity,
-            dL_dRawOpacity, memory_order_relaxed);
+        // Cache Gaussian indices for this chunk
+        for (uint i = tid; i < chunkSize; i += 256) {
+            tgGaussianIdx[i] = sortedIndices[chunkStart + i];
+        }
 
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_x,
-            dL_dWorldPos.x, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_y,
-            dL_dWorldPos.y, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_z,
-            dL_dWorldPos.z, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Viewspace gradients for density control
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_x,
-            dL_dScreenPos.x, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_y,
-            dL_dScreenPos.y, memory_order_relaxed);
+        // Process chunk back-to-front (each pixel maintains its own T state)
+        for (int sortIdx = int(chunkEnd) - 1; sortIdx >= int(chunkStart); sortIdx--) {
+            uint localIdx = uint(sortIdx) - chunkStart;
+            uint gIdx = tgGaussianIdx[localIdx];
 
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_x,
-            dL_dLogScale.x, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_y,
-            dL_dLogScale.y, memory_order_relaxed);
-        atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_z,
-            dL_dLogScale.z, memory_order_relaxed);
+            // Only process if this pixel contributes to this Gaussian
+            bool process = hasContrib && (uint(sortIdx) < endIdx) && (gIdx < uniforms.numGaussians);
 
-        atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 0,
-            dL_dq.x, memory_order_relaxed);
-        atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 1,
-            dL_dq.y, memory_order_relaxed);
-        atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 2,
-            dL_dq.z, memory_order_relaxed);
-        atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 3,
-            dL_dq.w, memory_order_relaxed);
+            if (process) {
+                ProjectedGaussian p = projected[gIdx];
+
+                if (p.radius > 0) {
+                    float2 d = pixelPos - p.screenPos;
+                    float power = -0.5 * (p.conic.x * d.x * d.x +
+                                          2.0 * p.conic.y * d.x * d.y +
+                                          p.conic.z * d.y * d.y);
+
+                    if (power <= 0.0 && power >= -4.5) {
+                        float G = exp(power);
+                        float alpha = min(p.opacity * G, 0.99f);
+
+                        if (alpha >= 1.0 / 255.0) {
+                            // Update T
+                            T = T / max(1.0 - alpha, 0.01);
+                            float weight = alpha * T;
+
+                            // Color gradient
+                            float3 dL_dColor = dL_dPixel * weight;
+                            float dL_dAlpha = T * dot(dL_dPixel, p.color - accum_rec);
+                            accum_rec = alpha * p.color + (1.0 - alpha) * accum_rec;
+
+                            // Opacity gradient
+                            float sig = p.opacity;
+                            float dAlpha_dRawOp = sig * (1.0 - sig) * G;
+                            float dL_dRawOpacity = clamp(dL_dAlpha * dAlpha_dRawOp, -0.1f, 0.1f);
+
+                            // Screen position gradient
+                            float dL_dG = dL_dAlpha * sig;
+                            float gdx = G * d.x;
+                            float gdy = G * d.y;
+                            float dG_ddelx = -gdx * p.conic.x - gdy * p.conic.y;
+                            float dG_ddely = -gdy * p.conic.z - gdx * p.conic.y;
+                            float2 dL_dScreenPos = dL_dG * float2(-dG_ddelx, -dG_ddely);
+
+                            // World position gradient
+                            float z = p.depth;
+                            float txtz = p.viewPos_xy.x / z;
+                            float tytz = p.viewPos_xy.y / z;
+
+                            float3 dL_dViewPos;
+                            dL_dViewPos.x = dL_dScreenPos.x * fx / z;
+                            dL_dViewPos.y = dL_dScreenPos.y * fy / z;
+                            dL_dViewPos.z = -dL_dScreenPos.x * fx * txtz / z
+                                            -dL_dScreenPos.y * fy * tytz / z;
+
+                            float3 dL_dWorldPos = transpose(viewRot) * dL_dViewPos;
+
+                            // Conic gradient
+                            float3 dL_dConic;
+                            dL_dConic.x = -0.5f * dL_dG * G * d.x * d.x;
+                            dL_dConic.y = -0.5f * dL_dG * G * 2.0f * d.x * d.y;
+                            dL_dConic.z = -0.5f * dL_dG * G * d.y * d.y;
+
+                            // Cov2D gradient
+                            float cov_a = p.cov2D.x;
+                            float cov_b = p.cov2D.y;
+                            float cov_c = p.cov2D.z;
+                            float denom = cov_a * cov_c - cov_b * cov_b;
+                            float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
+
+                            float3 dL_dCov2D;
+                            dL_dCov2D.x = denom2inv * (-cov_c * cov_c * dL_dConic.x
+                                                       + 2.0f * cov_b * cov_c * dL_dConic.y
+                                                       + (denom - cov_a * cov_c) * dL_dConic.z);
+                            dL_dCov2D.z = denom2inv * (-cov_a * cov_a * dL_dConic.z
+                                                       + 2.0f * cov_a * cov_b * dL_dConic.y
+                                                       + (denom - cov_a * cov_c) * dL_dConic.x);
+                            dL_dCov2D.y = denom2inv * 2.0f * (cov_b * cov_c * dL_dConic.x
+                                                              - (denom + 2.0f * cov_b * cov_b) * dL_dConic.y
+                                                              + cov_a * cov_b * dL_dConic.z);
+
+                            // Cov3D gradient
+                            float3 t_cam = float3(p.viewPos_xy, p.depth);
+                            float J00 = fx / t_cam.z;
+                            float J02 = -fx * (t_cam.x / t_cam.z) / t_cam.z;
+                            float J11 = fy / t_cam.z;
+                            float J12 = -fy * (t_cam.y / t_cam.z) / t_cam.z;
+
+                            float3x3 J = float3x3(
+                                float3(J00, 0, 0),
+                                float3(0, J11, 0),
+                                float3(J02, J12, 0)
+                            );
+
+                            float3x3 T_mat = J * viewRot;
+                            float3x3 dL_dCov2D_mat = float3x3(
+                                float3(dL_dCov2D.x, dL_dCov2D.y, 0),
+                                float3(dL_dCov2D.y, dL_dCov2D.z, 0),
+                                float3(0, 0, 0)
+                            );
+                            float3x3 dL_dCov3D = transpose(T_mat) * dL_dCov2D_mat * T_mat;
+
+                            // Scale and Rotation gradients
+                            Gaussian g_orig = gaussians[gIdx];
+                            float3 scale = exp(clamp(g_orig.scale, -MAX_SCALE, MAX_SCALE));
+
+                            float4 q = g_orig.rotation;
+                            float r = q.x;
+                            float x_q = q.y;
+                            float y_q = q.z;
+                            float z_q = q.w;
+
+                            float3x3 R = quatToMat(q);
+                            float3x3 S = float3x3(
+                                float3(scale.x, 0, 0),
+                                float3(0, scale.y, 0),
+                                float3(0, 0, scale.z)
+                            );
+                            float3x3 M = R * S;
+                            float3x3 dL_dM = 2.0f * dL_dCov3D * M;
+
+                            float3x3 Rt = transpose(R);
+                            float3x3 Rt_dLdM = Rt * dL_dM;
+                            float3 dL_dScale_val = float3(Rt_dLdM[0][0], Rt_dLdM[1][1], Rt_dLdM[2][2]);
+                            float3 dL_dLogScale = dL_dScale_val * scale;
+
+                            float3x3 dL_dR = float3x3(
+                                dL_dM[0] * scale.x,
+                                dL_dM[1] * scale.y,
+                                dL_dM[2] * scale.z
+                            );
+                            float3x3 dL_dMt_scaled = transpose(dL_dR);
+
+                            // Quaternion gradient
+                            float4 dL_dq;
+                            dL_dq.x = 2.0f * (z_q * (dL_dMt_scaled[0][1] - dL_dMt_scaled[1][0]) +
+                                             y_q * (dL_dMt_scaled[2][0] - dL_dMt_scaled[0][2]) +
+                                             x_q * (dL_dMt_scaled[1][2] - dL_dMt_scaled[2][1]));
+                            dL_dq.y = 2.0f * (y_q * (dL_dMt_scaled[1][0] + dL_dMt_scaled[0][1]) +
+                                             z_q * (dL_dMt_scaled[2][0] + dL_dMt_scaled[0][2]) +
+                                             r * (dL_dMt_scaled[1][2] - dL_dMt_scaled[2][1]) -
+                                             2.0f * x_q * (dL_dMt_scaled[2][2] + dL_dMt_scaled[1][1]));
+                            dL_dq.z = 2.0f * (x_q * (dL_dMt_scaled[1][0] + dL_dMt_scaled[0][1]) +
+                                             r * (dL_dMt_scaled[2][0] - dL_dMt_scaled[0][2]) +
+                                             z_q * (dL_dMt_scaled[1][2] + dL_dMt_scaled[2][1]) -
+                                             2.0f * y_q * (dL_dMt_scaled[2][2] + dL_dMt_scaled[0][0]));
+                            dL_dq.w = 2.0f * (r * (dL_dMt_scaled[0][1] - dL_dMt_scaled[1][0]) +
+                                             x_q * (dL_dMt_scaled[2][0] + dL_dMt_scaled[0][2]) +
+                                             y_q * (dL_dMt_scaled[1][2] + dL_dMt_scaled[2][1]) -
+                                             2.0f * z_q * (dL_dMt_scaled[1][1] + dL_dMt_scaled[0][0]));
+
+                            // SH gradient (DC terms only)
+                            float3 color = float3(p.color);
+                            float3 sigmoid_grad = color * (1.0f - color);
+                            float3 sh_grad = clamp(dL_dColor * sigmoid_grad, -1.0f, 1.0f);
+
+                            // Accumulate to threadgroup memory using SIMD-reduced atomics
+                            // SIMD reduction first: 256 threads -> 8 simd groups -> 8 atomics
+                            // This reduces CAS contention by ~32x
+                            uint baseIdx = localIdx * NUM_GRAD_COMPONENTS;
+                            simdAtomicAddTG(&tgGrads[baseIdx + 0], dL_dWorldPos.x);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 1], dL_dWorldPos.y);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 2], dL_dWorldPos.z);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 3], dL_dRawOpacity);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 4], dL_dLogScale.x);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 5], dL_dLogScale.y);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 6], dL_dLogScale.z);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 7], dL_dq.x);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 8], dL_dq.y);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 9], dL_dq.z);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 10], dL_dq.w);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 11], sh_grad.r);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 12], sh_grad.g);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 13], sh_grad.b);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 14], dL_dScreenPos.x);
+                            simdAtomicAddTG(&tgGrads[baseIdx + 15], dL_dScreenPos.y);
+                        }
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write accumulated gradients to global memory
+        // Each thread handles some of the Gaussians in the chunk
+        for (uint i = tid; i < chunkSize; i += 256) {
+            uint gIdx = tgGaussianIdx[i];
+            uint baseIdx = i * NUM_GRAD_COMPONENTS;
+
+            // Load from threadgroup (uint bits -> float) and write non-zero to global
+            float val;
+
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 0], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_x, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 1], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_y, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 2], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].position_z, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 3], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].opacity, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 4], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_x, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 5], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_y, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 6], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].scale_z, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 7], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 0, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 8], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 1, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 9], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 2, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 10], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit(((device atomic_float*)&gradients[gIdx].rotation) + 3, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 11], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[0], val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 12], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[4], val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 13], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].sh[8], val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 14], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_x, val, memory_order_relaxed);
+            val = as_type<float>(atomic_load_explicit(&tgGrads[baseIdx + 15], memory_order_relaxed));
+            if (val != 0) atomic_fetch_add_explicit((device atomic_float*)&gradients[gIdx].viewspace_grad_y, val, memory_order_relaxed);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
