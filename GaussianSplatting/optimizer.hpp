@@ -8,6 +8,8 @@
 #pragma once
 #include <Metal/Metal.hpp>
 #include <simd/simd.h>
+#include <vector>
+#include <utility>
 
 // Adam optimizer parameters structure
 struct AdamParams {
@@ -29,33 +31,52 @@ public:
     void step(MTL::CommandQueue* queue,
               MTL::Buffer* gausians,
               MTL::Buffer* gradients,
-               // Official default
-              float lr_position = 0.00016f,  
-              // Official default
-              float lr_scale = 0.005f,        
-              // Official default
-              float lr_rotation = 0.001f,     
-              // Official default
-              float lr_opacity = 0.05f,       
-              // Official default
-              float lr_sh = 0.0025f);         
-    
+              float lr_position = 0.00016f,
+              float lr_scale = 0.005f,
+              float lr_rotation = 0.001f,
+              float lr_opacity = 0.05f,
+              float lr_sh = 0.0025f,
+              float lr_sh_rest = 0.000125f,  
+              float maxLogScaleTrain = 4.0f,
+              bool wait = true);
+
+    // Wait for the last async step to complete (call before reading Gaussian buffer)
+    void waitForLastStep();
+
     void reset();
     
-    // Resize buffers when Gaussian count increases (after density control)
+    // Resize buffers when Gaussian count increases 
     void resizeIfNeeded(size_t newNumGaussians);
-    
+
+    // Set actual Gaussian count
+    void setGaussianCount(size_t count) { resizeIfNeeded(count); }
+
     // Reset opacity momentum after opacity reset
     void resetOpacityMomentum();
-    
-    // Reset scale momentum after opacity reset (optimization landscape changes)
+
+    // Reset position momentum after opacity reset 
+    void resetPositionMomentum();
+
+    // Reset scale momentum after opacity reset 
     void resetScaleMomentum();
-    
-    // Reset SH momentum after opacity reset (colors may need to re-adapt)
+
+    // Reset rotation momentum after opacity reset
+    void resetRotationMomentum();
+
+    // Reset SH momentum after opacity reset 
     void resetSHMomentum();
-    
-    // Reset Adam state for new Gaussians starting at startIdx (after split/clone)
+
+    // Reset Adam state for new Gaussians starting at startIdx 
     void resetStateForNewGaussians(size_t startIdx);
+
+    // Reset ALL Adam momentum 
+    // Must be called after density control which rearranges Gaussian indices
+    void resetAllMomentum();
+
+    // Remap momentum buffers after density control using old→new index mapping
+    // Preserves momentum for surviving Gaussians, zeros momentum for new ones
+    void remapMomentum(const std::vector<std::pair<size_t, size_t>>& indexMapping,
+                       size_t newCount);
     
     // Debug print Adam state for first Gaussian
     void debugPrintState(int gaussianIdx = 0);
@@ -94,9 +115,11 @@ private:
     
     // Adam parameters buffer
     MTL::Buffer* paramsBuffer;
-    
-    size_t numGaussians;
+
+    size_t numGaussians;      // Actual Gaussian count
+    size_t bufferCapacity;    // Allocated buffer capacity
     uint32_t timestep = 0;
+    MTL::CommandBuffer* lastCmdBuffer = nullptr;  // For async step
     
     // Allocate or reallocate Adam state buffers
     void allocateBuffers(size_t count);

@@ -152,21 +152,25 @@ private:
     MTL::Buffer* totalLossBuffer = nullptr;
     
     // 0.2 weight for D-SSIM
-    float lambdaDSSIM = 0.2f;  
+    float lambdaDSSIM = 0.2f;
     void createLossPipeline();
     float computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth);
+    void encodeLossAsync(MTL::Texture* rendered, MTL::Texture* groundTruth);
+    float readLossValue();
+    uint32_t lastLossPixelCount = 0;
     
     // Tiled rasterizer for training
     TiledRasterizer* tiledRasterizer = nullptr;
     MTL::Buffer* gaussianGradients = nullptr;
     
     // Training step with learning rate parameters
-    float trainStep(size_t imageIndex, 
+    float trainStep(size_t imageIndex,
                     float lr_position = 0.00016f,
                     float lr_scale = 0.005f,
                     float lr_rotation = 0.001f,
                     float lr_opacity = 0.05f,
-                    float lr_sh = 0.0025f);
+                    float lr_sh = 0.0025f,
+                    float lr_sh_rest = 0.000125f);
     void updatePositionBuffer();
     
     // Optimizer and density control

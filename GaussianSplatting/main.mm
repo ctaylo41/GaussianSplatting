@@ -131,12 +131,13 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
         
         // Get initial scale
         float scale = initialScales[i];
-        
+
+        // Apply a global scaling factor to better fit the scene and ensure gradients flow at the start
+        scale *= 0.7f;
+
         // Clamp scale to reasonable range relative to scene
-         // Very small minimum
-        float minScale = 0.0001f * sceneExtent; 
-        // Reasonable maximum
-        float maxScale = 0.1f * sceneExtent;     
+        float minScale = 0.0001f * sceneExtent;
+        float maxScale = 0.1f * sceneExtent;
         scale = std::clamp(scale, minScale, maxScale);
         
         // Convert to log space
@@ -155,18 +156,16 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
         for (int j = 0; j < 12; j++) {
             g.sh[j] = 0.0f;
         }
-        
-        // Set DC terms indices 0, 4, 8 using logit inverse sigmoid
-        // Forward color = sigmoid(sh) 
-        // so sh = logit(color) = log(color / (1 - color))
-        // Clamp colors to avoid infinity at 0 and 1
-        auto safeLogit = [](float c) -> float {
-            c = fmaxf(0.001f, fminf(0.999f, c));
-            return logf(c / (1.0f - c));
+
+        // Set DC terms indices 0, 4, 8
+        // Official 3DGS formula: color = SH_C0 * dc + 0.5
+        // So dc = (color - 0.5) / SH_C0 (RGB2SH conversion)
+        auto RGB2SH = [SH_C0](float c) -> float {
+            return (c - 0.5f) / SH_C0;
         };
-        g.sh[0] = safeLogit(pt.color.x);
-        g.sh[4] = safeLogit(pt.color.y);
-        g.sh[8] = safeLogit(pt.color.z);
+        g.sh[0] = RGB2SH(pt.color.x);
+        g.sh[4] = RGB2SH(pt.color.y);
+        g.sh[8] = RGB2SH(pt.color.z);
         
         gaussians.push_back(g);
     }
@@ -198,13 +197,13 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
 
 int main(int argc, char* argv[]) {
     // Default paths can be overridden with command line args
-    std::string colmapPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/sparse/0";
-    std::string imagePath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/images_4";
-    std::string outputPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_bike.ply";
-    // 30k Iterations for 108 images
-    size_t numEpochs = 155;
+    std::string colmapPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/sparse_kitchen/0";
+    std::string imagePath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/images_4_kitchen";
+    std::string outputPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_kitchen.ply";
+    // 30k Iterations for 194 images
+    size_t numEpochs = 108;
     bool viewOnly = false;
-    std::string viewPlyPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_bike.ply";
+    std::string viewPlyPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_kitchen.ply";
     
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -335,13 +334,13 @@ int main(int argc, char* argv[]) {
         printf("SH[0] (R DC): %.4f\n", gaussians[0].sh[0]);
         printf("SH[4] (G DC): %.4f\n", gaussians[0].sh[4]);
         printf("SH[8] (B DC): %.4f\n", gaussians[0].sh[8]);
-        
-        // Verify color recovery using sigmoid activation
-        auto sigmoid = [](float x) { return 1.0f / (1.0f + expf(-x)); };
-        float r = sigmoid(gaussians[0].sh[0]);
-        float g = sigmoid(gaussians[0].sh[4]);
-        float b = sigmoid(gaussians[0].sh[8]);
-        printf("Recovered color (sigmoid): (%.4f, %.4f, %.4f)\n", r, g, b);
+
+        // Verify color recovery using official 3DGS formula: color = SH_C0 * dc + 0.5
+        const float SH_C0 = 0.28209479177387814f;
+        float r = SH_C0 * gaussians[0].sh[0] + 0.5f;
+        float g = SH_C0 * gaussians[0].sh[4] + 0.5f;
+        float b = SH_C0 * gaussians[0].sh[8] + 0.5f;
+        printf("Recovered color (SH_C0*dc+0.5): (%.4f, %.4f, %.4f)\n", r, g, b);
     }
 
     // Compute bounding box

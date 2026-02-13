@@ -12,23 +12,29 @@
 #include <algorithm>
 #include "gradients.hpp"
 // Apples GCD for parallel operations
-#include <dispatch/dispatch.h> 
+#include <dispatch/dispatch.h>
+#include <random>
 
 // Number of threads for parallel operations
 static const int NUM_THREADS = 8;
+
+// Deterministic RNG for split offsets
+static std::mt19937 splitRng(42);
 
 // Papers recommended threshold
 
 // densify_grad_threshold
 static constexpr float GRAD_THRESHOLD = 0.0002f;
 // Opacity prune threshold minimum opacity below which to prune
-static constexpr float OPACITY_PRUNE_THRESHOLD = 0.005f;
+static constexpr float OPACITY_PRUNE_THRESHOLD = 0.01f;
 // Brightness prune threshold prune if max(R,G,B) < this
 static constexpr float MIN_BRIGHTNESS_THRESHOLD = 0.02f;
 static constexpr float SH_C0 = 0.28209479177387814f;
 // percent_dense for clone vs split
 static constexpr float PERCENT_DENSE = 0.01f; 
-static constexpr size_t MAX_GAUSSIANS = 1000000;
+// Buffer pre-allocation size no runtime cap on Gaussian count.
+// Density control prune vs clone/split naturally regulates count.
+static constexpr size_t MAX_GAUSSIANS = 2000000;
 // Start densification
 static constexpr size_t DENSIFY_FROM_ITER = 500;      
 // Stop densification
@@ -37,8 +43,10 @@ static constexpr size_t DENSIFY_UNTIL_ITER = 15000;
 static constexpr float MAX_SCALE_LOG = 4.0f;
 // Opacity reset interval skip density control around these iterations 3000, 6000, 9000, 12000
 static constexpr size_t OPACITY_RESET_INTERVAL = 3000;
-// Warm-up iterations after opacity reset before resuming density control
-static constexpr size_t OPACITY_RESET_WARMUP = 500;          
+// Warmup window after each opacity reset.
+// During this window, disable opacity screen-size pruning so coverage can recover
+// before aggressive pruning resumes.
+static constexpr size_t OPACITY_RESET_WARMUP = 1000;
 
 // Scene extent set during initialization
 static float sceneExtent = 1.0f; 
@@ -90,8 +98,67 @@ DensityController::~DensityController() {
     if (maxRadii2D) maxRadii2D->release();
 }
 
+// Ensure internal buffers can accommodate required Gaussian count
+void DensityController::ensureCapacity(size_t requiredCount) {
+    // No need to grow if current capacity suffices
+    if (requiredCount <= maxGaussians) {
+        return;
+    }
+
+
+    // Compute new capacity 1.5x growth to balance reallocations vs memory usage
+    size_t oldCapacity = maxGaussians;
+    size_t newCapacity = std::max(requiredCount, maxGaussians + maxGaussians / 2);
+
+    // Allocate new buffers
+    MTL::Buffer* newGradientAccum = device->newBuffer(newCapacity * sizeof(float), MTL::ResourceStorageModeShared);
+    MTL::Buffer* newGradientCount = device->newBuffer(newCapacity * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* newMarkerBuffer = device->newBuffer(newCapacity * sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* newPositionGradAccum = device->newBuffer(newCapacity * sizeof(simd_float3), MTL::ResourceStorageModeShared);
+    MTL::Buffer* newMaxRadii2D = device->newBuffer(newCapacity * sizeof(float), MTL::ResourceStorageModeShared);
+
+    // Check allocations
+    if (!newGradientAccum || !newGradientCount || !newMarkerBuffer || !newPositionGradAccum || !newMaxRadii2D) {
+        std::cerr << "DensityController: failed to grow internal buffers to " << newCapacity << std::endl;
+        std::abort();
+    }
+
+    // Initialize new buffers to zero
+    memset(newGradientAccum->contents(), 0, newCapacity * sizeof(float));
+    memset(newGradientCount->contents(), 0, newCapacity * sizeof(uint32_t));
+    memset(newMarkerBuffer->contents(), 0, newCapacity * sizeof(uint32_t));
+    memset(newPositionGradAccum->contents(), 0, newCapacity * sizeof(simd_float3));
+    memset(newMaxRadii2D->contents(), 0, newCapacity * sizeof(float));
+
+    // Copy old data to new buffers
+    memcpy(newGradientAccum->contents(), gradientAccum->contents(), oldCapacity * sizeof(float));
+    memcpy(newGradientCount->contents(), gradientCount->contents(), oldCapacity * sizeof(uint32_t));
+    memcpy(newMarkerBuffer->contents(), markerBuffer->contents(), oldCapacity * sizeof(uint32_t));
+    memcpy(newPositionGradAccum->contents(), positionGradAccum->contents(), oldCapacity * sizeof(simd_float3));
+    memcpy(newMaxRadii2D->contents(), maxRadii2D->contents(), oldCapacity * sizeof(float));
+
+    // Release old buffers
+    gradientAccum->release();
+    gradientCount->release();
+    markerBuffer->release();
+    positionGradAccum->release();
+    maxRadii2D->release();
+
+    // Update pointers and capacity
+    gradientAccum = newGradientAccum;
+    gradientCount = newGradientCount;
+    markerBuffer = newMarkerBuffer;
+    positionGradAccum = newPositionGradAccum;
+    maxRadii2D = newMaxRadii2D;
+    maxGaussians = newCapacity;
+
+    std::cout << "Density control buffers grown: " << oldCapacity << " -> " << newCapacity << std::endl;
+}
+
 // Reset accumulators
 void DensityController::resetAccumulator(size_t gaussianCount) {
+    ensureCapacity(gaussianCount);
+
     // Reset accumulators to zero using memset
     memset(gradientAccum->contents(), 0, gaussianCount * sizeof(float));
     memset(gradientCount->contents(), 0, gaussianCount * sizeof(uint32_t));
@@ -103,6 +170,7 @@ void DensityController::resetAccumulator(size_t gaussianCount) {
 void DensityController::accumulateGradients(MTL::CommandQueue* queue,
                                             MTL::Buffer* gradients,
                                             size_t gaussianCount) {
+    ensureCapacity(gaussianCount);
     
     // Must match gradients.hpp and tiled_shaders.metal
     struct GaussianGradients {
@@ -139,10 +207,7 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
             float gradMag = sqrtf(grads[i].viewspace_grad_x * grads[i].viewspace_grad_x +
                                   grads[i].viewspace_grad_y * grads[i].viewspace_grad_y);
             
-            // Clamp gradient magnitude to prevent explosive accumulation
-            // This is critical around opacity reset when gradients can spike
-            const float MAX_GRAD_MAG = 1.0f;
-            gradMag = std::min(gradMag, MAX_GRAD_MAG);
+            // No gradient magnitude clamping 
             
             // Only accumulate valid gradients
             if (!std::isnan(gradMag) && !std::isinf(gradMag) && gradMag > 0.0f) {
@@ -162,6 +227,11 @@ void DensityController::accumulateGradients(MTL::CommandQueue* queue,
 // Accumulate screen-space radii from rasterizer for accurate size-based pruning
 void DensityController::accumulateRadii(MTL::Buffer* projectedGaussians,
                                         size_t gaussianCount) {
+    ensureCapacity(gaussianCount);
+    if (!projectedGaussians) {
+        return;
+    }
+
     // ProjectedGaussian structure must match tiled_rasterizer.hpp
     struct ProjectedGaussian {
         simd_float2 screenPos;
@@ -174,26 +244,44 @@ void DensityController::accumulateRadii(MTL::Buffer* projectedGaussians,
         uint32_t tileMinY;
         uint32_t tileMaxX;
         uint32_t tileMaxY;
-        float _pad1;
+        uint8_t colorClamped[3]; 
+        uint8_t _pad1;
         simd_float2 viewPos_xy;
         float cov2D[3];
-        float _pad2;
+        float viewDir[3];
     };
-    
-    ProjectedGaussian* projected = (ProjectedGaussian*)projectedGaussians->contents();
-    float* maxRadii = (float*)maxRadii2D->contents();
-    
 
-    
-    // Update max radius for each Gaussian
-    for (size_t i = 0; i < gaussianCount; i++) {
-        float currentRadius = projected[i].radius;
-        // Track maximum radius seen across all views
-        if (currentRadius > maxRadii[i]) {
-            maxRadii[i] = currentRadius;
-        }
+    // Clamp processing to buffer capacity to avoid out-of-bounds access
+    size_t projectedCapacity = projectedGaussians->length() / sizeof(ProjectedGaussian);
+    size_t countToProcess = std::min(gaussianCount, projectedCapacity);
+    if (countToProcess == 0) {
+        return;
     }
     
+    // Access buffer contents
+    ProjectedGaussian* projected = (ProjectedGaussian*)projectedGaussians->contents();
+    float* maxRadii = (float*)maxRadii2D->contents();
+
+    // If projected buffer is smaller than Gaussian count, log a warning and only process what fits
+    if (countToProcess < gaussianCount) {
+        memset(maxRadii + countToProcess, 0, (gaussianCount - countToProcess) * sizeof(float));
+        std::cerr << "WARNING: accumulateRadii clamped to projected buffer capacity "
+                  << projectedCapacity << " (requested " << gaussianCount << ")" << std::endl;
+    }
+
+    // Parallel update of max radii using GCD
+    dispatch_queue_t dispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+    size_t chunkSize = (countToProcess + NUM_THREADS - 1) / NUM_THREADS;
+    dispatch_apply((size_t)NUM_THREADS, dispatchQueue, ^(size_t t) {
+        size_t start = t * chunkSize;
+        size_t end = std::min(start + chunkSize, countToProcess);
+        for (size_t i = start; i < end; i++) {
+            float currentRadius = projected[i].radius;
+            if (currentRadius > maxRadii[i]) {
+                maxRadii[i] = currentRadius;
+            }
+        }
+    });
 
 }
 
@@ -209,25 +297,22 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
                                       float maxScale,
                                       float focalLength,
                                       float imageWidth,
-                                      float avgDepth) {
+                                      float avgDepth,
+                                      bool pruneOnly) {
+
+    ensureCapacity(gaussianCount);
 
     DensityStats stats = {0, 0, 0};
     
-    // Skip density control during opacity reset warmup period
-    // This prevents bad decisions with post-reset low opacities
-    if (isInOpacityResetWarmup(iteration)) {
-        std::cout << "Skipping density control - opacity reset warmup (iter " << iteration << ")" << std::endl;
-        resetAccumulator(gaussianCount);
-        return stats;
-    }
+    const bool inOpacityResetWarmup = isInOpacityResetWarmup(iteration);
     
     // Check if we should densify at this iteration
-    bool canDensify = (iteration > DENSIFY_FROM_ITER && iteration < DENSIFY_UNTIL_ITER);
+    // prune only mode is used to recover opacity
+    bool canDensify = !pruneOnly && (iteration >= DENSIFY_FROM_ITER && iteration < DENSIFY_UNTIL_ITER);
     
-    // If past densify_until_iter just return
+    // If past densify_until_iter, return early
     if (iteration >= DENSIFY_UNTIL_ITER) {
         std::cout << "Densification stopped at iteration " << iteration << std::endl;
-        resetAccumulator(gaussianCount);
         return stats;
     }
     
@@ -241,94 +326,104 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     // Access max_radii2D buffer actual screen radii from rasterizer
     float* maxRadii = (float*)maxRadii2D->contents();
     
-    // Fixed percentile-based screen pruning threshold
-    // Prevents death spiral from recalculating percentile every iteration
-    static float maxScreenPixels = -1.0f;
-    static bool thresholdComputed = false;
-    
-    // Dont enable screen pruning until well after opacity reset and warmup
-    // This prevents mass-pruning of large Gaussians before they've adapted
-    const bool enableScreenPruning = (iteration > OPACITY_RESET_INTERVAL + OPACITY_RESET_WARMUP + 200);
-    
-    // Compute threshold once at first densification after opacity reset
-    if (enableScreenPruning && !thresholdComputed && gaussianCount > 100) {
-        // Copy radii to vector for percentile calculation
-        std::vector<float> radiiCopy(maxRadii, maxRadii + gaussianCount);
-        
-        // Find 95th percentile using nth_element
-        size_t percentileIdx = size_t(gaussianCount * 0.95f);
-        std::nth_element(radiiCopy.begin(), radiiCopy.begin() + percentileIdx, radiiCopy.end());
-        maxScreenPixels = radiiCopy[percentileIdx];
-        
-        // Dont prune too aggressively or too loosely
-        maxScreenPixels = std::clamp(maxScreenPixels, 50.0f, 300.0f);
-        thresholdComputed = true;
-        
-        std::cout << "*** FIXED screen pruning threshold computed: " << maxScreenPixels << " pixels (will not change) ***" << std::endl;
-    }
+    // Determine pruning thresholds and strategies based on iteration and warmup status
+    const bool enableSizePruning = (iteration >= DENSIFY_FROM_ITER && iteration < DENSIFY_UNTIL_ITER);
+    const bool enableScreenPruning = (iteration > OPACITY_RESET_INTERVAL) && !inOpacityResetWarmup;
+    static constexpr float screenPruneThreshold = 40.0f;
+    static constexpr float screenPruneOpacityGate = 0.35f;
     
     // Per thread counters for parallel first pass
     static uint32_t threadPruned[NUM_THREADS];
     static uint32_t threadCloned[NUM_THREADS];
     static uint32_t threadSplit[NUM_THREADS];
-    static uint32_t threadPrunedBlack[NUM_THREADS];
+    static uint32_t threadCorrupted[NUM_THREADS];
 
     // Reset per thread counters
     memset(threadPruned, 0, sizeof(threadPruned));
     memset(threadCloned, 0, sizeof(threadCloned));
     memset(threadSplit, 0, sizeof(threadSplit));
-    memset(threadPrunedBlack, 0, sizeof(threadPrunedBlack));
-    
+    memset(threadCorrupted, 0, sizeof(threadCorrupted));
+
     // Capture locals for block
     const float splitThreshold = PERCENT_DENSE * sceneExtent;
     const float pruneThreshold = 0.1f * sceneExtent;
-    
+
     // Parallel first pass to decide prune clone split
     dispatch_queue_t dispatchQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
     size_t chunkSize = (gaussianCount + NUM_THREADS - 1) / NUM_THREADS;
-    
+
     // First pass decide what to do with each Gaussian
     dispatch_apply((size_t)NUM_THREADS, dispatchQueue, ^(size_t t) {
         // Compute chunk range
         size_t start = t * chunkSize;
         size_t end = std::min(start + chunkSize, gaussianCount);
-        
-        uint32_t localPruned = 0, localCloned = 0, localSplit = 0, localPrunedBlack = 0;
-        
+
+        uint32_t localPruned = 0, localCloned = 0, localSplit = 0;
+
         // Process Gaussians in this chunk
         for (size_t i = start; i < end; i++) {
             Gaussian& g = gaussians[i];
-            
+
+            // Check for corrupted Gaussians NaN/inf always prune these
+            bool isCorrupted = std::isnan(g.position.x) || std::isnan(g.position.y) || std::isnan(g.position.z) ||
+                               std::isinf(g.position.x) || std::isinf(g.position.y) || std::isinf(g.position.z) ||
+                               std::isnan(g.opacity) || std::isinf(g.opacity) ||
+                               std::isnan(g.scale.x) || std::isnan(g.scale.y) || std::isnan(g.scale.z) ||
+                               std::isinf(g.scale.x) || std::isinf(g.scale.y) || std::isinf(g.scale.z) ||
+                               std::isnan(g.rotation.x) || std::isnan(g.rotation.y) ||
+                               std::isnan(g.rotation.z) || std::isnan(g.rotation.w) ||
+                               std::isinf(g.rotation.x) || std::isinf(g.rotation.y) ||
+                               std::isinf(g.rotation.z) || std::isinf(g.rotation.w);
+
+            // Check SH coefficients for NaN/inf
+            if (!isCorrupted) {
+                for (int j = 0; j < 12; j++) {
+                    if (std::isnan(g.sh[j]) || std::isinf(g.sh[j])) {
+                        isCorrupted = true;
+                        break;
+                    }
+                }
+            }
+
+            if (isCorrupted) {
+                markers[i] = 1;  // Prune
+                localPruned++;
+                threadCorrupted[t]++;
+                continue;
+            }
+
             // Compute sigmoid opacity
             float opacity = 1.0f / (1.0f + expf(-g.opacity));
             
             // Get average gradient
             float avgGrad = (counts[i] > 0) ? (accumGrad[i] / counts[i]) : 0.0f;
             
-            // Compute max scale in world units applying exp to log scale
-            float maxScaleVal = fmaxf(fmaxf(
-                expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
-                expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG))),
-                expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG)));
+            // Compute scale values in world units applying exp to log scale
+            float sx = expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG));
+            float sy = expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG));
+            float sz = expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG));
+            float maxScaleVal = fmaxf(fmaxf(sx, sy), sz);
             
-            // prune_mask
-            bool shouldPrune = (opacity < OPACITY_PRUNE_THRESHOLD);
+            // prune_mask 
+            bool shouldPrune = (!inOpacityResetWarmup && opacity < minOpacity);
+            
+            // Size-based pruning official 3DGS only enables after first opacity_reset_interval
+            if (enableSizePruning) {
+                if (maxScaleVal > pruneThreshold) {
+                    shouldPrune = true;
+                }
 
-            // Additional prune if very very dark
-            if (canDensify && iteration > OPACITY_RESET_INTERVAL && maxScaleVal > pruneThreshold) {
-                shouldPrune = true;
-            }
-            
-            // Optionally prune based on screen-space radius using adaptive percentile-based
-            if (enableScreenPruning && maxRadii[i] > maxScreenPixels) {
-                shouldPrune = true;
+                // Screen-space pruning big_points_vs
+                if (enableScreenPruning && maxRadii[i] > screenPruneThreshold && opacity < screenPruneOpacityGate) {
+                    shouldPrune = true;
+                }
             }
             
             // Mark accordingly and prune
             if (shouldPrune) {
                 markers[i] = 1;
                 localPruned++;
-            } else if (canDensify && avgGrad > GRAD_THRESHOLD) {
+            } else if (canDensify && avgGrad > gradThreshold) {
                 // Clone if small Split if large
                 if (maxScaleVal > splitThreshold) {
                     // Split large Gaussians
@@ -343,7 +438,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
                 }
             } else {
                 // Keep
-                markers[i] = 0;  
+                markers[i] = 0;
             }
         }
         
@@ -351,7 +446,6 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
         threadPruned[t] = localPruned;
         threadCloned[t] = localCloned;
         threadSplit[t] = localSplit;
-        threadPrunedBlack[t] = localPrunedBlack;
     });
 
     // Sum up thread-local counters
@@ -360,33 +454,9 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
         stats.numCloned += threadCloned[t];
         stats.numSplit += threadSplit[t];
     }
-    
-    // Check capacity
+
+    // Compute new count no artificial caps, density control self-regulates
     size_t newCount = gaussianCount - stats.numPruned + stats.numCloned + stats.numSplit;
-    
-    if (newCount > MAX_GAUSSIANS) {
-        size_t excess = newCount - MAX_GAUSSIANS;
-        
-        // Reduce clones first
-        for (size_t i = 0; i < gaussianCount && excess > 0; i++) {
-            if (markers[i] == 2) {
-                markers[i] = 0;
-                stats.numCloned--;
-                excess--;
-            }
-        }
-        
-        // Then reduce splits
-        for (size_t i = 0; i < gaussianCount && excess > 0; i++) {
-            if (markers[i] == 3) {
-                markers[i] = 0;
-                stats.numSplit--;
-                excess--;
-            }
-        }
-        // Recompute new count
-        newCount = gaussianCount - stats.numPruned + stats.numCloned + stats.numSplit;
-    }
     
     // Allocate new buffers
     MTL::Buffer* newGaussianBuffer = device->newBuffer(newCount * sizeof(Gaussian), MTL::ResourceStorageModeShared);
@@ -396,31 +466,52 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     Gaussian* newGaussians = (Gaussian*)newGaussianBuffer->contents();
     simd_float3* newPositions = (simd_float3*)newPositionsBuffer->contents();
     
-    // Second pass to build new arrays
+    // Second pass to build new arrays and populate index mapping for momentum remapping
+    stats.indexMapping.clear();
+    stats.indexMapping.reserve(gaussianCount - stats.numPruned);
+
     size_t writeIdx = 0;
     for (size_t i = 0; i < gaussianCount; i++) {
         Gaussian& g = gaussians[i];
         uint32_t marker = markers[i];
-        
+
         if (marker == 1) {
-            // Pruned
-            continue;  
+            // Pruned no mapping momentum discarded
+            continue;
         }
-        
+
         if (marker == 0) {
-            // Keep as is
+            // Keep as is record old->new mapping for momentum preservation
+            stats.indexMapping.push_back({i, writeIdx});
             newGaussians[writeIdx] = g;
             newPositions[writeIdx] = g.position;
             writeIdx++;
         } else if (marker == 2) {
-            // Clone and Keep original
+            // Clone ecord mapping for original only 
+            stats.indexMapping.push_back({i, writeIdx});
             newGaussians[writeIdx] = g;
             newPositions[writeIdx] = g.position;
             writeIdx++;
-            
+
             Gaussian cloned = g;
-            
-            // Write clone at same position
+
+            // Offset clone along position gradient direction to break symmetry and prevent self-reinforcing cloning
+            simd_float3 posGrad = posGradAccum[i];
+            float gradNorm = sqrtf(posGrad.x*posGrad.x + posGrad.y*posGrad.y + posGrad.z*posGrad.z);
+            if (gradNorm > 1e-7f) {
+                // Gaussian's world-space extent max axis
+                float maxScaleVal = fmaxf(fmaxf(
+                    expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
+                    expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG))),
+                    expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG)));
+                // Offset magnitude proportional to Gaussian size to ensure clones are sufficiently separated, even for small Gaussians with high gradients
+                float offsetMag = maxScaleVal * 2.0f;
+                cloned.position.x += (posGrad.x / gradNorm) * offsetMag;
+                cloned.position.y += (posGrad.y / gradNorm) * offsetMag;
+                cloned.position.z += (posGrad.z / gradNorm) * offsetMag;
+            }
+
+            // Write clone at offset position (no mapping - fresh momentum)
             newGaussians[writeIdx] = cloned;
             newPositions[writeIdx] = cloned.position;
             writeIdx++;
@@ -441,9 +532,10 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             float maxS = fmaxf(fmaxf(scale.x, scale.y), scale.z);
             
             // Random direction scaled by Gaussian
-            float rx = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-            float ry = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-            float rz = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            float rx = dist(splitRng);
+            float ry = dist(splitRng);
+            float rz = dist(splitRng);
             float rNorm = sqrtf(rx*rx + ry*ry + rz*rz);
             if (rNorm > 0.001f) {
                 rx /= rNorm; ry /= rNorm; rz /= rNorm;
@@ -499,7 +591,18 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     std::cout << "Density control: pruned=" << stats.numPruned
               << " cloned=" << stats.numCloned
               << " split=" << stats.numSplit
-              << " total=" << gaussianCount << std::endl;
+              << " total=" << gaussianCount;
+    if (inOpacityResetWarmup) {
+        std::cout << " [WARMUP: prune relaxed]";
+    }
+    if (pruneOnly) {
+        std::cout << " [PRUNE-ONLY: opacity recovery]";
+    }
+    if (enableScreenPruning && screenPruneThreshold > 0) {
+        std::cout << " screenPrune=" << screenPruneThreshold << "px"
+                  << " (opacity<" << screenPruneOpacityGate << ")";
+    }
+    std::cout << std::endl;
     
     return stats;
 }

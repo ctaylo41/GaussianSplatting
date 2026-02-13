@@ -17,6 +17,8 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <random>
+#include <numeric>
 #include <Foundation/NSAutoreleasePool.hpp>
 
 // Helper to convert half float to float
@@ -202,7 +204,7 @@ void MTLEngine::run(Camera& camera) {
         
         // Training step
         if (isTraining && !trainingImages.empty()) {
-            float loss = trainStep(currentImageIdx);
+            float loss = trainStep(currentImageIdx, 0.00016f * sceneExtent);
             epochLoss += loss;
             epochIterations++;
             totalIterations++;
@@ -215,38 +217,47 @@ void MTLEngine::run(Camera& camera) {
             }
             
             // Density control application
-            // Stop densification at 15k iterations (matching official 3DGS)
+            // Stop densification at 15k iterations 
             const size_t DENSIFY_UNTIL_ITER = 15000;
-            if (totalIterations % densityControlInterval == 0 && 
-                totalIterations > 500 && 
+            if (totalIterations % densityControlInterval == 0 &&
+                totalIterations > 500 &&
                 totalIterations < DENSIFY_UNTIL_ITER) {
                 // Get camera parameters for screen-space pruning
                 // Use scaled intrinsics to match actual training texture resolution
                 const TrainingImage& currentImg = trainingImages[currentImageIdx];
                 const ColmapCamera& cam = colmapData.cameras.at(currentImg.cameraId);
-                
+
                 uint32_t actualWidth = currentImg.texture->width();
                 float scaleX = (float)actualWidth / (float)cam.width;
-                
+
                 // Scale focal length to match actual training resolution
                 float focalLength = cam.fx * scaleX;
                 float imageWidth = (float)actualWidth;
                 float avgDepth = sceneExtent;
-                
-                densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
+
+                size_t oldCount = gaussianCount;
+                DensityStats stats = densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
                                          nullptr, gaussianCount, totalIterations,
                                          0.0002f,
-                                         0.003f,  // min_opacity: must be lower than reset value (0.01)
+                                         0.005f,  // min_opacity (matches OPACITY_PRUNE_THRESHOLD)
                                          0.1f * sceneExtent,
                                          focalLength,
                                          imageWidth,
                                          avgDepth);
-                
+
                 // Reallocate gradients buffer if needed
                 if (gaussianGradients->length() < gaussianCount * sizeof(GaussianGradients)) {
                     gaussianGradients->release();
                     gaussianGradients = metalDevice->newBuffer(gaussianCount * sizeof(GaussianGradients),
                                                                MTL::ResourceStorageModeShared);
+                }
+
+                // Remap optimizer momentum for surviving Gaussians
+                // Must call remapMomentum whenever changes occur, even if indexMapping is empty
+                // (e.g., all Gaussians split - children need zero momentum, not inherited)
+                bool hadChanges = (stats.numPruned > 0 || stats.numCloned > 0 || stats.numSplit > 0);
+                if (optimizer && hadChanges) {
+                    optimizer->remapMomentum(stats.indexMapping, gaussianCount);
                 }
             }
             
@@ -293,6 +304,22 @@ void MTLEngine::initDevice() {
         std::exit(1);
     }
     std::cout << "Using Metal device: " << metalDevice->name()->utf8String() << std::endl;
+
+    // Feature probing: this tells us if the runtime exposes Metal 3 vs Metal 4 families.
+    // (This is OS/runtime-gated; Xcode alone won't change it.)
+    auto printFamily = [&](MTL::GPUFamily family, const char* label) {
+        bool supported = metalDevice->supportsFamily(family);
+        std::cout << "  supportsFamily(" << label << "): " << (supported ? "YES" : "NO") << std::endl;
+    };
+
+    std::cout << "Metal family support:" << std::endl;
+    printFamily(MTL::GPUFamilyMetal3, "Metal3");
+    printFamily(MTL::GPUFamilyMetal4, "Metal4");
+    // Useful context for Apple Silicon
+    printFamily(MTL::GPUFamilyMac2, "Mac2");
+    printFamily(MTL::GPUFamilyApple7, "Apple7");
+    printFamily(MTL::GPUFamilyApple8, "Apple8");
+    printFamily(MTL::GPUFamilyApple9, "Apple9");
 }
 
 // Initialize GLFW window with Metal layer
@@ -999,9 +1026,10 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
     encoder->setBuffer(totalLossBuffer, 0, 1);
     encoder->setBytes(&pixelCount, sizeof(uint32_t), 2);
     
-    // Launch reduction with fixed number of threads
-    uint32_t reductionThreads = 1024;
-    encoder->dispatchThreads(MTL::Size(reductionThreads, 1, 1), MTL::Size(64, 1, 1));
+    // reduceLoss is implemented as a single-threadgroup reduction
+    // Dispatch exactly one 256-thread group.
+    uint32_t reductionThreads = 256;
+    encoder->dispatchThreads(MTL::Size(reductionThreads, 1, 1), MTL::Size(reductionThreads, 1, 1));
     
     // Finalize encoding
     encoder->endEncoding();
@@ -1013,13 +1041,88 @@ float MTLEngine::computeLoss(MTL::Texture* rendered, MTL::Texture* groundTruth) 
     return totalLoss / pixelCount;
 }
 
+// Encode loss computation without waiting call readLossValue() after a later GPU wait
+void MTLEngine::encodeLossAsync(MTL::Texture* rendered, MTL::Texture* groundTruth) {
+    uint32_t width = rendered->width();
+    uint32_t height = rendered->height();
+    uint32_t pixelCount = width * height;
+    lastLossPixelCount = pixelCount;
+
+    // Allocate buffers if needed
+    if (!lossBuffer || lossBuffer->length() < pixelCount * sizeof(float)) {
+        if (lossBuffer) lossBuffer->release();
+        lossBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+    if (!ssimBuffer || ssimBuffer->length() < pixelCount * sizeof(float)) {
+        if (ssimBuffer) ssimBuffer->release();
+        ssimBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+    if (!combinedLossBuffer || combinedLossBuffer->length() < pixelCount * sizeof(float)) {
+        if (combinedLossBuffer) combinedLossBuffer->release();
+        combinedLossBuffer = metalDevice->newBuffer(pixelCount * sizeof(float), MTL::ResourceStorageModeShared);
+    }
+    if (!totalLossBuffer) {
+        totalLossBuffer = metalDevice->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+    }
+
+    float zero = 0.0f;
+    memcpy(totalLossBuffer->contents(), &zero, sizeof(float));
+
+    MTL::CommandBuffer* cmdBuffer = commandQueue->commandBuffer();
+    MTL::ComputeCommandEncoder* encoder = cmdBuffer->computeCommandEncoder();
+
+    MTL::Size gridSize = MTL::Size(width, height, 1);
+    MTL::Size threadGroupSize = MTL::Size(16, 16, 1);
+
+    encoder->setComputePipelineState(lossComputePSO);
+    encoder->setTexture(rendered, 0);
+    encoder->setTexture(groundTruth, 1);
+    encoder->setBuffer(lossBuffer, 0, 0);
+    encoder->dispatchThreads(gridSize, threadGroupSize);
+
+    encoder->setComputePipelineState(ssimComputePSO);
+    encoder->setTexture(rendered, 0);
+    encoder->setTexture(groundTruth, 1);
+    encoder->setBuffer(ssimBuffer, 0, 0);
+    encoder->dispatchThreads(gridSize, threadGroupSize);
+
+    encoder->setComputePipelineState(combinedLossPSO);
+    encoder->setTexture(rendered, 0);
+    encoder->setTexture(groundTruth, 1);
+    encoder->setBuffer(lossBuffer, 0, 0);
+    encoder->setBuffer(ssimBuffer, 0, 1);
+    encoder->setBuffer(combinedLossBuffer, 0, 2);
+    encoder->setBytes(&lambdaDSSIM, sizeof(float), 3);
+    encoder->dispatchThreads(gridSize, threadGroupSize);
+
+    encoder->setComputePipelineState(reductionPSO);
+    encoder->setBuffer(combinedLossBuffer, 0, 0);
+    encoder->setBuffer(totalLossBuffer, 0, 1);
+    encoder->setBytes(&pixelCount, sizeof(uint32_t), 2);
+    // reduceLoss is implemented as a single-threadgroup reduction (no atomics)
+    // Dispatch exactly one 256-thread group.
+    uint32_t reductionThreads = 256;
+    encoder->dispatchThreads(MTL::Size(reductionThreads, 1, 1), MTL::Size(reductionThreads, 1, 1));
+
+    encoder->endEncoding();
+    cmdBuffer->commit();
+    // No wait - loss result readable after next GPU sync on same queue
+}
+
+// Read the loss value after a GPU wait has ensured the loss computation is complete
+float MTLEngine::readLossValue() {
+    float totalLoss = *(float*)totalLossBuffer->contents();
+    return totalLoss / lastLossPixelCount;
+}
+
 // Perform a single training step on a specified training image
-float MTLEngine::trainStep(size_t imageIndex, 
+float MTLEngine::trainStep(size_t imageIndex,
                            float lr_position,
                            float lr_scale,
                            float lr_rotation,
                            float lr_opacity,
-                           float lr_sh) {
+                           float lr_sh,
+                           float lr_sh_rest) {
     // Validate image index
     if (imageIndex >= trainingImages.size()) return 0.0f;
     
@@ -1151,137 +1254,72 @@ float MTLEngine::trainStep(size_t imageIndex,
     }
     saveCounter++;
     
-    // Compute loss
-    float loss = computeLoss(renderTarget, img.texture);
-    
-    // Backward pass
+    // Encode loss computation (async - no GPU wait, will complete before backward)
+    encodeLossAsync(renderTarget, img.texture);
+
+    // Backward pass combined L1 + D-SSIM pixel gradients; waits for loss + backward completion
     tiledRasterizer->backward(commandQueue, gaussianBuffer, gaussianGradients, gaussianCount,
                               uniforms, renderTarget, img.texture);
+
+    // Read loss value (safe - backward wait guarantees loss command buffer completed)
+    float loss = readLossValue();
     
-    // Accumulate gradients for density control
-    densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
-    
-    // Accumulate actual screen-space radii from rasterizer (official max_radii2D)
-    densityController->accumulateRadii(tiledRasterizer->getProjectedGaussians(), gaussianCount);
-    
-    // Optimizer step with decayed learning rates
+    // Set actual Gaussian count before optimizer step
+    optimizer->setGaussianCount(gaussianCount);
+
+    // Start optimizer on GPU
+    // Safe because optimizer writes to gaussianBuffer/Adam state,
+    // while density accumulation reads gradientBuffer/projectedGaussians
     optimizer->step(commandQueue, gaussianBuffer, gaussianGradients,
                     lr_position,
                     lr_scale,
                     lr_rotation,
                     lr_opacity,
-                    lr_sh);
-    
-    // Check for NAN contamination and gradient health after optimizer step
-    if (saveCounter % 100 == 0) {
-        Gaussian* g = (Gaussian*)gaussianBuffer->contents();
-        GaussianGradients* grads = (GaussianGradients*)gaussianGradients->contents();
-        
-        int nanCount = 0;
-        int shNanCount = 0;
-        float maxSH = -1e10f;
-        float minSH = 1e10f;
-        int maxSHIdx = -1;
-        int minSHIdx = -1;
-        float maxSHGrad = 0.0f;
-        float avgSHGrad = 0.0f;
-        int saturatedCount = 0;
-        
-        // Check first 1000 Gaussians for NaN and gradients
-        const int checkCount = std::min((size_t)1000, gaussianCount);
-        for (int i = 0; i < checkCount; i++) {
-            if (std::isnan(g[i].position.x) || std::isnan(g[i].position.y) || std::isnan(g[i].position.z)) {
-                nanCount++;
-            }
-            if (std::isnan(g[i].opacity)) {
-                nanCount++;
-            }
-            
-            // Check SH coefficients and gradients
-            for (int sh = 0; sh < 12; sh++) {
-                if (std::isnan(g[i].sh[sh])) {
-                    shNanCount++;
-                    // Only Count once per Gaussian
-                    break;  
-                }
-                if (g[i].sh[sh] > maxSH) {
-                    maxSH = g[i].sh[sh];
-                    maxSHIdx = i;
-                }
-                if (g[i].sh[sh] < minSH) {
-                    minSH = g[i].sh[sh];
-                    minSHIdx = i;
-                }
-                
-                // Check gradient magnitude for SH
-                float grad = grads[i].sh[sh];
-                maxSHGrad = fmaxf(maxSHGrad, fabsf(grad));
-                avgSHGrad += fabsf(grad);
-            }
-            
-            // Check if color output is very dark sigmoid activation
-            const float DARK_THRESHOLD = -4.0f;
-            bool isDark = false;
-            if (g[i].sh[0] <= DARK_THRESHOLD ||
-                g[i].sh[4] <= DARK_THRESHOLD ||
-                g[i].sh[8] <= DARK_THRESHOLD) {
-                isDark = true;
-            }
-            if (isDark) {
-                saturatedCount++;
-            }
-        }
-        
-        avgSHGrad /= (checkCount * 12);
-        
-        if (nanCount > 0 || shNanCount > 0) {
-            printf("\n WARNING: NaN DETECTED! %d position/opacity NaNs, %d SH NaNs (checked %d Gaussians)\n", 
-                   nanCount, shNanCount, checkCount);
-        }
-        
-        // Report SH value range and gradient health
-        printf("[SH] values: [%.4f, %.4f] | gradients: max=%.6f avg=%.6f | black: %d/%d\n",
-               minSH, maxSH, maxSHGrad, avgSHGrad, saturatedCount, checkCount);
+                    lr_sh,
+                    lr_sh_rest,
+                    /*maxLogScaleTrain=*/logf(fmaxf(1e-6f, 0.1f * sceneExtent)),
+                    /*wait=*/false);
 
-        // Count Gaussians at SH caps and with saturated colors sigmoid activation
-        int atCapHigh = 0, atCapLow = 0;
-        int saturatedHigh = 0, saturatedLow = 0;
-        for (int i = 0; i < checkCount; i++) {
-            // Check if at +-5 cap
-            if (g[i].sh[0] >= 4.9f || g[i].sh[4] >= 4.9f || g[i].sh[8] >= 4.9f) atCapHigh++;
-            if (g[i].sh[0] <= -4.9f || g[i].sh[4] <= -4.9f || g[i].sh[8] <= -4.9f) atCapLow++;
+    // CPU density accumulation runs while optimizer GPU work executes
+    densityController->accumulateGradients(commandQueue, gaussianGradients, gaussianCount);
+    densityController->accumulateRadii(tiledRasterizer->getProjectedGaussians(), gaussianCount);
 
-            // Check if any color channel is saturated near 0 or 1 with sigmoid
-            if (g[i].sh[0] >= 4.0f || g[i].sh[4] >= 4.0f || g[i].sh[8] >= 4.0f) saturatedHigh++;
-            if (g[i].sh[0] <= -4.0f || g[i].sh[4] <= -4.0f || g[i].sh[8] <= -4.0f) saturatedLow++;
-        }
-        printf("[SH] at_cap(high/low): %d/%d | saturated(high/low): %d/%d of %d\n",
-               atCapHigh, atCapLow, saturatedHigh, saturatedLow, checkCount);
-    }
+    // Wait for optimizer before reading Gaussian buffer
+    optimizer->waitForLastStep();
 
     // Periodic stats every 100 images
     if (saveCounter % 100 == 0) {
         // Print average opacity and scale
         Gaussian* g = (Gaussian*)gaussianBuffer->contents();
         // Calculate average opacity and scale for a sample of Gaussians
-        float avgOpacity = 0, avgScale = 0;
+        float avgOpacity = 0, avgScale = 0, maxScale = 0;
         int opAbove90 = 0, opAbove95 = 0, opAbove99 = 0;
+        int scaleExploded = 0;
         // Sample up to 1000 Gaussians for stats
         const int sampleCount = std::min((size_t)1000, gaussianCount);
         for (int i = 0; i < sampleCount; i++) {
             float sigOp = 1.0f / (1.0f + exp(-g[i].opacity));
             avgOpacity += sigOp;
-            avgScale += (exp(g[i].scale.x) + exp(g[i].scale.y) + exp(g[i].scale.z)) / 3.0f;
+            float scale = (exp(g[i].scale.x) + exp(g[i].scale.y) + exp(g[i].scale.z)) / 3.0f;
+            avgScale += scale;
+            if (scale > maxScale) maxScale = scale;
+            if (scale > 10.0f) scaleExploded++;
 
             // Count opacity distribution
             if (sigOp > 0.90f) opAbove90++;
             if (sigOp > 0.95f) opAbove95++;
             if (sigOp > 0.99f) opAbove99++;
         }
-        printf("\n[iter %d] Gaussians: %zu | Avg opacity: %.3f | Avg scale: %.4f\n",
-               saveCounter, gaussianCount, avgOpacity / sampleCount, avgScale / sampleCount);
+        printf("\n[iter %d] Gaussians: %zu | Avg opacity: %.3f | Avg scale: %.4f | Max scale: %.4f\n",
+               saveCounter, gaussianCount, avgOpacity / sampleCount, avgScale / sampleCount, maxScale);
         printf("[Opacity] above 0.90: %d | above 0.95: %d | above 0.99: %d (of %d sampled)\n",
                opAbove90, opAbove95, opAbove99, sampleCount);
+
+        // Scale explosion warning
+        if (scaleExploded > 0 || maxScale > 20.0f) {
+            printf("*** WARNING: %d Gaussians have scale > 10.0 (max: %.2f) ***\n",
+                   scaleExploded, maxScale);
+        }
     }
     
     return loss;
@@ -1318,16 +1356,14 @@ void MTLEngine::train(size_t numEpochs) {
     const size_t DENSIFY_UNTIL_ITER = 15000;
     const float OPACITY_RESET_VALUE = -4.6f;
     
-    // Position LR decays exponentially from init to final
-    const float POSITION_LR_INIT = 0.00016f;
-    // 100x smaller at end
-    const float POSITION_LR_FINAL = 0.0000016f;  
-    // Back to official value need Gaussians to shrink for sharpness
-    const float SCALE_LR = 0.005f;  
+    const float POSITION_LR_INIT = 0.00016f * sceneExtent;
+    const float POSITION_LR_FINAL = 0.0000016f * sceneExtent;
+    const float SCALE_LR = 0.005f;
     const float ROTATION_LR = 0.001f;
-    // Increased from 0.025 to help opacity recovery after resets
     const float OPACITY_LR = 0.05f;
     const float SH_LR = 0.0025f;
+    const float SH_REST_LR = SH_LR / 20.0f;  // 0.000125
+    const size_t SH_DEGREE1_ACTIVATE_ITER = 1000;
     
     // Total iterations for LR scheduling
     const size_t totalExpectedIters = numEpochs * trainingImages.size();
@@ -1338,13 +1374,25 @@ void MTLEngine::train(size_t numEpochs) {
     // Start training timer
     auto startTime = std::chrono::high_resolution_clock::now();
     size_t totalIterations = 0;
-    
+
+    // Official 3DGS no opacity LR boost after reset Adam's adaptive rate
+    // naturally handles the small sigmoid derivative at -4.6
+
+    // Image order shuffling
+    std::vector<size_t> imageOrder(trainingImages.size());
+    std::iota(imageOrder.begin(), imageOrder.end(), 0);
+    std::mt19937 rng(42);  // Fixed seed for reproducibility
+
     // Training loop
     for (size_t epoch = 0; epoch < numEpochs; epoch++) {
         float epochLoss = 0.0f;
         auto epochStart = std::chrono::high_resolution_clock::now();
-        
+
+        // Shuffle image order each epoch
+        std::shuffle(imageOrder.begin(), imageOrder.end(), rng);
+
         for (size_t imgIdx = 0; imgIdx < trainingImages.size(); imgIdx++) {
+            size_t shuffledIdx = imageOrder[imgIdx];
             // Autorelease pool to prevent memory buildup from temporary Metal objects
             NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
             
@@ -1352,7 +1400,10 @@ void MTLEngine::train(size_t numEpochs) {
             float currentPositionLR = exponentialLRDecay(POSITION_LR_INIT, POSITION_LR_FINAL, 
                                                           totalIterations, totalExpectedIters);
             
-            float loss = trainStep(imgIdx, currentPositionLR, SCALE_LR, ROTATION_LR, OPACITY_LR, SH_LR);
+            // Activate degree-1 SH at iter 1000 (official 3DGS schedule)
+            float currentSHRestLR = (totalIterations >= SH_DEGREE1_ACTIVATE_ITER) ? SH_REST_LR : 0.0f;
+            // Official 3DGS: constant LR for scale and opacity (no boost/freeze)
+            float loss = trainStep(shuffledIdx, currentPositionLR, SCALE_LR, ROTATION_LR, OPACITY_LR, SH_LR, currentSHRestLR);
             epochLoss += loss;
             totalIterations++;
             
@@ -1375,16 +1426,23 @@ void MTLEngine::train(size_t numEpochs) {
             
             // Enable screen-space pruning after OPACITY_RESET_INTERVAL iterations
             bool enableScreenPruning = (totalIterations > OPACITY_RESET_INTERVAL);
-            
-            // Density control condition
-            bool shouldDensify = (totalIterations > DENSIFY_FROM_ITER &&
+
+            // Density control condition - match official 3DGS
+            // Only start density control AFTER densify_from_iter, not before
+            // Skip on opacity reset iterations to avoid wasteful clone-then-reset
+            bool isOpacityResetIter = (totalIterations % OPACITY_RESET_INTERVAL == 0 &&
+                                       totalIterations > 0 &&
+                                       totalIterations < DENSIFY_UNTIL_ITER);
+
+            bool shouldDensify = (totalIterations >= DENSIFY_FROM_ITER &&
                                   totalIterations < DENSIFY_UNTIL_ITER &&
-                                  totalIterations % densityControlInterval == 0);
+                                  totalIterations % densityControlInterval == 0 &&
+                                  !isOpacityResetIter);
             
             // Apply density control if needed
             if (shouldDensify) {
                 // Get camera parameters for screen-space pruning
-                const TrainingImage& currentImg = trainingImages[imgIdx];
+                const TrainingImage& currentImg = trainingImages[shuffledIdx];
                 const ColmapCamera& cam = colmapData.cameras.at(currentImg.cameraId);
                 
                 uint32_t actualWidth = currentImg.texture->width();
@@ -1395,10 +1453,10 @@ void MTLEngine::train(size_t numEpochs) {
                 float avgDepth = 4.0f * sceneExtent;
 
                 if (totalIterations % 1000 == 0) {
-                    std::cout << "Density params: fx=" << focalLength 
-                            << " width=" << imageWidth 
-                            << " avgDepth=" << avgDepth 
-                            << " sceneExtent=" << sceneExtent 
+                    std::cout << "Density params: fx=" << focalLength
+                            << " width=" << imageWidth
+                            << " avgDepth=" << avgDepth
+                            << " sceneExtent=" << sceneExtent
                             << " screenPrune=" << (enableScreenPruning ? "ON" : "OFF") << std::endl;
                 }
                 
@@ -1407,54 +1465,51 @@ void MTLEngine::train(size_t numEpochs) {
                 
                 // Pass enableScreenPruning to density controller
                 // Official uses size_threshold=20 pixels when enabled
-                densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
+                // FIX #5: Use consistent opacity threshold (0.005) across all checks
+                DensityStats stats = densityController->apply(commandQueue, gaussianBuffer, positionBuffer,
                                          nullptr, gaussianCount, totalIterations,
-                                         0.0002f,
-                                         0.005f,
-                                         0.1f * sceneExtent,
+                                         0.0002f,  // Fixed threshold (official 3DGS)
+                                         0.005f,   // min_opacity (matches OPACITY_PRUNE_THRESHOLD)
+                                         0.1f * sceneExtent,  // max_scale
                                          focalLength,
                                          imageWidth,
                                          avgDepth);
-                
+
                 // Resize gradient buffer if needed
                 if (gaussianGradients->length() < gaussianCount * sizeof(GaussianGradients)) {
                     gaussianGradients->release();
                     gaussianGradients = metalDevice->newBuffer(gaussianCount * sizeof(GaussianGradients),
                                                                MTL::ResourceStorageModeShared);
                 }
-                
-                // Resize optimizer buffers if needed
-                if (optimizer) {
-                    optimizer->resizeIfNeeded(gaussianCount);
-                    
-                    // Reset Adam state for new Gaussians split/clone
-                    // New Gaussians should start with zeroed momentum
-                    if (gaussianCount > oldCount) {
-                        optimizer->resetStateForNewGaussians(oldCount);
-                    }
+
+                // Remap optimizer momentum - must handle the case where indexMapping is empty
+                // (e.g., all Gaussians split). In that case, remapMomentum creates zeroed buffers.
+                // The old fallback was WRONG: it assumed new Gaussians are at the end, but after
+                // density control they're interleaved throughout the array.
+                bool hadChanges = (stats.numPruned > 0 || stats.numCloned > 0 || stats.numSplit > 0);
+                if (optimizer && hadChanges) {
+                    optimizer->remapMomentum(stats.indexMapping, gaussianCount);
                 }
             }
             
             // Opacity reset condition
-            if (totalIterations % OPACITY_RESET_INTERVAL == 0 && 
-                totalIterations > 0 && 
-                totalIterations < DENSIFY_UNTIL_ITER) {
+            if (isOpacityResetIter) {
                 std::cout << std::endl << "Resetting opacity at iteration " << totalIterations << std::endl;
-                
+
                 // Clamp opacities in Gaussian buffer
                 Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
                 for (size_t i = 0; i < gaussianCount; i++) {
-                    // Clamp opacity to max 0.01
+                    // Clamp opacity to max OPACITY_RESET_VALUE
                     if (gaussians[i].opacity > OPACITY_RESET_VALUE) {
                         gaussians[i].opacity = OPACITY_RESET_VALUE;
                     }
                 }
-                
-                // Reset optimizer momentum for opacity, scale, AND SH
+
+                // Reset opacity momentum only — matches official 3DGS behavior.
+                // replace_tensor_to_optimizer zeros exp_avg and exp_avg_sq for opacity only.
+                // All other Adam state (position, scale, rotation, SH) is preserved.
                 optimizer->resetOpacityMomentum();
-                optimizer->resetScaleMomentum();
-                optimizer->resetSHMomentum();
-                
+
                 densityController->resetAccumulator(gaussianCount);
             }
             

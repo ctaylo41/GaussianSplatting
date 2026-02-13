@@ -186,7 +186,7 @@ MTL::Buffer* GPURadixSort32::sort(MTL::CommandQueue* queue,
 
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
     
-    // Step 1: Compute depths and initialize keys/values
+    // Step 1 Compute depths and initialize keys/values
     {
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
         enc->setComputePipelineState(computeDepthsPSO);
@@ -401,19 +401,16 @@ void GPURadixSort64::sort(MTL::CommandQueue* queue,
     MTL::Size grid = MTL::Size(numElements, 1, 1);
     MTL::Size tg = MTL::Size(THREADGROUP_SIZE, 1, 1);
 
-    // Initial blit to copy input
-    MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
-    MTL::BlitCommandEncoder* blit = cmdBuffer->blitCommandEncoder();
-    blit->copyFromBuffer(keysIn, 0, keysBuffers[0], 0, numElements * sizeof(uint64_t));
-    blit->copyFromBuffer(valuesIn, 0, valuesBuffers[0], 0, numElements * sizeof(uint32_t));
-    blit->endEncoding();
-    cmdBuffer->commit();
-    cmdBuffer->waitUntilCompleted();
-
     int srcIdx = 0;
 
-    // Single command buffer for all 8 passes
-    cmdBuffer = queue->commandBuffer();
+    // Single command buffer for blit + all 8 passes (eliminates extra GPU-CPU sync)
+    MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
+
+    // Copy input data as part of the same command buffer
+    MTL::BlitCommandEncoder* initialBlit = cmdBuffer->blitCommandEncoder();
+    initialBlit->copyFromBuffer(keysIn, 0, keysBuffers[0], 0, numElements * sizeof(uint64_t));
+    initialBlit->copyFromBuffer(valuesIn, 0, valuesBuffers[0], 0, numElements * sizeof(uint32_t));
+    initialBlit->endEncoding();
 
     for (uint32_t pass = 0; pass < NUM_PASSES; pass++) {
         uint32_t bitOffset = pass * 8;

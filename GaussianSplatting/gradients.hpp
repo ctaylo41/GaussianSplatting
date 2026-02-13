@@ -7,6 +7,16 @@
 #pragma once
 #include <simd/simd.h>
 
+// Intermediate per-Gaussian render gradients 
+// Must match Metal shader RenderGradientsAtomic/RenderGradientsRead layout exactly (40 bytes)
+struct RenderGradients {
+    float dL_dColor[3];  
+    float dL_dConic[3]; 
+    float dL_dOpacity;       
+    float dL_dMean2D[2];     
+    float _pad;
+};
+
 // Structure to hold Gaussian gradients for optimization
 // Must match Metal shader struct layout exactly 112 bytes
 struct GaussianGradients {

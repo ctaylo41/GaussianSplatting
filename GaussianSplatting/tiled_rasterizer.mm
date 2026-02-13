@@ -124,6 +124,10 @@ TiledRasterizer::TiledRasterizer(MTL::Device* device, MTL::Library* library, uin
     // Allocate projection buffer
     projectedGaussians = device->newBuffer(maxGaussians * sizeof(ProjectedGaussian),
                                            MTL::ResourceStorageModeShared);
+
+    // Allocate intermediate render gradient buffer Stage 1 -> Stage 2
+    renderGradientBuffer = device->newBuffer(maxGaussians * sizeof(RenderGradients),
+                                              MTL::ResourceStorageModeShared);
     
     // Uniform buffer
     uniformBuffer = device->newBuffer(sizeof(TiledUniforms), MTL::ResourceStorageModeShared);
@@ -155,14 +159,22 @@ TiledRasterizer::~TiledRasterizer() {
     if (perPixelLastIdx) perPixelLastIdx->release();
     if (uniformBuffer) uniformBuffer->release();
     if (pairCounterBuffer) pairCounterBuffer->release();
-    
+    if (ssimCoeffKBuffer) ssimCoeffKBuffer->release();
+    if (ssimCoeffLBuffer) ssimCoeffLBuffer->release();
+    if (ssimCoeffMBuffer) ssimCoeffMBuffer->release();
+    if (pixelGradientBuffer) pixelGradientBuffer->release();
+    if (renderGradientBuffer) renderGradientBuffer->release();
+
     if (gpuRadixSort) delete gpuRadixSort;
-    
+
     if (projectGaussiansPSO) projectGaussiansPSO->release();
     if (tiledForwardPSO) tiledForwardPSO->release();
     if (tiledBackwardPSO) tiledBackwardPSO->release();
     if (buildTileRangesPSO) buildTileRangesPSO->release();
     if (generatePairsPSO) generatePairsPSO->release();
+    if (computeSSIMGradCoeffsPSO) computeSSIMGradCoeffsPSO->release();
+    if (computePixelGradientPSO) computePixelGradientPSO->release();
+    if (preprocessBackwardPSO) preprocessBackwardPSO->release();
 }
 
 // Create compute pipelines
@@ -193,6 +205,9 @@ void TiledRasterizer::createPipelines(MTL::Library* library) {
     tiledBackwardPSO = makePipeline("tiledBackward");
     buildTileRangesPSO = makePipeline("buildTileRanges");
     generatePairsPSO = makePipeline("generateTilePairs");
+    computeSSIMGradCoeffsPSO = makePipeline("computeSSIMGradCoeffs");
+    computePixelGradientPSO = makePipeline("computePixelGradient");
+    preprocessBackwardPSO = makePipeline("preprocessBackward");
 }
 
 // Ensure buffers have enough capacity
@@ -206,6 +221,7 @@ void TiledRasterizer::ensureBufferCapacity(uint32_t width, uint32_t height, size
     // Check if reallocation needed
     bool needsTileRealloc = (newMaxTiles > maxTiles);
     bool needsPixelRealloc = (numPixels > currentWidth * currentHeight);
+    bool needsGaussianRealloc = (gaussianCount > maxGaussians);
     
     // Reallocate if needed
     if (needsTileRealloc) {
@@ -213,13 +229,40 @@ void TiledRasterizer::ensureBufferCapacity(uint32_t width, uint32_t height, size
         maxTiles = newMaxTiles;
         tileRanges = device->newBuffer(maxTiles * sizeof(TileRange), MTL::ResourceStorageModeShared);
     }
+
+    // Per-Gaussian buffers
+    if (needsGaussianRealloc) {
+        if (projectedGaussians) projectedGaussians->release();
+        projectedGaussians = device->newBuffer(gaussianCount * sizeof(ProjectedGaussian),
+                                               MTL::ResourceStorageModeShared);
+
+        if (renderGradientBuffer) renderGradientBuffer->release();
+        renderGradientBuffer = device->newBuffer(gaussianCount * sizeof(RenderGradients),
+                                                 MTL::ResourceStorageModeShared);
+
+        maxGaussians = (uint32_t)gaussianCount;
+        std::cout << "Tiled rasterizer buffers grown to " << maxGaussians << " gaussians" << std::endl;
+    }
     
     // Per-pixel last index buffer
     if (needsPixelRealloc || !perPixelLastIdx) {
         if (perPixelLastIdx) perPixelLastIdx->release();
         perPixelLastIdx = device->newBuffer(numPixels * sizeof(uint32_t), MTL::ResourceStorageModeShared);
     }
-    
+
+    // SSIM gradient buffers 3 floats per pixel for each coefficient map + final gradient
+    if (needsPixelRealloc || !ssimCoeffKBuffer) {
+        size_t pixelFloatBufSize = numPixels * 3 * sizeof(float);
+        if (ssimCoeffKBuffer) ssimCoeffKBuffer->release();
+        if (ssimCoeffLBuffer) ssimCoeffLBuffer->release();
+        if (ssimCoeffMBuffer) ssimCoeffMBuffer->release();
+        if (pixelGradientBuffer) pixelGradientBuffer->release();
+        ssimCoeffKBuffer = device->newBuffer(pixelFloatBufSize, MTL::ResourceStorageModeShared);
+        ssimCoeffLBuffer = device->newBuffer(pixelFloatBufSize, MTL::ResourceStorageModeShared);
+        ssimCoeffMBuffer = device->newBuffer(pixelFloatBufSize, MTL::ResourceStorageModeShared);
+        pixelGradientBuffer = device->newBuffer(pixelFloatBufSize, MTL::ResourceStorageModeShared);
+    }
+
     // Update current sizes
     currentWidth = width;
     currentHeight = height;
@@ -438,24 +481,40 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     
     // Read total pairs from atomic counter GPU pair gen already ran in batched command buffer
     uint32_t totalPairs = *((uint32_t*)pairCounterBuffer->contents());
-    
-    // Clamp if we exceeded buffer
+
+    // If pair buffer overflowed, grow and re-run pair generation projection is still valid
     if (totalPairs > maxPairs) {
-        std::cerr << "WARNING: GPU generated " << totalPairs << " pairs, clamping to " << maxPairs << std::endl;
-        totalPairs = maxPairs;
+        ensurePairsCapacity(totalPairs);
+
+        // Reset counter and re-run pair generation with larger buffer
+        *((uint32_t*)pairCounterBuffer->contents()) = 0;
+        MTL::CommandBuffer* retryCmdBuffer = queue->commandBuffer();
+        {
+            MTL::ComputeCommandEncoder* enc = retryCmdBuffer->computeCommandEncoder();
+            enc->setComputePipelineState(generatePairsPSO);
+            enc->setBuffer(projectedGaussians, 0, 0);
+            enc->setBuffer(gaussianKeys, 0, 1);
+            enc->setBuffer(gaussianValues, 0, 2);
+            enc->setBuffer(pairCounterBuffer, 0, 3);
+            uint32_t numG = (uint32_t)gaussianCount;
+            enc->setBytes(&numG, sizeof(uint32_t), 4);
+            enc->setBytes(&numTilesX, sizeof(uint32_t), 5);
+            enc->setBytes(&maxPairs, sizeof(uint32_t), 6);
+            NS::UInteger tgSize = generatePairsPSO->maxTotalThreadsPerThreadgroup();
+            if (tgSize > 256) tgSize = 256;
+            enc->dispatchThreads(MTL::Size(gaussianCount, 1, 1), MTL::Size(tgSize, 1, 1));
+            enc->endEncoding();
+        }
+        retryCmdBuffer->commit();
+        retryCmdBuffer->waitUntilCompleted();
+        totalPairs = *((uint32_t*)pairCounterBuffer->contents());
+        if (totalPairs > maxPairs) totalPairs = maxPairs;
     }
-    
-    // Timing after reading total pairs
+
     if (totalPairs == 0) {
         // Clear tile ranges
         memset(tileRanges->contents(), 0, maxTiles * sizeof(TileRange));
         return;
-    }
-    
-    // Clamp totalPairs to prevent memory explosion
-    if (totalPairs > 50000000) {
-        std::cerr << "WARNING: totalPairs clamped to 50M" << std::endl;
-        totalPairs = 50000000;
     }
     
     uint32_t pairCount = totalPairs;
@@ -658,7 +717,7 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     }
 }
 
-// Backward pass
+// Backward pass combined L1 + D-SSIM gradient
 void TiledRasterizer::backward(MTL::CommandQueue* queue,
                                 MTL::Buffer* gaussianBuffer,
                                 MTL::Buffer* gradientBuffer,
@@ -666,49 +725,105 @@ void TiledRasterizer::backward(MTL::CommandQueue* queue,
                                 const TiledUniforms& uniforms,
                                 MTL::Texture* renderedTexture,
                                 MTL::Texture* groundTruthTexture) {
-    
+
     uint32_t width = (uint32_t)renderedTexture->width();
     uint32_t height = (uint32_t)renderedTexture->height();
 
-    // Copy uniforms (small, CPU is fine)
+    // Ensure SSIM gradient buffers are allocated
+    ensureBufferCapacity(width, height, gaussianCount);
+
+    // Copy uniforms small, CPU is fine
     TiledUniforms u = uniforms;
     u.numTilesX = numTilesX;
     u.numTilesY = numTilesY;
     u.numGaussians = (uint32_t)gaussianCount;
     memcpy(uniformBuffer->contents(), &u, sizeof(TiledUniforms));
 
+    // Ensure renderGradientBuffer is large enough
+    if (!renderGradientBuffer || renderGradientBuffer->length() < gaussianCount * sizeof(RenderGradients)) {
+        if (renderGradientBuffer) renderGradientBuffer->release();
+        renderGradientBuffer = device->newBuffer(gaussianCount * sizeof(RenderGradients),
+                                                  MTL::ResourceStorageModeShared);
+    }
+
     MTL::CommandBuffer* cmdBuffer = queue->commandBuffer();
 
-    // Clear gradients on GPU (much faster than CPU memset on unified memory)
+    // 1. Clear intermediate render gradient buffer AND final gradient buffer on GPU
     {
         MTL::BlitCommandEncoder* blit = cmdBuffer->blitCommandEncoder();
+        blit->fillBuffer(renderGradientBuffer, NS::Range(0, gaussianCount * sizeof(RenderGradients)), 0);
         blit->fillBuffer(gradientBuffer, NS::Range(0, gaussianCount * sizeof(GaussianGradients)), 0);
         blit->endEncoding();
     }
 
-    // Backward rendering
+    MTL::Size pixelGrid = MTL::Size(width, height, 1);
+    MTL::Size pixelThreadgroup = MTL::Size(16, 16, 1);
+
+    // 2. Compute SSIM gradient coefficient maps (K, L, M per pixel)
     {
-        // Setup compute encoder and buffers
         MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
-        enc->setComputePipelineState(tiledBackwardPSO);
-        enc->setBuffer(gaussianBuffer, 0, 0);
-        enc->setBuffer(gradientBuffer, 0, 1);
-        enc->setBuffer(projectedGaussians, 0, 2);
-        // sortedIndices use active sorted values buffer
-        enc->setBuffer(activeSortedValues, 0, 3);  
-        enc->setBuffer(tileRanges, 0, 4);
-        enc->setBuffer(uniformBuffer, 0, 5);
-        enc->setBuffer(perPixelLastIdx, 0, 6);
+        enc->setComputePipelineState(computeSSIMGradCoeffsPSO);
         enc->setTexture(renderedTexture, 0);
         enc->setTexture(groundTruthTexture, 1);
-        
-        // Dispatch threads
+        enc->setBuffer(ssimCoeffKBuffer, 0, 0);
+        enc->setBuffer(ssimCoeffLBuffer, 0, 1);
+        enc->setBuffer(ssimCoeffMBuffer, 0, 2);
+        enc->dispatchThreads(pixelGrid, pixelThreadgroup);
+        enc->endEncoding();
+    }
+
+    // 3. Convolve coefficients and combine with L1 to get per-pixel gradient
+    {
+        MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
+        enc->setComputePipelineState(computePixelGradientPSO);
+        enc->setTexture(renderedTexture, 0);
+        enc->setTexture(groundTruthTexture, 1);
+        enc->setBuffer(ssimCoeffKBuffer, 0, 0);
+        enc->setBuffer(ssimCoeffLBuffer, 0, 1);
+        enc->setBuffer(ssimCoeffMBuffer, 0, 2);
+        enc->setBuffer(pixelGradientBuffer, 0, 3);
+        enc->dispatchThreads(pixelGrid, pixelThreadgroup);
+        enc->endEncoding();
+    }
+
+    // 4. Stage 1: Tiled backward — accumulates 9 intermediate gradients per Gaussian
+    //    (dL_dColor[3], dL_dConic[3], dL_dOpacity[1], dL_dMean2D[2])
+    {
+        MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
+        enc->setComputePipelineState(tiledBackwardPSO);
+        enc->setBuffer(projectedGaussians, 0, 0);
+        enc->setBuffer(renderGradientBuffer, 0, 1);
+        enc->setBuffer(activeSortedValues, 0, 2);
+        enc->setBuffer(tileRanges, 0, 3);
+        enc->setBuffer(uniformBuffer, 0, 4);
+        enc->setBuffer(perPixelLastIdx, 0, 5);
+        enc->setBuffer(pixelGradientBuffer, 0, 6);
+
         MTL::Size grid = MTL::Size(width, height, 1);
         MTL::Size threadgroup = MTL::Size(TILE_SIZE, TILE_SIZE, 1);
         enc->dispatchThreads(grid, threadgroup);
         enc->endEncoding();
     }
-    // Submit and wait for render to complete
+
+    // 5. Stage 2: Per-Gaussian preprocess — computes final gradients (no atomics)
+    //    SH, scale, rotation, position, viewspace gradients
+    {
+        MTL::ComputeCommandEncoder* enc = cmdBuffer->computeCommandEncoder();
+        enc->setComputePipelineState(preprocessBackwardPSO);
+        enc->setBuffer(gaussianBuffer, 0, 0);
+        enc->setBuffer(projectedGaussians, 0, 1);
+        enc->setBuffer(renderGradientBuffer, 0, 2);
+        enc->setBuffer(gradientBuffer, 0, 3);
+        enc->setBuffer(uniformBuffer, 0, 4);
+
+        NS::UInteger threadGroupSize = preprocessBackwardPSO->maxTotalThreadsPerThreadgroup();
+        if (threadGroupSize > 256) threadGroupSize = 256;
+        MTL::Size grid = MTL::Size(gaussianCount, 1, 1);
+        MTL::Size threadgroup = MTL::Size(threadGroupSize, 1, 1);
+        enc->dispatchThreads(grid, threadgroup);
+        enc->endEncoding();
+    }
+
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
 }

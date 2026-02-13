@@ -7,6 +7,8 @@
 
 #pragma once
 #include <Metal/Metal.hpp>
+#include <vector>
+#include <utility>
 #include "ply_loader.hpp"
 
 // Structure to hold density control statistics
@@ -14,6 +16,9 @@ struct DensityStats {
     uint32_t numPruned;
     uint32_t numCloned;
     uint32_t numSplit;
+    // Maps old Gaussian index → new index for momentum remapping
+    // Only includes kept and clone original Gaussians
+    std::vector<std::pair<size_t, size_t>> indexMapping;
 };
 
 // Class to manage density control operations on Gaussians
@@ -23,6 +28,7 @@ public:
     ~DensityController();
     
     // Apply density control operations
+    // pruneOnly when true only prune used after opaicty reset
     DensityStats apply(MTL::CommandQueue* queue,
                        MTL::Buffer*& gaussianBuffer,
                        MTL::Buffer*& positionBuffer,
@@ -34,7 +40,8 @@ public:
                        float maxScale = 0.5f,
                        float focalLength = 500.0f,
                        float imageWidth = 800.0f,
-                       float avgDepth = 5.0f);
+                       float avgDepth = 5.0f,
+                       bool pruneOnly = false);
     
     // Accumulate gradients into internal buffers
     void accumulateGradients(MTL::CommandQueue* queue,
@@ -52,6 +59,8 @@ public:
     static void setSceneExtent(float extent);
 
 private:
+    void ensureCapacity(size_t requiredCount);
+
     MTL::Device* device;
     
     // Compute pipelines for density control operations
@@ -62,7 +71,7 @@ private:
     // Store position gradients for gradient-directed cloning
     MTL::Buffer* positionGradAccum;
     
-    // Track maximum screen-space radius across all views matches official max_radii2D
+    // Track maximum screen space radius across all views matches official max_radii2D
     MTL::Buffer* maxRadii2D;
     
     size_t maxGaussians;

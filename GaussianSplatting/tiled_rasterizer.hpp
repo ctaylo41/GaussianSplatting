@@ -30,7 +30,8 @@ struct ProjectedGaussian {
     uint32_t tileMinY;
     uint32_t tileMaxX;
     uint32_t tileMaxY;
-    float _pad1;
+    uint8_t colorClamped[3];  // Track which color channels were clamped (official 3DGS behavior)
+    uint8_t _pad1;
     simd_float2 viewPos_xy;
     float cov2D[3];
     float viewDir[3];
@@ -74,11 +75,17 @@ public:
     
     // Get projected gaussians buffer for density control radius tracking
     MTL::Buffer* getProjectedGaussians() const { return projectedGaussians; }
+
+    // Get stage-1 intermediate gradient buffer (for debug telemetry)
+    MTL::Buffer* getRenderGradientBuffer() const { return renderGradientBuffer; }
+
+    // Get per-pixel loss gradient buffer (output of computePixelGradient)
+    MTL::Buffer* getPixelGradientBuffer() const { return pixelGradientBuffer; }
     
 private:
     static constexpr uint32_t TILE_SIZE = 16;
     // Average Gaussians touch 4-8 tiles depending on size
-    static constexpr uint32_t AVG_TILES_PER_GAUSSIAN = 8;
+    static constexpr uint32_t AVG_TILES_PER_GAUSSIAN = 16;
     
     // Metal device and library
     MTL::Device* device;
@@ -90,7 +97,10 @@ private:
     MTL::ComputePipelineState* tiledBackwardPSO;
     MTL::ComputePipelineState* buildTileRangesPSO;
     MTL::ComputePipelineState* generatePairsPSO;
-    
+    MTL::ComputePipelineState* computeSSIMGradCoeffsPSO;
+    MTL::ComputePipelineState* computePixelGradientPSO;
+    MTL::ComputePipelineState* preprocessBackwardPSO;
+
     // Buffers
     MTL::Buffer* projectedGaussians;
     MTL::Buffer* gaussianKeys;
@@ -102,7 +112,16 @@ private:
 
     // Atomic counter for GPU pair generation
     MTL::Buffer* pairCounterBuffer;
-    
+
+    // SSIM gradient intermediate buffers 
+    MTL::Buffer* ssimCoeffKBuffer = nullptr;
+    MTL::Buffer* ssimCoeffLBuffer = nullptr;
+    MTL::Buffer* ssimCoeffMBuffer = nullptr;
+    MTL::Buffer* pixelGradientBuffer = nullptr;
+
+    // Intermediate render gradients buffer (Stage 1 output, Stage 2 input)
+    MTL::Buffer* renderGradientBuffer = nullptr;
+
     // Track which buffers contain the sorted data
     MTL::Buffer* activeSortedKeys;
     MTL::Buffer* activeSortedValues;  

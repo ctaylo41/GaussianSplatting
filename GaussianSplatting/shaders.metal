@@ -51,16 +51,25 @@ constant float SH_C1 = 0.4886025119029199f;
 constant float MAX_SCALE = 8.0f; 
 // Stricter MAX_SCALE for training to prevent Gaussians from growing too large
 constant float MAX_SCALE_TRAIN = 4.0f;
+// Keep OFF for root-cause debugging so true gradient amplitudes are visible
+constant bool ENABLE_ADAM_GRAD_CLAMP = false;
 
-// Evaluate color from DC terms using sigmoid activation
-// Matches training renderer sigmoid naturally bounds to (0, 1)
+// Evaluate color from SH coefficients
+// Must match training renderer: color = SH_C0 * dc + 0.5 + SH_C1 * (view-dependent terms)
 float3 evalSH(float sh[12], float3 dir) {
-    float3 raw = float3(sh[0], sh[4], sh[8]);
-    return float3(
-        1.0f / (1.0f + exp(-raw.x)),
-        1.0f / (1.0f + exp(-raw.y)),
-        1.0f / (1.0f + exp(-raw.z))
-    );
+    // DC component (degree 0)
+    float3 dc = float3(sh[0], sh[4], sh[8]);
+
+    // Degree 1 components
+    float3 sh1_y = float3(sh[1], sh[5], sh[9]);
+    float3 sh1_z = float3(sh[2], sh[6], sh[10]);
+    float3 sh1_x = float3(sh[3], sh[7], sh[11]);
+
+    // Official 3DGS formula: SH_C0 * dc + 0.5 + SH_C1 * (view-dependent)
+    float3 color = SH_C0 * dc + 0.5f + SH_C1 * (-sh1_y * dir.y + sh1_z * dir.z - sh1_x * dir.x);
+
+    // Only clamp to non-negative (official uses max(result, 0.0f), no upper bound)
+    return max(color, 0.0f);
 }
 
 // Convert quaternion to rotation matrix
@@ -338,17 +347,38 @@ kernel void computeL1Loss(
 // Reduce Loss Kernel
 kernel void reduceLoss(
     device float* losses [[buffer(0)]],
-    device atomic_float* totalLoss [[buffer(1)]],
+    device float* totalLoss [[buffer(1)]],
     constant uint& pixelCount [[buffer(2)]],
-    uint tid [[thread_position_in_grid]],
-    uint threads [[threads_per_grid]])
+    uint tid [[thread_index_in_threadgroup]],
+    uint threadsPerThreadgroup [[threads_per_threadgroup]])
 {
-    // Parallel reduction
-    float sum = 0.0;
-    for (uint i = tid; i < pixelCount; i += threads) {
+    // Single-threadgroup reduction.
+    // Intentionally robust to accidental over-dispatch if multiple threadgroups are launched,
+    // they will redundantly compute the same sum and write the same value.
+    if (threadsPerThreadgroup > 256) return;
+
+    // Avoids atomic ops on a shared float buffer (which is undefined / driver-dependent).
+    threadgroup float partial[256];
+
+    float sum = 0.0f;
+    for (uint i = tid; i < pixelCount; i += threadsPerThreadgroup) {
         sum += losses[i];
     }
-    atomic_fetch_add_explicit(totalLoss, sum, memory_order_relaxed);
+
+    // Store partial and reduce
+    partial[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = (threadsPerThreadgroup >> 1); stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        *totalLoss = partial[0];
+    }
 }
 
 // SSIM Loss Computation
@@ -358,15 +388,8 @@ constant float SSIM_C2 = 0.03f * 0.03f;
 constant int SSIM_WINDOW_SIZE = 11;
 constant int SSIM_WINDOW_RADIUS = 5;
 
-// Precomputed Gaussian weights for 11x11 window with sigma=1.5
-constant float SSIM_GAUSS_1D[11] = {
-    // Actually use proper Gaussian
-    0.0113437f, 0.0838195f, 0.0838195f, 0.000335463f, 0.0f,  
-    // Placeholder we compute inline
-    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f  
-};
-
-// Compute SSIM per pixel
+// Compute SSIM per pixel per-channel: R, G, B separately, then average D-SSIM
+// Matches official 3DGS which computes SSIM per-channel
 kernel void computeSSIM(
     texture2d<float, access::read> rendered [[texture(0)]],
     texture2d<float, access::read> groundTruth [[texture(1)]],
@@ -376,98 +399,79 @@ kernel void computeSSIM(
     // Bounds check
     uint width = rendered.get_width();
     uint height = rendered.get_height();
-    
+
     if (gid.x >= width || gid.y >= height) return;
-    
-    // Compute Gaussian-weighted local statistics
-    float mu_x = 0.0f, mu_y = 0.0f;
-    float sigma_x_sq = 0.0f, sigma_y_sq = 0.0f, sigma_xy = 0.0f;
+
+    // Per-channel accumulators (R, G, B)
+    float3 mu_x = float3(0);
+    float3 mu_y = float3(0);
     float weight_sum = 0.0f;
-    
+
     // Gaussian kernel with sigma = 1.5
     float sigma = 1.5f;
     float two_sigma_sq = 2.0f * sigma * sigma;
-    
-    // First pass for means
+
+    // First pass: per-channel means
     for (int dy = -SSIM_WINDOW_RADIUS; dy <= SSIM_WINDOW_RADIUS; dy++) {
         for (int dx = -SSIM_WINDOW_RADIUS; dx <= SSIM_WINDOW_RADIUS; dx++) {
-            int px = int(gid.x) + dx;
-            int py = int(gid.y) + dy;
-            
-            // Clamp to image boundaries
-            px = clamp(px, 0, int(width) - 1);
-            py = clamp(py, 0, int(height) - 1);
-            
-            // Gaussian weight
+            int px = clamp(int(gid.x) + dx, 0, int(width) - 1);
+            int py = clamp(int(gid.y) + dy, 0, int(height) - 1);
+
             float dist_sq = float(dx * dx + dy * dy);
             float w = exp(-dist_sq / two_sigma_sq);
             weight_sum += w;
-            
-            // Read pixels and convert to grayscale luminance for SSIM
+
             float4 r = rendered.read(uint2(px, py));
             float4 gt = groundTruth.read(uint2(px, py));
-            
-            // Use luminance or average RGB
-            float x_val = (r.r + r.g + r.b) / 3.0f;
-            float y_val = (gt.r + gt.g + gt.b) / 3.0f;
-            
-            mu_x += w * x_val;
-            mu_y += w * y_val;
+
+            mu_x += w * r.rgb;
+            mu_y += w * gt.rgb;
         }
     }
-    
-    // Normalize means
+
     mu_x /= weight_sum;
     mu_y /= weight_sum;
-    
-    // Second pass for variance and covariance
+
+    // Second pass per-channel variances and covariance
+    float3 sigma_x_sq = float3(0);
+    float3 sigma_y_sq = float3(0);
+    float3 sigma_xy = float3(0);
     weight_sum = 0.0f;
+
     for (int dy = -SSIM_WINDOW_RADIUS; dy <= SSIM_WINDOW_RADIUS; dy++) {
         for (int dx = -SSIM_WINDOW_RADIUS; dx <= SSIM_WINDOW_RADIUS; dx++) {
-            int px = int(gid.x) + dx;
-            int py = int(gid.y) + dy;
-            
-            // Clamp to image boundaries
-            px = clamp(px, 0, int(width) - 1);
-            py = clamp(py, 0, int(height) - 1);
-            
-            // Gaussian weight
+            int px = clamp(int(gid.x) + dx, 0, int(width) - 1);
+            int py = clamp(int(gid.y) + dy, 0, int(height) - 1);
+
             float dist_sq = float(dx * dx + dy * dy);
             float w = exp(-dist_sq / two_sigma_sq);
             weight_sum += w;
-            
-            // Read pixels
+
             float4 r = rendered.read(uint2(px, py));
             float4 gt = groundTruth.read(uint2(px, py));
-            
-            // Use luminance or average RGB
-            float x_val = (r.r + r.g + r.b) / 3.0f;
-            float y_val = (gt.r + gt.g + gt.b) / 3.0f;
-            
-            // Accumulate variances and covariance
-            float dx_val = x_val - mu_x;
-            float dy_val = y_val - mu_y;
-            
-            // Variances and covariance
+
+            float3 dx_val = r.rgb - mu_x;
+            float3 dy_val = gt.rgb - mu_y;
+
             sigma_x_sq += w * dx_val * dx_val;
             sigma_y_sq += w * dy_val * dy_val;
             sigma_xy += w * dx_val * dy_val;
         }
     }
-    
-    // Normalize variances
+
     sigma_x_sq /= weight_sum;
     sigma_y_sq /= weight_sum;
     sigma_xy /= weight_sum;
-    
-    // Compute SSIM
-    float numerator = (2.0f * mu_x * mu_y + SSIM_C1) * (2.0f * sigma_xy + SSIM_C2);
-    float denominator = (mu_x * mu_x + mu_y * mu_y + SSIM_C1) * (sigma_x_sq + sigma_y_sq + SSIM_C2);
-    float ssim = numerator / denominator;
-    
-    // D-SSIM = (1 - SSIM) / 2 clamped to [0, 1]
-    float dssim = clamp((1.0f - ssim) / 2.0f, 0.0f, 1.0f);
-    
+
+    // Compute per-channel SSIM
+    float3 numerator = (2.0f * mu_x * mu_y + SSIM_C1) * (2.0f * sigma_xy + SSIM_C2);
+    float3 denominator = (mu_x * mu_x + mu_y * mu_y + SSIM_C1) * (sigma_x_sq + sigma_y_sq + SSIM_C2);
+    float3 ssim = numerator / denominator;
+
+    // Per-channel D-SSIM = (1 - SSIM) / 2, then average across channels
+    float3 dssim_per_channel = clamp((1.0f - ssim) / 2.0f, 0.0f, 1.0f);
+    float dssim = (dssim_per_channel.x + dssim_per_channel.y + dssim_per_channel.z) / 3.0f;
+
     uint idx = gid.y * width + gid.x;
     ssimMap[idx] = dssim;
 }
@@ -500,7 +504,7 @@ kernel void computeCombinedLoss(
     combinedLosses[idx] = (1.0f - lambda_dssim) * l1 + lambda_dssim * dssim;
 }
 
-// Gradient structure matching Gaussian parameters
+// Final Gaussian gradients plain float
 struct GaussianGradients {
     float position_x;
     float position_y;
@@ -510,11 +514,12 @@ struct GaussianGradients {
     float scale_y;
     float scale_z;
     float _pad1;
-    float4 rotation;
+    float rotation_x;
+    float rotation_y;
+    float rotation_z;
+    float rotation_w;
     float sh[12];
-    
-    // Viewspace (screen-space) gradients for density control
-    // Official 3DGS uses these for densification decisions
+
     float viewspace_grad_x;
     float viewspace_grad_y;
     float _pad2;
@@ -550,37 +555,82 @@ kernel void adamStep(
     
     if (tid >= numGaussians) return;
     
-    // Fetch gradients
-    GaussianGradients g = gradients[tid];
-    
-    // Skip if gradients are invalid
-    if (isnan(g.position_x) || isnan(g.opacity) || isnan(g.sh[0]) ||
-        isinf(g.position_x) || isinf(g.opacity)) {
-        return;
+    // Fetch gradients plain reads preprocessBackward writes non-atomic
+    float g_position_x = gradients[tid].position_x;
+    float g_position_y = gradients[tid].position_y;
+    float g_position_z = gradients[tid].position_z;
+    float g_opacity    = gradients[tid].opacity;
+    float g_scale_x    = gradients[tid].scale_x;
+    float g_scale_y    = gradients[tid].scale_y;
+    float g_scale_z    = gradients[tid].scale_z;
+    float4 g_rotation  = float4(
+        gradients[tid].rotation_x,
+        gradients[tid].rotation_y,
+        gradients[tid].rotation_z,
+        gradients[tid].rotation_w
+    );
+    float g_sh[12];
+    for (int i = 0; i < 12; i++) {
+        g_sh[i] = gradients[tid].sh[i];
     }
     
-    // Skip corrupted Gaussians
+    // Skip if any gradient is NaN or inf including rotation and SH
+    if (!isfinite(g_position_x) || !isfinite(g_position_y) || !isfinite(g_position_z) ||
+        !isfinite(g_opacity) || !isfinite(g_scale_x) || !isfinite(g_scale_y) || !isfinite(g_scale_z) ||
+        !isfinite(g_rotation.x) || !isfinite(g_rotation.y) || !isfinite(g_rotation.z) || !isfinite(g_rotation.w)) {
+        return;
+    }
+    // Also skip if any SH gradient is non-finite
+    for (int i = 0; i < 12; i++) {
+        if (!isfinite(g_sh[i])) return;
+    }
+
+    if (ENABLE_ADAM_GRAD_CLAMP) {
+        // Optional safety clipping for production stabilization
+        g_position_x = clamp(g_position_x, -10.0f, 10.0f);
+        g_position_y = clamp(g_position_y, -10.0f, 10.0f);
+        g_position_z = clamp(g_position_z, -10.0f, 10.0f);
+        g_scale_x = clamp(g_scale_x, -10.0f, 10.0f);
+        g_scale_y = clamp(g_scale_y, -10.0f, 10.0f);
+        g_scale_z = clamp(g_scale_z, -10.0f, 10.0f);
+        g_opacity = clamp(g_opacity, -10.0f, 10.0f);
+        g_rotation = clamp(g_rotation, float4(-10.0f), float4(10.0f));
+        for (int i = 0; i < 12; i++) {
+            g_sh[i] = clamp(g_sh[i], -10.0f, 10.0f);
+        }
+    }
+    
+    // Skip corrupted Gaussians check position, scale, and SH
     if (isnan(gaussians[tid].position.x) || isinf(gaussians[tid].position.x) ||
         abs(gaussians[tid].position.x) > 1e6) {
         return;
+    }
+
+    // SH coefficients are more prone to corruption due to their larger magnitude and lack of clamping in the training renderer, so we sanitize them before applying updates.
+    for (int i = 0; i < 12; i++) {
+        float shVal = gaussians[tid].sh[i];
+        if (!isfinite(shVal) || fabs(shVal) > 1.0e6f) {
+            gaussians[tid].sh[i] = 0.0f;
+            m_sh[tid * 12 + i] = 0.0f;
+            v_sh[tid * 12 + i] = 0.0f;
+        }
     }
     
     // Bias correction terms
     float bc1 = 1.0 - pow(beta1, float(t));
     float bc2 = 1.0 - pow(beta2, float(t));
-    
-    float clip = 0.5;
-    
-    // Position update with magnitude limiting
+
+    // Position update
     // Using manual indexing to avoid float3 z-component corruption
     {
-        // Clamp gradients
-        float3 grad = clamp(float3(g.position_x, g.position_y, g.position_z), -clip, clip);
+        float3 grad = float3(g_position_x, g_position_y, g_position_z);
         
-        // Read manually from float* buffer
+        // Read manually from float* buffer, sanitize corrupted moments
         float3 m_old = float3(m_position[tid * 3 + 0], m_position[tid * 3 + 1], m_position[tid * 3 + 2]);
         float3 v_old = float3(v_position[tid * 3 + 0], v_position[tid * 3 + 1], v_position[tid * 3 + 2]);
-        
+        if (!isfinite(m_old.x)) m_old.x = 0; if (!isfinite(m_old.y)) m_old.y = 0; if (!isfinite(m_old.z)) m_old.z = 0;
+        if (!isfinite(v_old.x)) v_old.x = 0; if (!isfinite(v_old.y)) v_old.y = 0; if (!isfinite(v_old.z)) v_old.z = 0;
+
         // Adam moment updates
         float3 m = beta1 * m_old + (1.0 - beta1) * grad;
         float3 v = beta2 * v_old + (1.0 - beta2) * grad * grad;
@@ -598,13 +648,8 @@ kernel void adamStep(
         float3 v_hat = v / bc2;
         float3 update = lrs[0] * m_hat / (sqrt(v_hat) + epsilon);
         
-        // Limit update magnitude
-        float updateMag = length(update);
-        if (updateMag > 0.1) {
-            update = update * (0.1 / updateMag);
-        }
-        
         // Apply update
+        // Adam + LR decay + gradient clipping naturally limit step sizes)
         float3 newPos = gaussians[tid].position - update;
         
         // Sanity check
@@ -618,14 +663,14 @@ kernel void adamStep(
     // Use stricter max_scale_train during training to prevent elongation
     // Using manual indexing to avoid float3 z-component corruption
     {
-        // Clamp gradients
-        float3 rawGrad = float3(g.scale_x, g.scale_y, g.scale_z);
-        float3 grad = clamp(rawGrad, -clip, clip);
+        float3 grad = float3(g_scale_x, g_scale_y, g_scale_z);
         
-        // Read manually from float* buffer
+        // Read manually from float* buffer, sanitize corrupted moments
         float3 m_old = float3(m_scale[tid * 3 + 0], m_scale[tid * 3 + 1], m_scale[tid * 3 + 2]);
         float3 v_old = float3(v_scale[tid * 3 + 0], v_scale[tid * 3 + 1], v_scale[tid * 3 + 2]);
-        
+        if (!isfinite(m_old.x)) m_old.x = 0; if (!isfinite(m_old.y)) m_old.y = 0; if (!isfinite(m_old.z)) m_old.z = 0;
+        if (!isfinite(v_old.x)) v_old.x = 0; if (!isfinite(v_old.y)) v_old.y = 0; if (!isfinite(v_old.z)) v_old.z = 0;
+
         // Adam moment updates
         float3 m = beta1 * m_old + (1.0 - beta1) * grad;
         float3 v = beta2 * v_old + (1.0 - beta2) * grad * grad;
@@ -642,51 +687,55 @@ kernel void adamStep(
         float3 m_hat = m / bc1;
         float3 v_hat = v / bc2;
         float3 newScale = gaussians[tid].scale - lrs[1] * m_hat / (sqrt(v_hat) + epsilon);
-        gaussians[tid].scale = clamp(newScale, -MAX_SCALE_TRAIN, MAX_SCALE_TRAIN);
+        if (isfinite(newScale.x) && isfinite(newScale.y) && isfinite(newScale.z)) {
+            // lrs[6] optionally supplies an upper cap derived from world-space pruning
+            // (e.g. log(0.1*sceneExtent)). Keep it within [-MAX_SCALE_TRAIN, MAX_SCALE_TRAIN].
+            float maxLog = lrs[6];
+            maxLog = min(maxLog, MAX_SCALE_TRAIN);
+            maxLog = max(maxLog, -MAX_SCALE_TRAIN);
+            gaussians[tid].scale = clamp(newScale, -MAX_SCALE_TRAIN, maxLog);
+        }
     }
     
     // Rotation update
     {
-        // Clamp gradients
-        float4 grad = clamp(g.rotation, -clip, clip);
+        float4 grad = g_rotation;
+        // Sanitize corrupted moments
+        float4 m_old_r = m_rotation[tid];
+        float4 v_old_r = v_rotation[tid];
+        if (!isfinite(m_old_r.x)) m_old_r.x = 0; if (!isfinite(m_old_r.y)) m_old_r.y = 0;
+        if (!isfinite(m_old_r.z)) m_old_r.z = 0; if (!isfinite(m_old_r.w)) m_old_r.w = 0;
+        if (!isfinite(v_old_r.x)) v_old_r.x = 0; if (!isfinite(v_old_r.y)) v_old_r.y = 0;
+        if (!isfinite(v_old_r.z)) v_old_r.z = 0; if (!isfinite(v_old_r.w)) v_old_r.w = 0;
         // Adam moment updates
-        float4 m = beta1 * m_rotation[tid] + (1.0 - beta1) * grad;
-        float4 v = beta2 * v_rotation[tid] + (1.0 - beta2) * grad * grad;
+        float4 m = beta1 * m_old_r + (1.0 - beta1) * grad;
+        float4 v = beta2 * v_old_r + (1.0 - beta2) * grad * grad;
         m_rotation[tid] = m;
         v_rotation[tid] = v;
-        
+
         // Compute bias-corrected estimates
         float4 m_hat = m / bc1;
         float4 v_hat = v / bc2;
         // Update rotation
         float4 newRot = gaussians[tid].rotation - lrs[2] * m_hat / (sqrt(v_hat) + epsilon);
         float rotLen = length(newRot);
-        gaussians[tid].rotation = (rotLen > 0.001) ? (newRot / rotLen) : float4(1, 0, 0, 0);
+        if (isfinite(rotLen) && rotLen > 0.001) {
+            gaussians[tid].rotation = newRot / rotLen;
+        }
     }
     
     // Opacity update stays in raw space
     {
-        // Opacity regularization penalize very high opacities to prevent blocking
-        // This helps gradients flow through the scene and prevents death spirals
-        float rawOp = gaussians[tid].opacity;
-        float sigOp = 1.0 / (1.0 + exp(-rawOp));
+        float grad = g_opacity;
 
-        // Add regularization gradient when opacity > 0.95 pushes towards lower opacity
-        // The regularization strength scales with how far above 0.95 we are
-        float opacityRegGrad = 0.0f;
-        if (sigOp > 0.95f) {
-            // Gradient of sigmoid is sig * (1 - sig), so dL/dRaw = dL/dSig * sig * (1-sig)
-            // We want to push opacity down, so positive gradient on raw opacity
-            float excess = sigOp - 0.95f;
-            opacityRegGrad = 0.1f * excess * sigOp * (1.0f - sigOp);
-        }
-
-        // Clamp gradient and add regularization
-        float grad = clamp(g.opacity, -clip, clip) + opacityRegGrad;
-
+        // Sanitize corrupted moments
+        float m_old_o = m_opacity[tid];
+        float v_old_o = v_opacity[tid];
+        if (!isfinite(m_old_o)) m_old_o = 0;
+        if (!isfinite(v_old_o)) v_old_o = 0;
         // Adam moment updates
-        float m = beta1 * m_opacity[tid] + (1.0 - beta1) * grad;
-        float v = beta2 * v_opacity[tid] + (1.0 - beta2) * grad * grad;
+        float m = beta1 * m_old_o + (1.0 - beta1) * grad;
+        float v = beta2 * v_old_o + (1.0 - beta2) * grad * grad;
         // Write back
         m_opacity[tid] = m;
         v_opacity[tid] = v;
@@ -694,33 +743,51 @@ kernel void adamStep(
         // Compute bias-corrected estimates
         float m_hat = m / bc1;
         float v_hat = v / bc2;
-        gaussians[tid].opacity = clamp(gaussians[tid].opacity - lrs[3] * m_hat / (sqrt(v_hat) + epsilon), -8.0f, 8.0f);
+        float newOp = gaussians[tid].opacity - lrs[3] * m_hat / (sqrt(v_hat) + epsilon);
+        if (isfinite(newOp)) {
+            gaussians[tid].opacity = clamp(newOp, -8.0f, 8.0f);
+        }
     }
     
-    // SH update DC terms only (indices 0, 4, 8)
-    int sh_indices[3] = {0, 4, 8};
+    // SH update DC terms and degree-1 terms 
+    // Official 3DGS uses lr/20 for degree>=1 terms and activates them at iter 1000
+    for (int i = 0; i < 12; i++) {
+        // DC indices are 0, 4, 8 rest are degree-1
+        bool isDC = (i == 0 || i == 4 || i == 8);
+        float lr = isDC ? lrs[4] : lrs[5];
 
-    for (int j = 0; j < 3; j++) {
-        int i = sh_indices[j];
-        float grad = clamp(g.sh[i], -clip, clip);
+        // Skip degree-1 terms when not yet active 
+        // Also keep momentum zeroed to prevent stale accumulation
+        if (lr == 0.0f) {
+            m_sh[tid * 12 + i] = 0;
+            v_sh[tid * 12 + i] = 0;
+            continue;
+        }
+
+        float grad = g_sh[i];
 
         uint idx = tid * 12 + i;
 
+        // Sanitize corrupted moments
+        float m_old_sh = m_sh[idx];
+        float v_old_sh = v_sh[idx];
+        if (!isfinite(m_old_sh)) m_old_sh = 0;
+        if (!isfinite(v_old_sh)) v_old_sh = 0;
         // Adam moment updates
-        float m = beta1 * m_sh[idx] + (1.0 - beta1) * grad;
-        float v = beta2 * v_sh[idx] + (1.0 - beta2) * grad * grad;
+        float m = beta1 * m_old_sh + (1.0 - beta1) * grad;
+        float v = beta2 * v_old_sh + (1.0 - beta2) * grad * grad;
         m_sh[idx] = m;
         v_sh[idx] = v;
 
         // Compute bias-corrected estimates
         float m_hat = m / bc1;
         float v_hat = v / bc2;
-        float newSH = gaussians[tid].sh[i] - lrs[4] * m_hat / (sqrt(v_hat) + epsilon);
 
-        // Clamp for numerical stability
-        newSH = clamp(newSH, -5.0f, 5.0f);
+        float newSH = gaussians[tid].sh[i] - lr * m_hat / (sqrt(v_hat) + epsilon);
 
-        gaussians[tid].sh[i] = newSH;
+        if (!isnan(newSH) && !isinf(newSH)) {
+            gaussians[tid].sh[i] = newSH;
+        }
     }
 }
 
@@ -730,7 +797,7 @@ struct BlitVertexOut {
     float2 texCoord;
 };
 
-// Full-screen triangle vertex shader (no vertex buffer needed)
+// Full-screen triangle vertex shader
 vertex BlitVertexOut blitVertexShader(uint vertexID [[vertex_id]]) {
     BlitVertexOut out;
 

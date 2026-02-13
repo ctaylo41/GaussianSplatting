@@ -10,7 +10,7 @@
 
 // Adam Optimizer class for updating Gaussian parameters
 AdamOptimizer::AdamOptimizer(MTL::Device* device, MTL::Library* library, size_t numGaussians)
-: device(device), numGaussians(numGaussians), timestep(0) {
+: device(device), numGaussians(numGaussians), bufferCapacity(numGaussians), timestep(0) {
     
     // Create compute pipeline for Adam optimizer
     NS::Error* error = nullptr;
@@ -60,6 +60,7 @@ void AdamOptimizer::allocateBuffers(size_t count) {
 
 // Destructor to release buffers
 AdamOptimizer::~AdamOptimizer() {
+    waitForLastStep();
     m_position->release();
     m_scale->release();
     m_rotation->release();
@@ -90,12 +91,16 @@ void AdamOptimizer::reset() {
     memset(v_sh->contents(), 0, v_sh->length());
 }
 
-// Resize Adam state buffers if number of Gaussians increases
+// Resize Adam state buffers if number of Gaussians exceeds capacity
 void AdamOptimizer::resizeIfNeeded(size_t newNumGaussians) {
-    if (newNumGaussians <= numGaussians) return;
-    
-    std::cout << "Resizing optimizer buffers from " << numGaussians << " to " << newNumGaussians << std::endl;
-    
+    // Update actual count
+    numGaussians = newNumGaussians;
+
+    // Only resize buffers if we exceed capacity
+    if (newNumGaussians <= bufferCapacity) return;
+
+    std::cout << "Resizing optimizer buffers from " << bufferCapacity << " to " << newNumGaussians << std::endl;
+
     // Helper lambda to resize a buffer
     auto resizeBuffer = [this](MTL::Buffer*& buf, size_t newSize) {
         MTL::Buffer* newBuf = device->newBuffer(newSize, MTL::ResourceStorageModeShared);
@@ -109,14 +114,14 @@ void AdamOptimizer::resizeIfNeeded(size_t newNumGaussians) {
         buf->release();
         buf = newBuf;
     };
-    
+
     // Calculate new sizes
     size_t posSize = newNumGaussians * 3 * sizeof(float);
     size_t scaleSize = newNumGaussians * 3 * sizeof(float);
     size_t rotSize = newNumGaussians * sizeof(simd_float4);
     size_t opacitySize = newNumGaussians * sizeof(float);
     size_t shSize = newNumGaussians * 12 * sizeof(float);
-    
+
     // Resize all buffers
     resizeBuffer(m_position, posSize);
     resizeBuffer(m_scale, scaleSize);
@@ -128,14 +133,21 @@ void AdamOptimizer::resizeIfNeeded(size_t newNumGaussians) {
     resizeBuffer(v_rotation, rotSize);
     resizeBuffer(v_opacity, opacitySize);
     resizeBuffer(v_sh, shSize);
-    
-    numGaussians = newNumGaussians;
+
+    bufferCapacity = newNumGaussians;
 }
 
 // Reset momentum for opacity to allow fresh learning after opacity reset
 void AdamOptimizer::resetOpacityMomentum() {
     memset(m_opacity->contents(), 0, numGaussians * sizeof(float));
     memset(v_opacity->contents(), 0, numGaussians * sizeof(float));
+}
+
+// Reset position momentum after opacity reset - prevents stale momentum from causing drift
+void AdamOptimizer::resetPositionMomentum() {
+    memset(m_position->contents(), 0, numGaussians * 3 * sizeof(float));
+    memset(v_position->contents(), 0, numGaussians * 3 * sizeof(float));
+    std::cout << "Reset position momentum after opacity reset" << std::endl;
 }
 
 // Reset scale momentum after opacity reset
@@ -145,11 +157,170 @@ void AdamOptimizer::resetScaleMomentum() {
     std::cout << "Reset scale momentum after opacity reset" << std::endl;
 }
 
+// Reset rotation momentum after opacity reset
+void AdamOptimizer::resetRotationMomentum() {
+    simd_float4* m_rot = (simd_float4*)m_rotation->contents();
+    simd_float4* v_rot = (simd_float4*)v_rotation->contents();
+    for (size_t i = 0; i < numGaussians; i++) {
+        m_rot[i] = simd_make_float4(0, 0, 0, 0);
+        v_rot[i] = simd_make_float4(0, 0, 0, 0);
+    }
+    std::cout << "Reset rotation momentum after opacity reset" << std::endl;
+}
+
 // Reset SH momentum after opacity reset
 void AdamOptimizer::resetSHMomentum() {
     memset(m_sh->contents(), 0, numGaussians * 12 * sizeof(float));
     memset(v_sh->contents(), 0, numGaussians * 12 * sizeof(float));
     std::cout << "Reset SH momentum after opacity reset" << std::endl;
+}
+
+// Reset ALL Adam momentum after density control (keeps timestep for bias correction)
+void AdamOptimizer::resetAllMomentum() {
+    memset(m_position->contents(), 0, numGaussians * 3 * sizeof(float));
+    memset(v_position->contents(), 0, numGaussians * 3 * sizeof(float));
+    memset(m_scale->contents(), 0, numGaussians * 3 * sizeof(float));
+    memset(v_scale->contents(), 0, numGaussians * 3 * sizeof(float));
+    memset(m_opacity->contents(), 0, numGaussians * sizeof(float));
+    memset(v_opacity->contents(), 0, numGaussians * sizeof(float));
+    memset(m_sh->contents(), 0, numGaussians * 12 * sizeof(float));
+    memset(v_sh->contents(), 0, numGaussians * 12 * sizeof(float));
+    simd_float4* m_rot = (simd_float4*)m_rotation->contents();
+    simd_float4* v_rot = (simd_float4*)v_rotation->contents();
+    for (size_t i = 0; i < numGaussians; i++) {
+        m_rot[i] = simd_make_float4(0, 0, 0, 0);
+        v_rot[i] = simd_make_float4(0, 0, 0, 0);
+    }
+}
+
+// Remap momentum buffers after density control using old→new index mapping
+void AdamOptimizer::remapMomentum(const std::vector<std::pair<size_t, size_t>>& indexMapping,
+                                   size_t newCount) {
+    // Allocate temporary buffers to build remapped state
+    size_t posSize = newCount * 3 * sizeof(float);
+    size_t scaleSize = newCount * 3 * sizeof(float);
+    size_t rotSize = newCount * sizeof(simd_float4);
+    size_t opacitySize = newCount * sizeof(float);
+    size_t shSize = newCount * 12 * sizeof(float);
+
+    // Create new zeroed buffers
+    MTL::Buffer* new_m_pos = device->newBuffer(posSize, MTL::ResourceStorageModeShared);
+    MTL::Buffer* new_v_pos = device->newBuffer(posSize, MTL::ResourceStorageModeShared);
+    MTL::Buffer* new_m_scl = device->newBuffer(scaleSize, MTL::ResourceStorageModeShared);
+    MTL::Buffer* new_v_scl = device->newBuffer(scaleSize, MTL::ResourceStorageModeShared);
+    MTL::Buffer* new_m_rot = device->newBuffer(rotSize, MTL::ResourceStorageModeShared);
+    MTL::Buffer* new_v_rot = device->newBuffer(rotSize, MTL::ResourceStorageModeShared);
+    MTL::Buffer* new_m_op = device->newBuffer(opacitySize, MTL::ResourceStorageModeShared);
+    MTL::Buffer* new_v_op = device->newBuffer(opacitySize, MTL::ResourceStorageModeShared);
+    MTL::Buffer* new_m_sh = device->newBuffer(shSize, MTL::ResourceStorageModeShared);
+    MTL::Buffer* new_v_sh = device->newBuffer(shSize, MTL::ResourceStorageModeShared);
+
+    // Zero-initialize all new buffers
+    memset(new_m_pos->contents(), 0, posSize);
+    memset(new_v_pos->contents(), 0, posSize);
+    memset(new_m_scl->contents(), 0, scaleSize);
+    memset(new_v_scl->contents(), 0, scaleSize);
+    memset(new_m_rot->contents(), 0, rotSize);
+    memset(new_v_rot->contents(), 0, rotSize);
+    memset(new_m_op->contents(), 0, opacitySize);
+    memset(new_v_op->contents(), 0, opacitySize);
+    memset(new_m_sh->contents(), 0, shSize);
+    memset(new_v_sh->contents(), 0, shSize);
+
+    // Get pointers to old buffers
+    float* old_m_pos = (float*)m_position->contents();
+    float* old_v_pos = (float*)v_position->contents();
+    float* old_m_scl = (float*)m_scale->contents();
+    float* old_v_scl = (float*)v_scale->contents();
+    simd_float4* old_m_rot = (simd_float4*)m_rotation->contents();
+    simd_float4* old_v_rot = (simd_float4*)v_rotation->contents();
+    float* old_m_op = (float*)m_opacity->contents();
+    float* old_v_op = (float*)v_opacity->contents();
+    float* old_m_sh = (float*)m_sh->contents();
+    float* old_v_sh = (float*)v_sh->contents();
+
+    // Get pointers to new buffers
+    float* nm_pos = (float*)new_m_pos->contents();
+    float* nv_pos = (float*)new_v_pos->contents();
+    float* nm_scl = (float*)new_m_scl->contents();
+    float* nv_scl = (float*)new_v_scl->contents();
+    simd_float4* nm_rot = (simd_float4*)new_m_rot->contents();
+    simd_float4* nv_rot = (simd_float4*)new_v_rot->contents();
+    float* nm_op = (float*)new_m_op->contents();
+    float* nv_op = (float*)new_v_op->contents();
+    float* nm_sh = (float*)new_m_sh->contents();
+    float* nv_sh = (float*)new_v_sh->contents();
+
+    // Copy momentum from old index to new index
+    size_t preserved = 0;
+    for (const auto& mapping : indexMapping) {
+        size_t oldIdx = mapping.first;
+        size_t newIdx = mapping.second;
+
+        if (oldIdx < numGaussians && newIdx < newCount) {
+            // Position
+            nm_pos[newIdx * 3 + 0] = old_m_pos[oldIdx * 3 + 0];
+            nm_pos[newIdx * 3 + 1] = old_m_pos[oldIdx * 3 + 1];
+            nm_pos[newIdx * 3 + 2] = old_m_pos[oldIdx * 3 + 2];
+            nv_pos[newIdx * 3 + 0] = old_v_pos[oldIdx * 3 + 0];
+            nv_pos[newIdx * 3 + 1] = old_v_pos[oldIdx * 3 + 1];
+            nv_pos[newIdx * 3 + 2] = old_v_pos[oldIdx * 3 + 2];
+
+            // Scale
+            nm_scl[newIdx * 3 + 0] = old_m_scl[oldIdx * 3 + 0];
+            nm_scl[newIdx * 3 + 1] = old_m_scl[oldIdx * 3 + 1];
+            nm_scl[newIdx * 3 + 2] = old_m_scl[oldIdx * 3 + 2];
+            nv_scl[newIdx * 3 + 0] = old_v_scl[oldIdx * 3 + 0];
+            nv_scl[newIdx * 3 + 1] = old_v_scl[oldIdx * 3 + 1];
+            nv_scl[newIdx * 3 + 2] = old_v_scl[oldIdx * 3 + 2];
+
+            // Rotation
+            nm_rot[newIdx] = old_m_rot[oldIdx];
+            nv_rot[newIdx] = old_v_rot[oldIdx];
+
+            // Opacity
+            nm_op[newIdx] = old_m_op[oldIdx];
+            nv_op[newIdx] = old_v_op[oldIdx];
+
+            // SH (12 coefficients)
+            for (int s = 0; s < 12; s++) {
+                nm_sh[newIdx * 12 + s] = old_m_sh[oldIdx * 12 + s];
+                nv_sh[newIdx * 12 + s] = old_v_sh[oldIdx * 12 + s];
+            }
+
+            preserved++;
+        }
+    }
+
+    // Release old buffers
+    m_position->release();
+    v_position->release();
+    m_scale->release();
+    v_scale->release();
+    m_rotation->release();
+    v_rotation->release();
+    m_opacity->release();
+    v_opacity->release();
+    m_sh->release();
+    v_sh->release();
+
+    // Assign new buffers
+    m_position = new_m_pos;
+    v_position = new_v_pos;
+    m_scale = new_m_scl;
+    v_scale = new_v_scl;
+    m_rotation = new_m_rot;
+    v_rotation = new_v_rot;
+    m_opacity = new_m_op;
+    v_opacity = new_v_op;
+    m_sh = new_m_sh;
+    v_sh = new_v_sh;
+
+    numGaussians = newCount;
+    bufferCapacity = newCount;
+
+    std::cout << "Remapped Adam momentum: " << preserved << " preserved, "
+              << (newCount - preserved) << " new (zeroed)" << std::endl;
 }
 
 // Reset Adam state for Gaussians starting at index startIdx after split/clone
@@ -243,6 +414,15 @@ void AdamOptimizer::printGPUDebug() {
     printf("[GPU Debug] scale_old = (%.6f, %.6f, %.6f)\n", debug[14], debug[15], 0.0f);  // Only 2 values fit
 }
 
+// Wait for the last async step to complete
+void AdamOptimizer::waitForLastStep() {
+    if (lastCmdBuffer) {
+        lastCmdBuffer->waitUntilCompleted();
+        lastCmdBuffer->release();
+        lastCmdBuffer = nullptr;
+    }
+}
+
 // Perform one Adam optimization step
 void AdamOptimizer::step(MTL::CommandQueue* queue,
                          MTL::Buffer* gaussians,
@@ -251,18 +431,24 @@ void AdamOptimizer::step(MTL::CommandQueue* queue,
                          float lr_scale,
                          float lr_rotation,
                          float lr_opacity,
-                         float lr_sh) {
+                         float lr_sh,
+                         float lr_sh_rest,
+                         float maxLogScaleTrain,
+                         bool wait) {
+    // Ensure any previous async step is complete before reusing state buffers
+    waitForLastStep();
+
     timestep++;
-    
+
     // Create command buffer and encoder
     MTL::CommandBuffer* cmd = queue->commandBuffer();
     MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
-    
+
     // Set pipeline and buffers
     enc->setComputePipelineState(adamPSO);
     enc->setBuffer(gaussians, 0, 0);
     enc->setBuffer(gradients, 0, 1);
-    
+
     enc->setBuffer(m_position, 0, 2);
     enc->setBuffer(m_scale, 0, 3);
     enc->setBuffer(m_rotation, 0, 4);
@@ -273,9 +459,9 @@ void AdamOptimizer::step(MTL::CommandQueue* queue,
     enc->setBuffer(v_rotation, 0, 9);
     enc->setBuffer(v_opacity, 0, 10);
     enc->setBuffer(v_sh, 0, 11);
-    
+
     // Set learning rates
-    float lrs[5] = {lr_position, lr_scale, lr_rotation, lr_opacity, lr_sh};
+    float lrs[7] = {lr_position, lr_scale, lr_rotation, lr_opacity, lr_sh, lr_sh_rest, maxLogScaleTrain};
     enc->setBytes(lrs, sizeof(lrs), 12);
 
     // Set Adam hyperparameters
@@ -288,16 +474,22 @@ void AdamOptimizer::step(MTL::CommandQueue* queue,
     enc->setBytes(&epsilon, sizeof(float), 15);
     enc->setBytes(params, sizeof(params), 16);
     // Debug buffer for GPU-side debugging
-    enc->setBuffer(debugBuffer, 0, 17);  
+    enc->setBuffer(debugBuffer, 0, 17);
 
     // Dispatch threads
     MTL::Size grid = MTL::Size(numGaussians, 1, 1);
     MTL::Size threadgroup = MTL::Size(64, 1, 1);
     enc->dispatchThreads(grid, threadgroup);
-    
+
     // End encoding and commit
     enc->endEncoding();
     cmd->commit();
-    cmd->waitUntilCompleted();
+
+    if (wait) {
+        cmd->waitUntilCompleted();
+    } else {
+        // Retain for later waitForLastStep()
+        lastCmdBuffer = cmd->retain();
+    }
 }
 
