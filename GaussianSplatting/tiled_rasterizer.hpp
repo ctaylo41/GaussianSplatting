@@ -81,8 +81,24 @@ public:
 
     // Get per-pixel loss gradient buffer (output of computePixelGradient)
     MTL::Buffer* getPixelGradientBuffer() const { return pixelGradientBuffer; }
-    
+
+    // True when the most recent forward/backward had a command buffer abort.
+    // The buffers those passes write to are shared-storage and are NOT rolled back
+    // on failure, so a caller that ignores this will feed partial/stale gradients
+    // into the optimizer. Always check before stepping Adam.
+    bool lastPassFailed() const { return passFailed; }
+    void clearPassFailed() { passFailed = false; }
+
+    // Cumulative count of aborted command buffers since startup.
+    uint64_t getAbortCount() const { return abortCount; }
+
 private:
+    // Commits, waits, and reports any execution error. Returns false on abort.
+    bool commitAndCheck(MTL::CommandBuffer* cmdBuffer, const char* label);
+
+    bool passFailed = false;
+    uint64_t abortCount = 0;
+
     static constexpr uint32_t TILE_SIZE = 16;
     // Average Gaussians touch 4-8 tiles depending on size
     static constexpr uint32_t AVG_TILES_PER_GAUSSIAN = 16;

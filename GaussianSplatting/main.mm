@@ -13,46 +13,130 @@
 #include "colmap_loader.hpp"
 #include "image_loader.hpp"
 #include "ply_exporter.hpp"
+#include <algorithm>
+#include <cmath>
+#include <queue>
+#include <vector>
+#include <dispatch/dispatch.h>
 
-// Compute Mean Nearest Neighbor Distance for a point
-float computeMeanNearestNeighborDistance(const std::vector<ColmapPoint>& points,
-                                          size_t pointIdx,
-                                          int k = 3) {
-    const auto& pt = points[pointIdx];
-    
-    // Use a max-heap to find k smallest distances
-    std::priority_queue<float> nearestDistances;
-    
-    // Iterate through all points to find nearest neighbors
-    for (size_t i = 0; i < points.size(); i++) {
-        if (i == pointIdx) continue;
-        
-        // Compute Euclidean distance
-        float dx = points[i].position.x - pt.position.x;
-        float dy = points[i].position.y - pt.position.y;
-        float dz = points[i].position.z - pt.position.z;
-        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-        
-        // Maintain a max-heap of size k
-        if (nearestDistances.size() < k) {
-            nearestDistances.push(dist);
-        } else if (dist < nearestDistances.top()) {
-            nearestDistances.pop();
-            nearestDistances.push(dist);
+// k-d tree over the COLMAP point cloud for k-nearest-neighbour queries.
+//
+// A brute-force scan is O(N^2), which is why this used to be sampled down to one global
+// median. A uniform grid is not a safe replacement either: COLMAP reconstructions contain
+// far-flung outlier points that stretch the bounding box (the bicycle scene spans 201
+// units diagonally while nearly every point sits within ~10 of the centre), so uniform
+// cells put almost the whole cloud in a handful of buckets and degrade back to O(N^2).
+// A k-d tree splits on the actual point distribution, so it is insensitive to that skew.
+struct KDTree {
+    struct Node {
+        int lo, hi;         // range in `order`, used only for leaves
+        int axis;           // split axis, -1 for a leaf
+        float split;        // split coordinate
+        int left, right;    // child node indices, -1 for a leaf
+    };
+
+    static constexpr int LEAF_SIZE = 16;
+
+    const std::vector<ColmapPoint>& points;
+    std::vector<uint32_t> order;   // permutation of point indices
+    std::vector<Node> nodes;
+
+    explicit KDTree(const std::vector<ColmapPoint>& pts) : points(pts) {
+        order.resize(pts.size());
+        for (uint32_t i = 0; i < pts.size(); i++) order[i] = i;
+        nodes.reserve(2 * (pts.size() / LEAF_SIZE + 1));
+        build(0, (int)pts.size());
+    }
+
+    // Returns the index of the node covering order[lo, hi)
+    int build(int lo, int hi) {
+        int nodeIdx = (int)nodes.size();
+        nodes.push_back({lo, hi, -1, 0.0f, -1, -1});
+
+        if (hi - lo <= LEAF_SIZE) return nodeIdx;
+
+        // Split on the axis with the widest spread within this range
+        simd_float3 mn = points[order[lo]].position;
+        simd_float3 mx = mn;
+        for (int i = lo + 1; i < hi; i++) {
+            mn = simd_min(mn, points[order[i]].position);
+            mx = simd_max(mx, points[order[i]].position);
+        }
+        simd_float3 span = mx - mn;
+        int axis = (span.x > span.y) ? ((span.x > span.z) ? 0 : 2)
+                                     : ((span.y > span.z) ? 1 : 2);
+
+        // Degenerate range (all points coincident) - keep it as a leaf
+        if (span[axis] <= 0.0f) return nodeIdx;
+
+        int mid = lo + (hi - lo) / 2;
+        std::nth_element(order.begin() + lo, order.begin() + mid, order.begin() + hi,
+                         [&](uint32_t a, uint32_t b) {
+                             return points[a].position[axis] < points[b].position[axis];
+                         });
+
+        nodes[nodeIdx].axis = axis;
+        nodes[nodeIdx].split = points[order[mid]].position[axis];
+
+        int left = build(lo, mid);
+        int right = build(mid, hi);
+        // build() can reallocate `nodes`, so assign through a fresh reference
+        nodes[nodeIdx].left = left;
+        nodes[nodeIdx].right = right;
+        return nodeIdx;
+    }
+
+    // k-NN search. `heap` is a max-heap of the k smallest squared distances found so far.
+    void search(int nodeIdx, simd_float3 q, size_t selfIdx, int k,
+                std::priority_queue<float>& heap) const {
+        const Node& n = nodes[nodeIdx];
+
+        if (n.axis < 0) {
+            for (int i = n.lo; i < n.hi; i++) {
+                uint32_t idx = order[i];
+                if (idx == selfIdx) continue;
+                simd_float3 d = points[idx].position - q;
+                float d2 = simd_dot(d, d);
+                if ((int)heap.size() < k) {
+                    heap.push(d2);
+                } else if (d2 < heap.top()) {
+                    heap.pop();
+                    heap.push(d2);
+                }
+            }
+            return;
+        }
+
+        // Descend the near side first so the pruning bound tightens as early as possible
+        float delta = q[n.axis] - n.split;
+        int near = (delta < 0.0f) ? n.left : n.right;
+        int far  = (delta < 0.0f) ? n.right : n.left;
+
+        search(near, q, selfIdx, k, heap);
+        if ((int)heap.size() < k || delta * delta < heap.top()) {
+            search(far, q, selfIdx, k, heap);
         }
     }
-    
-    // Compute mean of k nearest distances
+};
+
+// Compute Mean Nearest Neighbor Distance for a point. Exact k-NN via the k-d tree.
+float computeMeanNearestNeighborDistance(const KDTree& tree,
+                                          size_t pointIdx,
+                                          int k = 3) {
+    std::priority_queue<float> heap;  // squared distances
+    tree.search(0, tree.points[pointIdx].position, pointIdx, k, heap);
+
+    // Mean of the k nearest distances
     float sum = 0.0f;
     int count = 0;
-    while (!nearestDistances.empty()) {
-        sum += nearestDistances.top();
-        nearestDistances.pop();
+    while (!heap.empty()) {
+        sum += sqrtf(heap.top());
+        heap.pop();
         count++;
     }
-    
+
     // Default if no neighbors
-    return (count > 0) ? (sum / count) : 0.1f;  
+    return (count > 0) ? (sum / count) : 0.1f;
 }
 
 // Create Gaussians from COLMAP points
@@ -80,46 +164,37 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
 
     std::cout << "Computing initial scales from nearest neighbor distances..." << std::endl;
     
-    // Precompute initial scales based on nearest neighbor distances
+    // Precompute initial scales from each point's own nearest-neighbour distance.
+    // Assigning one global median to every point (the previous behaviour) makes Gaussians
+    // in dense, detailed regions far too large and destroys high-frequency detail.
     std::vector<float> initialScales(colmap.points.size());
-    
-    // For large point clouds, sampling can speed this up
-    bool useSampling = (colmap.points.size() > 10000);
-    
-    if (useSampling) {
-        // Compute for a sample and use median for the rest
-        std::vector<float> sampleScales;
-        size_t sampleSize = std::min((size_t)1000, colmap.points.size());
-        size_t step = colmap.points.size() / sampleSize;
-        
-        // Sample points at regular intervals
-        for (size_t i = 0; i < colmap.points.size(); i += step) {
-            // Compute mean nearest neighbor distance for sampled point
-            float dist = computeMeanNearestNeighborDistance(colmap.points, i, 3);
-            sampleScales.push_back(dist);
+
+    KDTree tree(colmap.points);
+
+    // Blocks capture C++ objects by const copy, so hand the parallel loop raw pointers.
+    // Dispatch a fixed number of stripes rather than one block per point: 240k blocks of
+    // a few microseconds each is mostly dispatch overhead.
+    const KDTree* treePtr = &tree;
+    float* scalesPtr = initialScales.data();
+    const size_t numPoints = colmap.points.size();
+    const size_t numStripes = 8;
+    const size_t stripeSize = (numPoints + numStripes - 1) / numStripes;
+
+    dispatch_apply(numStripes, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(size_t s) {
+        size_t begin = s * stripeSize;
+        size_t end = std::min(begin + stripeSize, numPoints);
+        for (size_t i = begin; i < end; i++) {
+            scalesPtr[i] = computeMeanNearestNeighborDistance(*treePtr, i, 3);
         }
-        
-        // Use median as default scale
-        std::sort(sampleScales.begin(), sampleScales.end());
-        float medianScale = sampleScales[sampleScales.size() / 2];
-        
-        std::cout << "Using median nearest neighbor distance: " << medianScale << std::endl;
-        
-        // Assign median scale to all points
-        for (size_t i = 0; i < colmap.points.size(); i++) {
-            initialScales[i] = medianScale;
-        }
-    } else {
-        // Compute for all points
-        for (size_t i = 0; i < colmap.points.size(); i++) {
-            // Compute mean nearest neighbor distance for point
-            initialScales[i] = computeMeanNearestNeighborDistance(colmap.points, i, 3);
-            
-            if (i % 5000 == 0) {
-                std::cout << "\rProcessed " << i << "/" << colmap.points.size() << std::flush;
-            }
-        }
-        std::cout << std::endl;
+    });
+
+    // Report the spread so a degenerate initialization is visible in the logs
+    {
+        std::vector<float> sorted = initialScales;
+        std::sort(sorted.begin(), sorted.end());
+        std::cout << "Per-point nearest neighbor distance: min=" << sorted.front()
+                  << " p50=" << sorted[sorted.size() / 2]
+                  << " max=" << sorted.back() << std::endl;
     }
     
     // Create Gaussians using initial scales
@@ -197,13 +272,13 @@ std::vector<Gaussian> gaussiansFromColmap(const ColmapData& colmap, float sceneE
 
 int main(int argc, char* argv[]) {
     // Default paths can be overridden with command line args
-    std::string colmapPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/sparse_kitchen/0";
-    std::string imagePath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/images_4_kitchen";
-    std::string outputPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_kitchen.ply";
-    // 30k Iterations for 194 images
-    size_t numEpochs = 108;
+    std::string colmapPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/sparse/0";
+    std::string imagePath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/scenes/images_4";
+    std::string outputPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_bike.ply";
+    // ~30k iterations for the 194-image bicycle scene (194 * 155 ≈ 30,070)
+    size_t numEpochs = 155;
     bool viewOnly = false;
-    std::string viewPlyPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_kitchen.ply";
+    std::string viewPlyPath = "/Users/colintaylortaylor/Documents/GaussianSplatting/GaussianSplatting/output_bike.ply";
     
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {

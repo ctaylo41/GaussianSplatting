@@ -342,7 +342,13 @@ void MTLEngine::initWindow() {
     metalWindow.contentView.layer = metalLayer;
     metalWindow.contentView.wantsLayer = YES;
     metalLayer.frame = metalWindow.contentView.bounds;
-    metalLayer.drawableSize = CGSizeMake(800, 600);
+
+    // The drawable must be sized in backing pixels, not layout points. Hardcoding the
+    // 800x600 window size renders at half resolution on a Retina display and upscales 2x;
+    // glfwGetFramebufferSize reports the real pixel count.
+    glfwGetFramebufferSize(glfwWindow, &windowWidth, &windowHeight);
+    metalLayer.contentsScale = metalWindow.backingScaleFactor;
+    metalLayer.drawableSize = CGSizeMake(windowWidth, windowHeight);
 }
 
 // Setup GLFW callbacks for input handling
@@ -802,8 +808,10 @@ void MTLEngine::framebufferSizeCallback(GLFWwindow* window, int width, int heigh
     MTLEngine* engine = static_cast<MTLEngine*>(glfwGetWindowUserPointer(window));
     engine->windowWidth = width;
     engine->windowHeight = height;
-    
-    // Update Metal layer size
+
+    // Update Metal layer size (width/height are already backing pixels from GLFW)
+    engine->metalLayer.contentsScale = engine->metalWindow.backingScaleFactor;
+    engine->metalLayer.frame = engine->metalWindow.contentView.bounds;
     engine->metalLayer.drawableSize = CGSizeMake(width, height);
     
     // Recreate depth texture
@@ -1263,7 +1271,19 @@ float MTLEngine::trainStep(size_t imageIndex,
 
     // Read loss value (safe - backward wait guarantees loss command buffer completed)
     float loss = readLossValue();
-    
+
+    // If either pass hit a GPU abort, gaussianGradients holds partial or stale data.
+    // Stepping Adam on it applies a garbage update to every Gaussian, and because the
+    // damage is baked into the parameters it never washes out — repeated aborts are what
+    // drive the loss back up late in training. Skip the update and drop the iteration.
+    if (tiledRasterizer->lastPassFailed()) {
+        std::cerr << "[GPU ABORT] skipping optimizer step for image " << imageIndex
+                  << " (gradients unreliable); total aborts so far: "
+                  << tiledRasterizer->getAbortCount() << std::endl;
+        tiledRasterizer->clearPassFailed();
+        return loss;
+    }
+
     // Set actual Gaussian count before optimizer step
     optimizer->setGaussianCount(gaussianCount);
 
@@ -1320,6 +1340,42 @@ float MTLEngine::trainStep(size_t imageIndex,
             printf("*** WARNING: %d Gaussians have scale > 10.0 (max: %.2f) ***\n",
                    scaleExploded, maxScale);
         }
+
+        // Full-population health scan. The sampled stats above only look at the first
+        // 1000 entries, which is a biased sample: density control reorders the array, so
+        // the head skews toward long-lived Gaussians. These counters scan everything and
+        // are the ones to watch across the 15000-iteration boundary, where density control
+        // stops and nothing repairs damaged Gaussians any more.
+        size_t nScaleFloor = 0, nOpacityRail = 0, nDead = 0, nNonFinite = 0;
+        for (size_t i = 0; i < gaussianCount; i++) {
+            const Gaussian& gi = g[i];
+
+            if (!std::isfinite(gi.position.x) || !std::isfinite(gi.position.y) ||
+                !std::isfinite(gi.position.z) || !std::isfinite(gi.opacity) ||
+                !std::isfinite(gi.scale.x) || !std::isfinite(gi.scale.y) ||
+                !std::isfinite(gi.scale.z)) {
+                nNonFinite++;
+                continue;
+            }
+
+            // Collapsed below exp(-6): the log-scale gradient is multiplied by scale, so
+            // these have an effectively zero size gradient and can never grow back. The
+            // +0.3 low-pass filter still renders them as a fixed ~0.55px screen dot whose
+            // footprint does NOT shrink with distance, so they fit one view and are wrong
+            // in every other. Monotonic growth here indicts MIN_SCALE_TRAIN being too low.
+            float maxLogScale = std::max({gi.scale.x, gi.scale.y, gi.scale.z});
+            if (maxLogScale < -6.0f) nScaleFloor++;
+
+            // Pinned at the Adam opacity clamp.
+            if (std::fabs(gi.opacity) >= 7.99f) nOpacityRail++;
+
+            // Below the prune threshold but never pruned (density control ended).
+            if (1.0f / (1.0f + std::exp(-gi.opacity)) < 0.005f) nDead++;
+        }
+
+        printf("[health] scale-floor: %zu (%.2f%%) | opacity-rail: %zu | dead-opacity: %zu | non-finite: %zu\n",
+               nScaleFloor, 100.0 * nScaleFloor / std::max<size_t>(1, gaussianCount),
+               nOpacityRail, nDead, nNonFinite);
     }
     
     return loss;
@@ -1358,9 +1414,19 @@ void MTLEngine::train(size_t numEpochs) {
     
     const float POSITION_LR_INIT = 0.00016f * sceneExtent;
     const float POSITION_LR_FINAL = 0.0000016f * sceneExtent;
-    const float SCALE_LR = 0.005f;
+    // Scale/opacity now decay like position. Rationale: Adam gives every Gaussian a step
+    // of magnitude ~lr regardless of how noisy its gradient is, so a constant scale_lr is
+    // a fixed-size random walk in LOG-scale space for the many under-constrained (near-dead,
+    // dilation-saturated) Gaussians. exp() of that walk drifts upward (E[exp(walk)]=exp(σ²/2)),
+    // which is the scale bloat measured after iter 15000 once split/prune stop masking it.
+    // Decaying the LR collapses the walk variance late in training; converged Gaussians have
+    // tiny gradients anyway so nothing useful is lost. Start scale_lr at half the old value
+    // (0.0025) because walk variance scales with the initial rate, not just the schedule.
+    const float SCALE_LR_INIT = 0.0025f;
+    const float SCALE_LR_FINAL = 0.00025f;
     const float ROTATION_LR = 0.001f;
-    const float OPACITY_LR = 0.05f;
+    const float OPACITY_LR_INIT = 0.05f;
+    const float OPACITY_LR_FINAL = 0.005f;
     const float SH_LR = 0.0025f;
     const float SH_REST_LR = SH_LR / 20.0f;  // 0.000125
     const size_t SH_DEGREE1_ACTIVATE_ITER = 1000;
@@ -1368,8 +1434,10 @@ void MTLEngine::train(size_t numEpochs) {
     // Total iterations for LR scheduling
     const size_t totalExpectedIters = numEpochs * trainingImages.size();
     
-    std::cout << "Learning rate decay: position " << POSITION_LR_INIT 
-              << " -> " << POSITION_LR_FINAL << " over " << totalExpectedIters << " iterations" << std::endl;
+    std::cout << "Learning rate decay over " << totalExpectedIters << " iterations:" << std::endl;
+    std::cout << "  position " << POSITION_LR_INIT << " -> " << POSITION_LR_FINAL << std::endl;
+    std::cout << "  scale    " << SCALE_LR_INIT << " -> " << SCALE_LR_FINAL << std::endl;
+    std::cout << "  opacity  " << OPACITY_LR_INIT << " -> " << OPACITY_LR_FINAL << std::endl;
     
     // Start training timer
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -1397,13 +1465,18 @@ void MTLEngine::train(size_t numEpochs) {
             NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
             
             // Compute decayed learning rates
-            float currentPositionLR = exponentialLRDecay(POSITION_LR_INIT, POSITION_LR_FINAL, 
+            float currentPositionLR = exponentialLRDecay(POSITION_LR_INIT, POSITION_LR_FINAL,
                                                           totalIterations, totalExpectedIters);
-            
+            // Scale/opacity decay on the same exponential schedule to damp the late-training
+            // Adam random walk that inflates scale and drains opacity (see LR constants above).
+            float currentScaleLR = exponentialLRDecay(SCALE_LR_INIT, SCALE_LR_FINAL,
+                                                      totalIterations, totalExpectedIters);
+            float currentOpacityLR = exponentialLRDecay(OPACITY_LR_INIT, OPACITY_LR_FINAL,
+                                                        totalIterations, totalExpectedIters);
+
             // Activate degree-1 SH at iter 1000 (official 3DGS schedule)
             float currentSHRestLR = (totalIterations >= SH_DEGREE1_ACTIVATE_ITER) ? SH_REST_LR : 0.0f;
-            // Official 3DGS: constant LR for scale and opacity (no boost/freeze)
-            float loss = trainStep(shuffledIdx, currentPositionLR, SCALE_LR, ROTATION_LR, OPACITY_LR, SH_LR, currentSHRestLR);
+            float loss = trainStep(shuffledIdx, currentPositionLR, currentScaleLR, ROTATION_LR, currentOpacityLR, SH_LR, currentSHRestLR);
             epochLoss += loss;
             totalIterations++;
             
@@ -1535,10 +1608,39 @@ void MTLEngine::train(size_t numEpochs) {
                   << " | Time: " << epochDuration << "s ===" << std::endl;
     }
     
+    // Final prune. Density control only runs while iteration < DENSIFY_UNTIL_ITER (15000),
+    // so Gaussians that fade below the opacity threshold during the remaining ~15000
+    // iterations are never removed and ship in the PLY as invisible dead weight.
+    {
+        Gaussian* gaussians = (Gaussian*)gaussianBuffer->contents();
+        const float minOpacity = 0.005f;
+
+        size_t writeIdx = 0;
+        for (size_t i = 0; i < gaussianCount; i++) {
+            const Gaussian& g = gaussians[i];
+
+            bool invalid = !std::isfinite(g.position.x) || !std::isfinite(g.position.y) ||
+                           !std::isfinite(g.position.z) || !std::isfinite(g.opacity) ||
+                           !std::isfinite(g.scale.x) || !std::isfinite(g.scale.y) ||
+                           !std::isfinite(g.scale.z);
+
+            float opacity = 1.0f / (1.0f + expf(-g.opacity));
+            if (invalid || opacity < minOpacity) continue;
+
+            gaussians[writeIdx++] = g;
+        }
+
+        size_t removed = gaussianCount - writeIdx;
+        std::cout << "Final prune: removed " << removed << " Gaussians below opacity "
+                  << minOpacity << " (" << gaussianCount << " -> " << writeIdx << ")" << std::endl;
+        gaussianCount = writeIdx;
+        updatePositionBuffer();
+    }
+
     // Total training time
     auto endTime = std::chrono::high_resolution_clock::now();
     auto totalDuration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
-    
+
     std::cout << "Training complete! Total time: " << totalDuration << "s" << std::endl;
 }
 

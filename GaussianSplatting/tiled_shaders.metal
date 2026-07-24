@@ -108,6 +108,9 @@ constant uint TILE_SIZE = 16;
 constant float MAX_RADIUS = 512.0f;
 // exp(4) = 54.6, must match optimizer's MAX_SCALE_TRAIN
 constant float MAX_SCALE = 4.0f;
+// Must match optimizer's MIN_SCALE_TRAIN. A floor of -4 here would re-inflate every
+// Gaussian the optimizer managed to shrink below e^-4, reintroducing the blur floor.
+constant float MIN_SCALE = -12.0f;
 
 // SSIM gradient constants must match forward SSIM in shaders.metal
 constant float SSIM_C1 = 0.01f * 0.01f;
@@ -200,7 +203,7 @@ kernel void projectGaussians(
     proj.viewPos_xy = viewPos.xy;
     
     // scale is stored in LOG space
-    float3 logScale = clamp(g.scale, -MAX_SCALE, MAX_SCALE);
+    float3 logScale = clamp(g.scale, MIN_SCALE, MAX_SCALE);
     float3 scale = exp(logScale);
 
     // Normalize quaternion
@@ -913,7 +916,7 @@ kernel void preprocessBackward(
 
     // Scale and Rotation gradients
     Gaussian g_orig = gaussians[tid];
-    float3 scale = exp(clamp(g_orig.scale, -MAX_SCALE, MAX_SCALE));
+    float3 scale = exp(clamp(g_orig.scale, MIN_SCALE, MAX_SCALE));
 
     float4 q = g_orig.rotation;
     float r = q.x;

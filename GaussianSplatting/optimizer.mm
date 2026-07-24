@@ -460,14 +460,19 @@ void AdamOptimizer::step(MTL::CommandQueue* queue,
     enc->setBuffer(v_opacity, 0, 10);
     enc->setBuffer(v_sh, 0, 11);
 
-    // Set learning rates
-    float lrs[7] = {lr_position, lr_scale, lr_rotation, lr_opacity, lr_sh, lr_sh_rest, maxLogScaleTrain};
-    enc->setBytes(lrs, sizeof(lrs), 12);
-
     // Set Adam hyperparameters
     float beta1 = 0.9f;
     float beta2 = 0.999f;
     float epsilon = 1e-8f;
+
+    // Precompute bias correction on CPU once — avoids N pow() calls on GPU
+    float bc1 = 1.0f - powf(beta1, (float)timestep);
+    float bc2 = 1.0f - powf(beta2, (float)timestep);
+
+    // Set learning rates + bias correction terms (lrs[7]=bc1, lrs[8]=bc2)
+    float lrs[9] = {lr_position, lr_scale, lr_rotation, lr_opacity, lr_sh, lr_sh_rest, maxLogScaleTrain, bc1, bc2};
+    enc->setBytes(lrs, sizeof(lrs), 12);
+
     uint32_t params[2] = {timestep, (uint32_t)numGaussians};
     enc->setBytes(&beta1, sizeof(float), 13);
     enc->setBytes(&beta2, sizeof(float), 14);

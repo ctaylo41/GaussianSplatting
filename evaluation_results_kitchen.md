@@ -6,9 +6,9 @@
 
 | Metric | Mean | Best | Std |
 |--------|------|------|-----|
-| PSNR (dB) ↑ | 19.72 | 27.34 | 5.98 |
-| SSIM ↑ | 0.4881 | 0.8257 | 0.2085 |
-| LPIPS ↓ | 0.5676 | 0.2829 | - |
+| PSNR (dB) ↑ | 23.64 | 27.34 | 1.89 |
+| SSIM ↑ | 0.6087 | 0.8257 | 0.0863 |
+| LPIPS ↓ | 0.4531 | 0.2829 | - |
 
 ### Training Convergence
 
@@ -32,6 +32,6 @@
 | Method | PSNR | SSIM | Training Time |
 |--------|------|------|---------------|
 | Original 3DGS | 25.25 | 0.771 | 6 min |
-| This Implementation | 19.72 | 0.488 | 142 min |
+| This Implementation | 23.64 | 0.609 | 142 min |
 
 *Note: Original results use 30K iterations. This implementation uses Metal on Apple Silicon.*

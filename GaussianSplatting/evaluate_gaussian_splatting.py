@@ -276,35 +276,27 @@ def evaluate_rendering_quality(renders_dir: str, ground_truth_dir: str,
             if os.path.exists(gt_checkpoint):
                 gt_path = gt_checkpoint
 
-            # Second try: search ground_truth_dir for files containing the image ID
+            # Second try: index into the sorted ground truth list.
+            #
+            # The renderer names each output after the COLMAP image_id (see
+            # exportTrainingViews in mtl_engine.mm), and COLMAP assigns ids 1..N in
+            # sorted-filename order, so image_id - 1 indexes the sorted list directly.
+            #
+            # There used to be a substring-matching pass here that looked for the id
+            # anywhere in a filename. It silently paired image_0026 with _DSC8726.JPG
+            # (ends with "26") instead of _DSC8704.JPG, mismatching 99 of 194 bicycle
+            # views and 99 of 279 kitchen views. Those views scored 4-6 dB, which dragged
+            # the reported means down by ~4-5 dB and inflated the std to ~6 dB. Substring
+            # matching on numeric ids is not recoverable in general - don't reintroduce it.
             if not gt_path and gt_files_map:
-                # Try various common naming patterns
-                id_patterns = [
-                    f"{image_id:04d}",  # 0001
-                    f"{image_id:03d}",   # 001
-                    f"{image_id}",       # 1
-                ]
-                for gt_name, gt_full_path in gt_files_map.items():
-                    gt_name_lower = gt_name.lower()
-                    for pattern in id_patterns:
-                        # Match pattern in filename (before extension)
-                        name_no_ext = os.path.splitext(gt_name)[0]
-                        if pattern in name_no_ext and (
-                            name_no_ext.endswith(pattern) or
-                            f"_{pattern}" in name_no_ext or
-                            f"-{pattern}" in name_no_ext or
-                            name_no_ext.startswith(pattern)
-                        ):
-                            gt_path = gt_full_path
-                            break
-                    if gt_path:
-                        break
-
-                # If still not found, try sorted order matching
-                if not gt_path:
-                    gt_sorted = sorted(gt_files_map.values())
-                    if image_id - 1 < len(gt_sorted):  # image IDs are typically 1-indexed
-                        gt_path = gt_sorted[image_id - 1]
+                gt_sorted = sorted(gt_files_map.values())
+                if 0 < image_id <= len(gt_sorted):  # image IDs are 1-indexed
+                    gt_path = gt_sorted[image_id - 1]
+                else:
+                    # Render has no corresponding ground truth. Usually a stale file left
+                    # over from a previous scene with more views sharing the output dir.
+                    print(f"  WARNING: skipping {basename} - image id {image_id} is outside "
+                          f"the {len(gt_sorted)} ground truth images in {ground_truth_dir}")
         else:
             # Old format: train_render_XXXX.ppm with ground_truth_XXXX.ppm
             match = re.search(r'train_render_(\d+)', basename)
@@ -421,18 +413,20 @@ def parse_performance_metrics(log_path: str) -> PerformanceMetrics:
     Expected format:
     === Forward Pass Timing (avg over 100 frames) ===
       Project+PairGen (GPU):    X.XX ms
-      Sort+Copy (CPU):         XX.XX ms
+      Sort (GPU):              XX.XX ms   # or "Sort+Copy (CPU):" on the CPU-sort path
       Range+Render (GPU):       X.XX ms
       TOTAL:                   XX.XX ms
       Pairs/frame:            ~NNNNNN
     """
     with open(log_path, 'r') as f:
         log_content = f.read()
-    
-    # Find all timing blocks
+
+    # Find all timing blocks. The sort line label varies with the sort backend
+    # ("Sort (GPU):" vs the older "Sort+Copy (CPU):"), so match the "Sort" prefix
+    # loosely and capture whatever ms value follows.
     timing_blocks = re.findall(
         r'Project\+PairGen \(GPU\):\s+([\d.]+) ms.*?'
-        r'Sort\+Copy \(CPU\):\s+([\d.]+) ms.*?'
+        r'Sort[^:]*:\s+([\d.]+) ms.*?'
         r'Range\+Render \(GPU\):\s+([\d.]+) ms.*?'
         r'TOTAL:\s+([\d.]+) ms.*?'
         r'Pairs/frame:\s+~(\d+)',
@@ -614,7 +608,7 @@ def main():
     print("\n[2/3] Extracting performance metrics...")
     performance_metrics = parse_performance_metrics(args.training_log)
     print(f"  - Forward pass: {performance_metrics.avg_forward_pass_ms:.1f} ms")
-    print(f"  - Sort (CPU): {performance_metrics.avg_sort_time_ms:.1f} ms")
+    print(f"  - Sort: {performance_metrics.avg_sort_time_ms:.1f} ms")
     print(f"  - Render: {performance_metrics.avg_render_time_ms:.1f} ms")
     print(f"  - Estimated inference FPS: {performance_metrics.estimated_inference_fps:.1f}")
     

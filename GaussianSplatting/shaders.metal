@@ -51,6 +51,10 @@ constant float SH_C1 = 0.4886025119029199f;
 constant float MAX_SCALE = 8.0f; 
 // Stricter MAX_SCALE for training to prevent Gaussians from growing too large
 constant float MAX_SCALE_TRAIN = 4.0f;
+// Lower bound on log-scale. This must NOT mirror MAX_SCALE_TRAIN: official 3DGS has no
+// lower bound at all, and a floor of -4 pins Gaussians at e^-4 = 0.0183 world units,
+// which at fx~1163 is a ~5px blur floor in the foreground. Kept only as a NaN guard.
+constant float MIN_SCALE_TRAIN = -12.0f;
 // Keep OFF for root-cause debugging so true gradient amplitudes are visible
 constant bool ENABLE_ADAM_GRAD_CLAMP = false;
 
@@ -89,7 +93,7 @@ float3x3 computeCovariance3D(float3 logScale, float4 rotation) {
     float3x3 R = quaternionToMatrix(rotation);
     // Apply exp() to log scale
     // Only place exp() is applied
-    float3 scale = exp(clamp(logScale, -MAX_SCALE, MAX_SCALE));
+    float3 scale = exp(clamp(logScale, MIN_SCALE_TRAIN, MAX_SCALE));
     // Diagonal scale matrix Metal column constructor
     float3x3 S = float3x3(
         float3(scale.x, 0, 0),  
@@ -550,7 +554,6 @@ kernel void adamStep(
     uint tid [[thread_position_in_grid]])
 {
     // Unpack parameters
-    uint t = params.x;
     uint numGaussians = params.y;
     
     if (tid >= numGaussians) return;
@@ -616,9 +619,9 @@ kernel void adamStep(
         }
     }
     
-    // Bias correction terms
-    float bc1 = 1.0 - pow(beta1, float(t));
-    float bc2 = 1.0 - pow(beta2, float(t));
+    // Bias correction terms (precomputed once on CPU, passed via lrs[7..8])
+    float bc1 = lrs[7];
+    float bc2 = lrs[8];
 
     // Position update
     // Using manual indexing to avoid float3 z-component corruption
@@ -689,11 +692,11 @@ kernel void adamStep(
         float3 newScale = gaussians[tid].scale - lrs[1] * m_hat / (sqrt(v_hat) + epsilon);
         if (isfinite(newScale.x) && isfinite(newScale.y) && isfinite(newScale.z)) {
             // lrs[6] optionally supplies an upper cap derived from world-space pruning
-            // (e.g. log(0.1*sceneExtent)). Keep it within [-MAX_SCALE_TRAIN, MAX_SCALE_TRAIN].
+            // (e.g. log(0.1*sceneExtent)). Keep it within [MIN_SCALE_TRAIN, MAX_SCALE_TRAIN].
             float maxLog = lrs[6];
             maxLog = min(maxLog, MAX_SCALE_TRAIN);
-            maxLog = max(maxLog, -MAX_SCALE_TRAIN);
-            gaussians[tid].scale = clamp(newScale, -MAX_SCALE_TRAIN, maxLog);
+            maxLog = max(maxLog, MIN_SCALE_TRAIN);
+            gaussians[tid].scale = clamp(newScale, MIN_SCALE_TRAIN, maxLog);
         }
     }
     

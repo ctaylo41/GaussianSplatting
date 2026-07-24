@@ -210,6 +210,41 @@ void TiledRasterizer::createPipelines(MTL::Library* library) {
     preprocessBackwardPSO = makePipeline("preprocessBackward");
 }
 
+// Commit a command buffer, wait for it, and report any execution error.
+//
+// Metal does not throw on GPU faults — it marks the command buffer Error and returns
+// from waitUntilCompleted normally. Every buffer here is ResourceStorageModeShared, so
+// on abort the CPU reads whatever the GPU managed to write before dying: a partially
+// filled gradient buffer, or stale contents from the previous iteration. Feeding that
+// to Adam corrupts the model a little on every abort, which compounds into a rising
+// loss long after the aborts themselves start. Hence: detect, label, and propagate.
+bool TiledRasterizer::commitAndCheck(MTL::CommandBuffer* cmdBuffer, const char* label) {
+    cmdBuffer->commit();
+    cmdBuffer->waitUntilCompleted();
+
+    if (cmdBuffer->status() == MTL::CommandBufferStatusError) {
+        abortCount++;
+        passFailed = true;
+
+        NS::Error* err = cmdBuffer->error();
+        std::cerr << "\n[GPU ABORT] pass=" << label
+                  << " abort #" << abortCount;
+        if (err) {
+            std::cerr << " code=" << err->code();
+            if (err->localizedDescription()) {
+                std::cerr << " desc=" << err->localizedDescription()->utf8String();
+            }
+        }
+        std::cerr << "\n            state: gaussians=" << maxGaussians
+                  << " maxPairs=" << maxPairs
+                  << " tiles=" << numTilesX << "x" << numTilesY
+                  << " res=" << currentWidth << "x" << currentHeight
+                  << std::endl;
+        return false;
+    }
+    return true;
+}
+
 // Ensure buffers have enough capacity
 void TiledRasterizer::ensureBufferCapacity(uint32_t width, uint32_t height, size_t gaussianCount) {
     // Compute required tiles
@@ -309,7 +344,11 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     
     // Start timing the forward pass
     auto forwardStart = std::chrono::high_resolution_clock::now();
-    
+
+    // Reset per-step failure flag; forward is the first pass of a training step, so this
+    // scopes the flag to forward+backward of a single iteration.
+    passFailed = false;
+
     // Get output texture size
     uint32_t width = (uint32_t)outputTexture->width();
     uint32_t height = (uint32_t)outputTexture->height();
@@ -405,9 +444,13 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     }
     
     // Submit and wait need results for CPU sorting
-    cmdBuffer->commit();
-    cmdBuffer->waitUntilCompleted();
-    
+    // A failure here means projectedGaussians / the pair counter are garbage, so the
+    // rest of the frame would sort and render nonsense. Bail out immediately.
+    if (!commitAndCheck(cmdBuffer, "forward:project+pairgen")) {
+        memset(tileRanges->contents(), 0, maxTiles * sizeof(TileRange));
+        return;
+    }
+
     // Timing after projection pair generation
     auto t2 = std::chrono::high_resolution_clock::now();
     
@@ -505,8 +548,10 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
             enc->dispatchThreads(MTL::Size(gaussianCount, 1, 1), MTL::Size(tgSize, 1, 1));
             enc->endEncoding();
         }
-        retryCmdBuffer->commit();
-        retryCmdBuffer->waitUntilCompleted();
+        if (!commitAndCheck(retryCmdBuffer, "forward:pairgen-retry")) {
+            memset(tileRanges->contents(), 0, maxTiles * sizeof(TileRange));
+            return;
+        }
         totalPairs = *((uint32_t*)pairCounterBuffer->contents());
         if (totalPairs > maxPairs) totalPairs = maxPairs;
     }
@@ -614,9 +659,8 @@ void TiledRasterizer::forward(MTL::CommandQueue* queue,
     }
     
     // Submit and wait for render to complete
-    cmdBuffer->commit();
-    cmdBuffer->waitUntilCompleted();
-    
+    commitAndCheck(cmdBuffer, "forward:tileranges+render");
+
     auto t7 = std::chrono::high_resolution_clock::now();
     
     // Check tile ranges for gaps/overlaps after render completes
@@ -824,6 +868,5 @@ void TiledRasterizer::backward(MTL::CommandQueue* queue,
         enc->endEncoding();
     }
 
-    cmdBuffer->commit();
-    cmdBuffer->waitUntilCompleted();
+    commitAndCheck(cmdBuffer, "backward:ssim+tiled+preprocess");
 }

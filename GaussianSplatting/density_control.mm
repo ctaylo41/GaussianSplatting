@@ -39,8 +39,10 @@ static constexpr size_t MAX_GAUSSIANS = 2000000;
 static constexpr size_t DENSIFY_FROM_ITER = 500;      
 // Stop densification
 static constexpr size_t DENSIFY_UNTIL_ITER = 15000;   
-// Clamp scale values
+// Clamp scale values. MIN must match MIN_SCALE_TRAIN in shaders.metal — a -4 floor here
+// would report every sub-e^-4 Gaussian as 0.0183 world units, skewing the clone/split split.
 static constexpr float MAX_SCALE_LOG = 4.0f;
+static constexpr float MIN_SCALE_LOG = -12.0f;
 // Opacity reset interval skip density control around these iterations 3000, 6000, 9000, 12000
 static constexpr size_t OPACITY_RESET_INTERVAL = 3000;
 // Warmup window after each opacity reset.
@@ -321,8 +323,7 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
     uint32_t* markers = (uint32_t*)markerBuffer->contents();
     float* accumGrad = (float*)gradientAccum->contents();
     uint32_t* counts = (uint32_t*)gradientCount->contents();
-    simd_float3* posGradAccum = (simd_float3*)positionGradAccum->contents();
-    
+
     // Access max_radii2D buffer actual screen radii from rasterizer
     float* maxRadii = (float*)maxRadii2D->contents();
     
@@ -399,9 +400,9 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             float avgGrad = (counts[i] > 0) ? (accumGrad[i] / counts[i]) : 0.0f;
             
             // Compute scale values in world units applying exp to log scale
-            float sx = expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG));
-            float sy = expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG));
-            float sz = expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG));
+            float sx = expf(std::clamp(g.scale.x, MIN_SCALE_LOG, MAX_SCALE_LOG));
+            float sy = expf(std::clamp(g.scale.y, MIN_SCALE_LOG, MAX_SCALE_LOG));
+            float sz = expf(std::clamp(g.scale.z, MIN_SCALE_LOG, MAX_SCALE_LOG));
             float maxScaleVal = fmaxf(fmaxf(sx, sy), sz);
             
             // prune_mask 
@@ -493,25 +494,13 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
             newPositions[writeIdx] = g.position;
             writeIdx++;
 
+            // Clone in place, matching official 3DGS. The previous 2*maxScale offset along
+            // the position gradient displaced clones two sigma off the surface they were
+            // meant to densify, which smears geometry instead of sharpening it. Position
+            // gradients separate the pair within a few steps on their own.
             Gaussian cloned = g;
 
-            // Offset clone along position gradient direction to break symmetry and prevent self-reinforcing cloning
-            simd_float3 posGrad = posGradAccum[i];
-            float gradNorm = sqrtf(posGrad.x*posGrad.x + posGrad.y*posGrad.y + posGrad.z*posGrad.z);
-            if (gradNorm > 1e-7f) {
-                // Gaussian's world-space extent max axis
-                float maxScaleVal = fmaxf(fmaxf(
-                    expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
-                    expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG))),
-                    expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG)));
-                // Offset magnitude proportional to Gaussian size to ensure clones are sufficiently separated, even for small Gaussians with high gradients
-                float offsetMag = maxScaleVal * 2.0f;
-                cloned.position.x += (posGrad.x / gradNorm) * offsetMag;
-                cloned.position.y += (posGrad.y / gradNorm) * offsetMag;
-                cloned.position.z += (posGrad.z / gradNorm) * offsetMag;
-            }
-
-            // Write clone at offset position (no mapping - fresh momentum)
+            // Write clone (no mapping - fresh momentum)
             newGaussians[writeIdx] = cloned;
             newPositions[writeIdx] = cloned.position;
             writeIdx++;
@@ -522,26 +511,20 @@ DensityStats DensityController::apply(MTL::CommandQueue* queue,
 
             // Get actual scale by applying exp to log scale
             simd_float3 scale = simd_make_float3(
-                expf(std::clamp(g.scale.x, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
-                expf(std::clamp(g.scale.y, -MAX_SCALE_LOG, MAX_SCALE_LOG)),
-                expf(std::clamp(g.scale.z, -MAX_SCALE_LOG, MAX_SCALE_LOG))
+                expf(std::clamp(g.scale.x, MIN_SCALE_LOG, MAX_SCALE_LOG)),
+                expf(std::clamp(g.scale.y, MIN_SCALE_LOG, MAX_SCALE_LOG)),
+                expf(std::clamp(g.scale.z, MIN_SCALE_LOG, MAX_SCALE_LOG))
             );
             
-            // Generate random offset direction
-            simd_float3 offset;
-            float maxS = fmaxf(fmaxf(scale.x, scale.y), scale.z);
-            
-            // Random direction scaled by Gaussian
-            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-            float rx = dist(splitRng);
-            float ry = dist(splitRng);
-            float rz = dist(splitRng);
-            float rNorm = sqrtf(rx*rx + ry*ry + rz*rz);
-            if (rNorm > 0.001f) {
-                rx /= rNorm; ry /= rNorm; rz /= rNorm;
-            }
-            
-            offset = simd_make_float3(rx * scale.x, ry * scale.y, rz * scale.z);
+            // Sample the offset from the parent Gaussian itself: N(0, scale) per axis,
+            // matching official 3DGS. A normalized direction would place every child at
+            // exactly 1 sigma, which is a shell rather than the distribution being split.
+            std::normal_distribution<float> dist(0.0f, 1.0f);
+            simd_float3 offset = simd_make_float3(
+                dist(splitRng) * scale.x,
+                dist(splitRng) * scale.y,
+                dist(splitRng) * scale.z
+            );
             
             // Rotate offset by Gaussian's rotation
             // q.x=w, q.y=x, q.z=y, q.w=z
