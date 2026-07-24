@@ -18,28 +18,27 @@ This project was undertaken as an exploratory deep-dive into 3D Gaussian Splatti
 
 | Metric | This Implementation | Original 3DGS (CUDA) |
 |--------|---------------------|----------------------|
-| PSNR | 19.72 dB (mean) / **27.34 dB** (best) | ~31.6 dB (mean) |
-| SSIM | 0.488 (mean) / **0.826** (best) | ~0.922 |
-| LPIPS ↓ | 0.568 (mean) / **0.283** (best) | - |
-| Final Loss | 0.0741 | - |
-| Training Time | 142 min | ~6 min |
-| Gaussians | 241,367 → 818,463 | - |
+| PSNR | 29.50 dB (mean) / **33.06 dB** (best) | ~31.6 dB (mean) |
+| SSIM | 0.910 (mean) / **0.949** (best) | ~0.922 |
+| Final Loss | 0.0246 | - |
+| Training Time | 138 min | ~6 min |
+| Gaussians | 241,367 → 1,029,781 | - |
 
-![Best Kitchen Render (image_0273, PSNR 27.34 dB)](readme-images/best-kitchen-render.png)
+![Best Kitchen Render (image_0209, PSNR 33.06 dB)](readme-images/best-kitchen-render.jpg)
 
 <details>
 <summary>Kitchen Training Convergence</summary>
 
 ```
-Training: 107 epochs (20,758 iterations) on 279 images
+Training: 108 epochs (30,114 iterations) on 279 images
 Optimizer: Adam with per-parameter learning rates
 
 Loss progression:
-        Epoch 0:   0.1579 (initial)
-        Epoch 107: 0.0741 (final)
+        Epoch 0:   0.1051 (initial)
+        Epoch 107: 0.0246 (final)
 
 Opacity resets at iterations: 3000, 6000, 9000, 12000
-Loss reduction: 53.1%
+Loss reduction: 76.6%
 ```
 
 </details>
@@ -48,28 +47,27 @@ Loss reduction: 53.1%
 
 | Metric | This Implementation | Original 3DGS (CUDA) |
 |--------|---------------------|----------------------|
-| PSNR | 14.96 dB (mean) / **22.92 dB** (best) | 25.25 dB (mean) |
-| SSIM | 0.324 (mean) / **0.700** (best) | 0.771 |
-| LPIPS ↓ | 0.753 (mean) / **0.395** (best) | - |
-| Final Loss | 0.0984 | - |
-| Training Time | 174 min | ~6 min |
-| Gaussians | 54,275 → 2,983,570 | - |
+| PSNR | 21.83 dB (mean) / **26.20 dB** (best) | 25.25 dB (mean) |
+| SSIM | 0.636 (mean) / **0.793** (best) | 0.771 |
+| Final Loss | 0.0767 | - |
+| Training Time | 168 min | ~6 min |
+| Gaussians | 54,275 → 1,888,200 | - |
 
-![Best Bicycle Render (image_0153, PSNR 22.92 dB)](readme-images/best-bike-render.png)
+![Best Bicycle Render (image_0109, PSNR 26.20 dB)](readme-images/best-bike-render.jpg)
 
 <details>
 <summary>Bicycle Training Convergence</summary>
 
 ```
-Training: 155 epochs (30,070 iterations) on 194 images
+Training: 155 epochs (30,057 iterations) on 194 images
 Optimizer: Adam with per-parameter learning rates
 
 Loss progression:
-        Epoch 0:   0.2430 (initial)
-        Epoch 155: 0.0984 (final)
+        Epoch 0:   0.1852 (initial)
+        Epoch 154: 0.0767 (final)
 
 Opacity resets at iterations: 3000, 6000, 9000, 12000
-Loss reduction: 59.5%
+Loss reduction: 58.6%
 ```
 
 </details>
@@ -82,7 +80,7 @@ The gap between this implementation and the original is expected and provides in
 
 2. **Density Control Tuning**: The original's adaptive densification thresholds were calibrated against CUDA gradient magnitudes. Different gradient scales in this Metal implementation lead to suboptimal split/clone decisions, an area where scene-aware threshold scheduling would help.
 
-3. **Hardware & Iteration Speed**: Training on an M1 Pro (174 min) vs. an RTX 3090 (~6 min) limits the number of hyperparameter iterations possible during development, compounding tuning differences.
+3. **Hardware & Iteration Speed**: Training on an M1 Pro (168 min) vs. an RTX 3090 (~6 min) limits the number of hyperparameter iterations possible during development, compounding tuning differences.
 
 The kitchen scene performs significantly better than the bicycle scene because it is an indoor scene with more diffuse surfaces, where degree-1 SH is sufficient to capture most of the appearance variation.
 
@@ -167,7 +165,7 @@ This removed the prior sigmoid-gradient behavior in color updates and improved t
 
 **Before Fix** | **After Fix**
 :---:|:---:
-![Saturated Image](readme-images/saturated-image.png) | ![Best Render](readme-images/best-bike-render.png)
+![Saturated Image](readme-images/saturated-image.png) | ![Best Render](readme-images/best-bike-render.jpg)
 
 ### Other Challenges Overcome
 
@@ -181,13 +179,14 @@ This removed the prior sigmoid-gradient behavior in color updates and improved t
 
 ## Performance
 
-| Stage | Time |
+| Stage | Time (bicycle, ~1.9M Gaussians) |
 |-------|------|
-| **Training Iteration** | ~348 ms |
-| Sort (GPU, sampled from logs) | ~10-14 ms |
-| Range+Render (GPU, sampled from logs) | ~5-8 ms |
+| **Training Iteration** | ~336 ms |
+| Sort (GPU, avg over run) | ~45 ms |
+| Range+Render (GPU, avg over run) | ~31 ms |
+| Inference (forward only) | ~25 FPS |
 
-*Measured on Apple M1 Pro with 16GB unified memory.*
+*Measured on Apple M1 Pro with 16GB unified memory. Per-stage times scale with Gaussian count; the sort dominates the forward pass (~53%).*
 
 Training is slower than the original CUDA implementation due to Metal's lack of mature sorting infrastructure, lower memory bandwidth of unified memory compared to dedicated VRAM, and Metal compute shader occupancy tuning differences from CUDA.
 
